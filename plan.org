@@ -1,9 +1,10 @@
 * bjostat: the plan
 
-What is done, and what comes next. The design is in three layers, as in Polars
-and Spark: a table whose schema is known when the program runs, a query that
-is checked against that schema before it runs, and typed views where a
-program wants static types.
+What is done, and what comes next. A table is an Arrow record batch whose
+schema is known when the program runs. Work on it is one API: Bjolang's
+~loop~, with collectors for what it makes, which Bjolang compiles to vector
+code where it can. Beside the loop are the operations on whole tables that
+are not loops, and statistics, as R has them.
 
 ** Done: tables (bjostat table)
 
@@ -15,6 +16,8 @@ program wants static types.
   ~TensorPrimitives~ when the column has no nulls.
 - Arrow IPC files in and out. A file of several batches is read as one
   table, each column in one piece.
+- Sorted (~table-sort~) and joined (~inner-join~ and the others), and
+  columns of dates and timestamps: see "Done: what R has, the first part".
 
 ** Done: CSV (bjostat csv)
 
@@ -27,8 +30,9 @@ program wants static types.
 - Faster still would be fields as spans of the reader's chunk: ~(text csv)~
   now makes a string of each field and an array of each row, which is most
   of what it allocates, and read-csv only copies the bytes on.
-- Not yet: other null markers such as ~NA~, booleans, dates, and columns
-  that are skipped.
+- Dates, dates and times, and instants (ISO 8601) are guessed too.
+- Not yet: other null markers such as ~NA~, booleans, and columns that are
+  skipped.
 
 ** Done: the function layer of queries (bjostat query)
 
@@ -132,31 +136,26 @@ much as before: a slice is a small object, as big as the copy of a short
 string was. Codes for the strings of a column, found once from the bytes, so
 that a row needs no string at all, are next.
 
-A number that only ~summing~ uses is an ~int~, as Bjolang reads a literal,
-so the column is asked for as ints, and a column of doubles is an ~Err~ at
-run time. Such a value needs its type written.
-
-Found in the Bjolang compiler:
-- A column type that nothing decides is left as ~object~, and C# then
-  refuses the call of ~col~. It should be a Bjolang error that asks for the
-  type.
-- The inferred ~where~ clauses are on functions only, not on type
-  declarations: a Bjolang struct holding a ~Cells<T>~ with ~where T : struct~
-  is refused by C#. The glue's ~Cells<T>~ has no constraint for that reason.
-
 ** Measured against Polars
 
 The same file of 1 000 000 rows (bench/compare/make_data.py), the same
 operations and the same results, in bench/compare.bjo and
 bench/compare/polars_bench.py. Polars 2.1.0, eager, the median of 20 runs.
+bjostat with Bjolang's vector loops (measured; first numbers in brackets):
 
-| Operation                    | bjostat, 1 core | Polars, 1 thread | Polars, 24 threads |
-|------------------------------+-----------------+------------------+--------------------|
-| read CSV (26 MB)             | 182 ms          | 72.9 ms          | 19.0 ms            |
-| filter, kept rows            | 11.7 ms         | 4.03 ms          | 2.61 ms            |
-| new column                   | 6.15 ms         | 0.62 ms          | 0.72 ms            |
-| group by string, sum         | 29.9 ms         | 8.31 ms          | 2.51 ms            |
-| group by long, sum and count | 6.14 ms         | 7.27 ms          | 1.68 ms            |
+| Operation                    | bjostat            | Polars, 1 thread | Polars, 24 threads |
+|------------------------------+--------------------+------------------+--------------------|
+| read CSV (26 MB)             | 187 ms (182)       | 72.9 ms          | 19.0 ms            |
+| filter, kept rows            | 4.37 ms (11.7)     | 4.03 ms          | 2.61 ms            |
+| new column                   | 1.00 ms (6.15)     | 0.62 ms          | 0.72 ms            |
+| group by string, sum         | 27.9 ms (29.9)     | 8.31 ms          | 2.51 ms            |
+| group by long, sum and count | 6.74 ms (6.14)     | 7.27 ms          | 1.68 ms            |
+
+The loops of bjostat run on one core. The copy of the kept rows of a filter
+runs on one thread for each column, because most of its time is to get new
+memory, which the threads get at the same time. The new column varies
+between processes, from 0.99 to 2.84 ms; it is 8 MB of new memory each
+time.
 
 The filter took 20.8 ms at first. Of that:
 - The test of random prices: the loop alone took 5.9 ms, and 1.7 ms with a
@@ -169,10 +168,15 @@ The filter took 20.8 ms at first. Of that:
   loop alone takes 1.37 ms, and one API is enough.
 - The copy of the kept rows: validity was read through ~IsValid~, an
   interface call a row, and every array was zeroed before it was written.
-  The bitmap is read directly now, and the arrays are not zeroed: the column
-  of notes took 7.7 ms and takes 2.8. The number columns, 3.4 ms for three,
-  are about what reading them costs: a kept row in four touches every cache
-  line.
+  The bitmap is read directly now, with no jump on each bit, and the arrays
+  are not zeroed; a short string is copied as 16 bytes at once. A copy into
+  an array that was used before takes 0.15 ms for 250 000 longs, and a new
+  array of 2 MB costs 0.85 ms more to get its pages from the operating
+  system, so the columns are copied on several threads. Memory of the C
+  allocator would not cost that, but a span of it is not seen by the
+  garbage collector, which could free it while a loop reads it.
+- The loop alone, with ~:when~ and ~selecting~, became a vector loop: 4.1 ms
+  became 1.37 ms.
 
 The new column took 5.7 ms. Ways to make it faster were measured in paired
 rounds (--compare-within); of them, only the faster builder is kept, as the
@@ -181,9 +185,7 @@ next section says:
   end. ~column-building/sized~ writes into the buffer the column ends in:
   3.9 ms.
 - ~column-map~ and ~column-map2~ deal with the nulls once, before the loop,
-  and splice the function they are given: 2.7 ms. A ~match~ on a ~Tuple~ of
-  two Options cost 2.4 ms a million rows more than two nested matches did,
-  in a loop of its own: the C# switch on the tuple. To look at in Bjolang.
+  and splice the function they are given: 2.7 ms.
 - Kernels on whole columns, ~column*~ and the others, by TensorPrimitives:
   1.9 ms. The multiplication takes 0.7–1.0 ms, as Polars's 0.62. The cast of
   longs to doubles takes the rest: neither ConvertChecked nor
@@ -191,6 +193,8 @@ next section says:
   column would leave it out.
 - A loop of plain values over spans with a sized builder takes 1.2–2.2 ms:
   about what code a row can do in .NET, which does not vectorize loops.
+- Bjolang's vector loops then made the loop with ~column-building/option~
+  1.0 ms: 4.2 ms with the same code in scalar loops.
 
 ** Decided: one API, the loop
 
@@ -207,37 +211,82 @@ So:
    array it grew in is the buffer Arrow is given, with no copy at the end:
    4.2 ms where it took 6.5, in three pairs of runs, as fast as the sized
    builder, without being told the size.
-2. Bjolang vectorizes simple loops: maps over ranges, arrays and spans
-   first; then loops over a library's values through a trait, ~Contiguous~,
-   with null bitmaps as masks; then counts, sums and filters. The design is
-   in Bjolang's Docs/Vectorisation-design.org. bjostat implements
-   ~Contiguous~ for the cells of a column of numbers.
+2. Done, on the vectorise branches of Bjolang and bjostat: Bjolang
+   vectorizes simple loops: maps over ranges, arrays and spans; loops over a
+   library's values through the trait ~Contiguous~, with null bitmaps as
+   masks; counts and integer sums under ~:when~; and filters into a
+   ~BlockCollector~, the kept lanes put next to each other. bjostat
+   implements ~Contiguous~ for the cells of a column of numbers, and
+   ~BlockCollector~ for ~column-building~, ~column-building/option~ and
+   ~selecting~. The design and its status are in Bjolang's
+   Docs/Vectorisation-design.org. ~selecting-if~, a second way to filter
+   with no jump, was slower than the vector loop and is gone.
 
 Arithmetic on columns, as ~(* price qty)~ of two columns, is not in the
 plan: ~*~ is ~INumber~'s, which a column cannot be, and each step would make
 a column, which a vectorized loop over all its columns does not.
 
-Next, besides: codes for strings (group by string), CSV from the bytes, and
-loops over rows split across cores.
+Next, besides: codes for strings (group by string, joins by string), CSV
+from the bytes, and loops over rows split across cores.
 
-** Next: what R has that an analysis needs
+** Done: what R has, the first part
 
 The tables, the CSV, the loops and the collectors are the representation.
 What R adds for work on data is a set of operations on tables, column types
-and statistics. In the order that lets an analysis be done from start to
-end:
+and statistics. Done so far:
 
-1. *Table operations that are not loops:* sort (done: ~table-sort~), joins
-   (done: ~inner-join~, ~left-join~, ~semi-join~, ~anti-join~), distinct
-   rows, tables appended by rows, and pivots (longer and wider).
-2. *Column types:* dates and timestamps (done: ~date-cells~,
-   ~dates-building~ and the others, read from CSV, as values of
-   ~(std datetime)~), categorical columns (Arrow dictionaries: a group-by on
-   them is a group-by on small ints), and booleans.
-3. *Statistics as collectors:* done in ~(bjostat stats)~: mean, variance,
-   standard deviation, covariance, correlation, quantiles, median, a summary
-   of numbers and of a table. Not yet: counts by one or two keys (R's
-   ~table~), and a t-digest for quantiles in one pass with little memory.
+- *Sort:* ~(table-sort t [(ascending "region") (descending "price")])~, as
+  R's ~order~: stable, a null last in both directions, a NaN after every
+  number, strings by code point. Each key is one stable pass, from the last
+  key to the first: a radix sort of 64-bit keys whose unsigned order is the
+  order of the values, and a string key is first the rank of each string
+  among the distinct ones.
+- *Joins:* ~inner-join~, ~left-join~, ~semi-join~ and ~anti-join~, as
+  dplyr's: the left rows in their order, two nulls equal keys, ~.x~ and
+  ~.y~ on names both tables have. The right rows go in a hash table by the
+  hash of their keys, with the rows of a hash in a chain in their order.
+- *Dates and timestamps:* columns of Arrow's Date32 (days since 1970) and
+  timestamps in microseconds, with or without a time zone. ~date-cells~,
+  ~datetime-cells~ and ~instant-cells~ give their cells as ~Date~,
+  ~DateTime~ and ~Instant~ of ~(std datetime)~, through its
+  ~unix-days->date~ and ~unix-microseconds->instant~; ~dates-building~ and
+  the others make such columns. No reflection on ~(std datetime)~'s types,
+  so a program built ahead of time works the same. CSV reads ISO 8601.
+- *Statistics* in ~(bjostat stats)~, as collectors of doubles: ~mean~,
+  ~variance~, ~standard-deviation~, ~covariance~, ~correlation~, ~median~,
+  ~quantile~, ~quantiles~ and ~summarizing~, as R gives them, and
+  ~table-summary~ of a whole table. The one-pass statistics sum the
+  differences from the first value; a quantile is found by selection, not
+  by a sort (60 ms became 16.5).
+
+Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
+
+| Operation                       | bjostat    | Polars, 1 | Polars, 24 |
+|---------------------------------+------------+-----------+------------|
+| sort by a number                | 43.9–49.6 ms | 53.5 ms | 25.4 ms    |
+| sort by a string, then a number | 103 ms     | 334 ms    | 48.7 ms    |
+| join by a string, to 4 rows     | 75–88 ms   | 44.1 ms   | 12.9 ms    |
+| join by a long, one to one      | 116–122 ms | 105 ms    | 25.3 ms    |
+| standard deviation              | 2.49 ms    | 0.63 ms   | 0.48 ms    |
+| median                          | 16.4 ms    | 11.5 ms   | 3.0 ms     |
+| correlation                     | 2.91 ms    | 1.08 ms   | 1.31 ms    |
+| summary of the table            | 95–100 ms  | 46.8 ms   | 26.2 ms    |
+
+The hash of a string key is made from its bytes for each row; a column of
+few distinct strings would be faster with codes. The one-pass statistics
+are sums of doubles, which Bjolang does not vectorize unless a program asks,
+because the vector adds in another order.
+
+** Next: the rest of what R has
+
+In the order that lets an analysis be done from start to end:
+
+1. *Table operations:* distinct rows, tables appended by rows, and pivots
+   (longer and wider).
+2. *Column types:* categorical columns (Arrow dictionaries: a group-by or a
+   join on them is one on small ints), and booleans.
+3. *Statistics:* counts by one or two keys (R's ~table~), and a t-digest for
+   quantiles in one pass with little memory.
 4. *Models:* ~lm~ as a collector of a QR decomposition, with coefficients,
    standard errors, R² and p-values; then ~glm~. A formula macro later.
 5. *Distributions and random numbers:* density, distribution, quantile and
@@ -249,91 +298,33 @@ Not from R: the recycling of short vectors, silent conversions between
 types, NA that spreads through a sum unless the collector says so, and
 operations on whole vectors as a second API.
 
-Sorting is measured against Polars (1M rows; Polars 2.1.0 on 1 and 24
-threads; measured):
-
-| Sort                            | bjostat | Polars, 1 | Polars, 24 |
-|---------------------------------+---------+-----------+------------|
-| by a number                     | 49.6 ms | 53.5 ms   | 25.4 ms    |
-| by a string, then a number down | 104 ms  | 334 ms    | 48.7 ms    |
-
-| Join (inner, 1M rows)           | bjostat | Polars, 1 | Polars, 24 |
-|---------------------------------+---------+-----------+------------|
-| by a string, to 4 rows          | 75–85 ms | 44.1 ms  | 12.9 ms    |
-| by a long, one to one           | 116–122 ms | 105 ms | 25.3 ms    |
-
-A join puts the right rows in a hash table by the hash of their keys, with
-the rows of a hash in a chain in their order, and each left row goes down
-the chain of its hash. The hash of a string key is made from its bytes for
-each row; a column of few distinct strings would be faster with codes.
-
-| Statistic (1M rows)             | bjostat | Polars, 1 | Polars, 24 |
-|---------------------------------+---------+-----------+------------|
-| standard deviation              | 2.50 ms | 0.63 ms   | 0.48 ms    |
-| median                          | 16.5 ms | 11.5 ms   | 3.0 ms     |
-| correlation                     | 2.91 ms | 1.08 ms   | 1.31 ms    |
-| summary of the table            | 95.2 ms | 46.8 ms   | 26.2 ms    |
-
-The one-pass statistics are sums of doubles, which Bjolang does not
-vectorize unless a program asks, because the vector adds in another order.
-A quantile is found by selection, not by a sort: 60 ms became 16.5.
-
-Each key is one stable pass, from the last key to the first: a radix sort
-of 64-bit keys whose unsigned order is the order of the values, and a
-string key is first the rank of each string among the distinct ones.
-
 ** Before: queries, checked before they run
 
-This was the plan before the decision for one API, the loop. A query macro
-is not part of it now; the checks of the schema before rows are read may
-come back as checks of a loop's columns.
-
-
-A query is a value, a plan, not a series of calls:
-
-#+BEGIN_SRC scheme
-(query sales
-  (where (> price 10.0))
-  (group-by region)
-  (summarise (total (sum price)) (n (count))))
-#+END_SRC
-
-- *The plan is checked against the table's schema before any row is read.*
-  Each step gives the schema it makes from the one it gets, so a misspelt
-  column or a type that does not fit is an error about the query, at once:
-  "~price~ is a column of string, and ~sum~ takes a number". This is what
-  ~LazyFrame.collect_schema()~ is in Polars, and it is what makes a table
-  whose schema is dynamic safe to work with.
-- *The query is a macro.* It reads the expressions when the program
-  compiles, so ~(> price 10.0)~ becomes a loop over the column's span, with
-  no interpreter between. The column's type is found when the plan is
-  checked, so the macro makes the loop for each type it can be.
-- *Steps:* ~where~, ~select~, ~mutate~ (new columns), ~group-by~ with
-  ~summarise~, ~order-by~, ~limit~, ~join~. ~where~ makes a selection vector,
-  not a copy, and the next step reads through it.
-- *The order of work:* ~where~ and ~select~ with plan checking, then the
-  aggregates with ~group-by~ (a hash table on the keys), then ~order-by~ and
-  ~join~.
+This was the plan before the decision for one API, the loop: a query macro,
+~(query sales (where ...) (group-by ...) (summarise ...))~, whose plan was
+checked against the table's schema before any row was read, as Polars's
+~LazyFrame.collect_schema()~. It is not part of the plan now. The check of
+the schema before rows are read may come back as a check of a loop's
+columns.
 
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema
   once and makes typed accessors: ~Dataset[T]~ in Spark.
-- *DuckDB* for joins, windows and Parquet, with Arrow between it and the
-  tables, so a query too large or too relational for the kernels here goes
-  there.
-- *Parquet* into tables.
+- *DuckDB* for windows, Parquet and queries too large for memory, with
+  Arrow between it and the tables.
+- *Window functions*: ~lag~, ~lead~, running sums and ranks, as collectors
+  or loops over sorted rows.
 - *Chunked columns.* A table is one record batch now, and reading a file of
   many batches copies each column into one. A column of many chunks keeps
   them, for files larger than memory and for streams.
-- *More types:* booleans, timestamps and dates, decimals, dictionaries.
+- *More types:* decimals, and lists and structs in columns.
 - *Notebooks.* A Jupyter kernel over Bjolang's REPL, with tables shown as
   HTML and plots as Vega-Lite.
 
 ** Found in Bjolang while writing this
 
-Both are fixed in Bjolang, and the generic code is now in Bjolang, not in
-the glue.
+Fixed in Bjolang, and the generic code is now in Bjolang, not in the glue:
 
 - A generic ~import/extern~ did not take Bjolang's ~string~ for a .NET
   ~System.String~ parameter. Now it does, and the call converts it.
@@ -341,3 +332,19 @@ the glue.
   ~T~ without Arrow's constraint ~where T : struct~, which C# refused. Now
   Bjolang finds the constraints and writes them as ~where~ clauses. A call at
   a type that breaks one is a Bjolang type error.
+- A ~match~ on a ~Tuple~ of two Options cost 2.4 ms a million rows more
+  than two nested matches. Now it costs 2% more, and a ~:let~ of a
+  ~Tuple~ costs nothing (measured in paired rounds).
+
+Still open, checked again on the vectorise branch:
+- A column type that nothing decides is left as ~object~:
+  ~(count-rows t (col "price") (fun (p) #t))~ compiles, and is then an Err
+  at run time, "'price' is a column of double, not of Object". It should be
+  a Bjolang error that asks for the type.
+- The inferred ~where~ clauses are on functions only, not on type
+  declarations: a Bjolang struct with a field ~(Column %a)~ is refused by C#,
+  as Arrow's ~PrimitiveArray<T>~ needs ~where T : struct~. The glue's
+  ~Cells<T>~ has no constraint for that reason.
+- A number that only ~summing~ uses is an ~int~, as Bjolang reads a literal,
+  so ~(:acc (summing x))~ over cells asks for a column of ints, and a column
+  of doubles is an Err at run time. Such a value needs its type written.
