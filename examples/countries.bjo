@@ -1,0 +1,111 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/examples/countries.bjo — some questions to 167 countries.
+;;
+;; The data is Kaggle's "Country data" (manusmitajha/countrydatacsv): per
+;; country, child mortality, trade and health spending as % of GDP, income
+;; per person, inflation, life expectancy and children per woman.
+;;
+;;     curl -L -o country.zip https://www.kaggle.com/api/v1/datasets/download/manusmitajha/countrydatacsv
+;;     unzip country.zip
+;;     bjo run examples/countries.bjo Country-data.csv
+
+(import (std prelude))
+(import (only (std maths) round))
+(import (bjostat table))
+(import (bjostat csv))
+(import (bjostat query))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+;; To one decimal, for the printed tables.
+(: (-> double double))
+(defun (one-decimal x) (/ (round (* x 10.0)) 10.0))
+
+(: (-> long string))
+(defun (bracket income)
+  (cond
+    ((< income 2000L) "1. under $2k")
+    ((< income 10000L) "2. $2k to $10k")
+    ((< income 30000L) "3. $10k to $30k")
+    (else "4. over $30k")))
+
+(defun (main args)
+  (match (analyse (if (> (vec-length args) 0) (vec-ref args 0) "Country-data.csv"))
+    ((Ok _) 0)
+    ((Err e) (println (displayed e)) 1)))
+
+;; Every column is found, and its type checked, before a row is read: a
+;; misspelt name is an Err here, with the names the file has.
+(: (-> string (Result TableError Unit)))
+(defun (analyse path)
+  (def (Ok t) (read-csv path) :propagate)
+  (println (str (int->string (table-row-count t)) " countries, "
+                (int->string (table-column-count t)) " columns, the types guessed:"))
+  (println (table->string t #:rows 3))
+
+  (def* ((Ok country) (column-as t "country") :propagate)
+        ((Ok income) (column-as t "income") :propagate)
+        ((Ok life) (column-as t "life_expec") :propagate)
+        ((Ok babies) (column-as t "total_fer") :propagate)
+        ((Ok inflation) (column-as t "inflation") :propagate)
+        ((Ok exports) (column-as t "exports") :propagate)
+        ((Ok imports) (column-as t "imports") :propagate))
+
+  ;; 1. Does money buy years? Grouped by income, one pass, one hash a row.
+  (def groups (group-index))
+  (def by-income
+    (ok (loop (:for i* income) (:for l* life) (:for b* babies)
+              (:when-let (Some i) i*) (:when-let (Some l) l*) (:when-let (Some b) b*)
+              (:let g (group-of! groups (bracket (: i long))))
+              (:acc n (counting-by groups (Tuple g l)))
+              (:acc years (mean-by groups (Tuple g l)))
+              (:acc shortest (min-by groups (Tuple g (: l double))))
+              (:acc kids (mean-by groups (Tuple g b)))
+              => (groups->table groups "income per person"
+                                [(Tuple "countries" n) (Tuple "mean life" years)
+                                 (Tuple "shortest" shortest) (Tuple "children per woman" kids)]))))
+  (println "Does money buy years?")
+  (println (table->string by-income #:digits 1))
+
+  ;; 2. Long lives on a small budget: over 75 years on under $12 000 a year.
+  (def thrifty
+    (loop (:for row (range 0 (table-row-count t)))
+          (:for i* income) (:for l* life)
+          (:when-let (Some i) i*) (:when-let (Some l) l*)
+          (:when (and (> l 75.0) (< (: i long) 12000L)))
+          (:acc (selecting t row))))
+  (println "Long lives on a small budget:")
+  (println (table->string (ok (table-select thrifty ["country" "income" "life_expec"])) #:rows 20))
+
+  ;; 3. Prices: the country where they rise fastest, and the one where they fall.
+  (def* ((Tuple hottest heat)
+         (loop (:for c* country) (:for f* inflation)
+               (:when-let (Some c) c*) (:when-let (Some f) f*)
+               (:acc best (folding (Tuple "" -1000.0) (if (> f (snd best)) (Tuple c f) best)))))
+        ((Tuple coolest cold)
+         (loop (:for c* country) (:for f* inflation)
+               (:when-let (Some c) c*) (:when-let (Some f) f*)
+               (:acc best (folding (Tuple "" 1000.0) (if (< f (snd best)) (Tuple c f) best))))))
+  (println (str "Prices rise fastest in " hottest ", " (double->string heat) "% a year, "
+                "and fall in " coolest ", " (double->string cold) "%.\n"))
+
+  ;; 4. Trade: how many countries buy more than they sell, and by how much the
+  ;; most such country does, in points of GDP.
+  (def* ((Tuple buyers (Tuple deepest gap))
+         (loop (:for c* country) (:for x* exports) (:for m* imports)
+               (:when-let (Some c) c*) (:when-let (Some x) x*) (:when-let (Some m) m*)
+               (:when (> m x))
+               (:acc n (counting c))
+               (:acc best (folding (Tuple "" 0.0) (if (> (- m x) (snd best)) (Tuple c (- m x)) best)))
+               => (Tuple n best))))
+  (println (str (int->string buyers) " of " (int->string (table-row-count t))
+                " countries import more than they export. The keenest shopper is " deepest
+                ", by " (double->string (one-decimal gap)) " points of GDP."))
+  (Ok unit))

@@ -64,7 +64,7 @@
   ;; Any column
   (clr-type-name (: Bjostat.Columns.TypeName (-> AnyColumn string)))
   (any-length (: Bjostat.Columns.Length (-> AnyColumn int)))
-  (any->string (: Bjostat.Columns.CellText (-> AnyColumn int string)))
+  (any->string (: Bjostat.Columns.CellText (-> AnyColumn int int string)))
   (column->any (: Bjostat.Columns.Any (-> (Column %a) AnyColumn)))
   (strings->any (: Bjostat.Columns.AnyStrings (-> StringColumn AnyColumn)))
 
@@ -384,15 +384,16 @@
 ;; ===========================================================================
 
 ;; The table as text: the names, the types, and the first `#:rows` rows, each
-;; column as wide as its widest cell.
-(: (-> Table (#:rows int) string))
-(defun (table->string t #:rows 10)
+;; column as wide as its widest cell. With `#:digits`, a double or float is
+;; rounded to that many decimals.
+(: (-> Table (#:rows int) (#:digits int) string))
+(defun (table->string t #:rows 10 #:digits -1)
   (def shown (min rows (table-row-count t)))
   (def columns {vecing (clr-column t i) (:for i (range 0 (table-column-count t)))})
   (def cells
     (vec-map (fun (i)
                (def c (vec-ref columns i))
-               (vec-add-first (vec-add-first {vecing (any->string c r) (:for r (range 0 shown))}
+               (vec-add-first (vec-add-first {vecing (any->string c r digits) (:for r (range 0 shown))}
                                              (type-text (type-of-column c)))
                               (vec-ref (table-names t) i)))
              (range-vec (vec-length columns))))

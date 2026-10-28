@@ -190,14 +190,22 @@ public static class Columns
     // ---------------------------------------------------------------------
     // Text of a cell, for a printed table
 
-    public static string CellText(IArrowArray a, int i)
+    private static double Rounded(double x, int digits) =>
+        digits < 0 ? x : Math.Round(x, Math.Min(digits, 15), MidpointRounding.AwayFromZero);
+
+    /// <summary>
+    /// The text of a cell. With <paramref name="digits"/> 0 or more, a double
+    /// or float is rounded to that many decimals first; below 0, it is all of
+    /// it. A rounded number is still the shortest text, so 10 stays "10".
+    /// </summary>
+    public static string CellText(IArrowArray a, int i, int digits)
     {
         if (a.IsNull(i)) return "null";
         var c = CultureInfo.InvariantCulture;
         return a switch
         {
-            DoubleArray d => d.GetValue(i)!.Value.ToString("R", c),
-            FloatArray f => f.GetValue(i)!.Value.ToString("R", c),
+            DoubleArray d => Rounded(d.GetValue(i)!.Value, digits).ToString("R", c),
+            FloatArray f => Rounded(f.GetValue(i)!.Value, digits).ToString("R", c),
             Int64Array l => l.GetValue(i)!.Value.ToString(c),
             Int32Array n => n.GetValue(i)!.Value.ToString(c),
             Int16Array s => s.GetValue(i)!.Value.ToString(c),
