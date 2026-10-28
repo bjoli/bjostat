@@ -92,12 +92,45 @@ so a pipeline is one loop and makes no table between its steps.
   needed nothing new in Bjolang: the implementation names the associated
   types of the inner one, as ~(assoc Collector acc %c)~.
 
-~grouping~ is slow yet: 52 ms by four string keys, 12 ms by forty long
-keys. A string key is copied out of Arrow and hashed at each row; the long
-keys allocate 30 bytes a row, maybe the inner collector's values boxed
-through its dictionary. To do: codes for the strings of a column, found
-once, so that a group is found by an int; and a look at what the long keys
-allocate.
+~grouping~ took 52 ms by four string keys and 12 ms by forty long keys. The
+long keys allocated 32 bytes a row: the dictionary of ~grouping~'s
+conditional implementation was built at each step. Bjolang now builds such
+a dictionary once, and splices the methods of a library's implementations
+into the loop that calls them, so the loop has no dictionary at all: 5.6 ms
+and nothing allocated by long keys, 46 ms by string keys.
+
+** Done: groups by number
+
+~(group-of! groups key)~ gives each key a number, in the order first seen,
+and the ~-by~ collectors keep an array by that number: ~summing-by~,
+~counting-by~, ~min-by~, ~max-by~, ~mean-by~. Each takes the groups, so that
+its column has a row for each group: 0 for a sum or a count where its rows
+did not reach a group, a null for the others. ~groups->table~ makes the table
+of the keys and those columns. Each aggregate is its own ~:acc~ and can have
+its own ~#:when~.
+
+Measured on 1 000 000 rows:
+
+| Groups                                  | String keys | Long keys |
+|-----------------------------------------+-------------+-----------|
+| ~grouping summing~                      | 48 ms       | 5.6 ms    |
+| ~summing-by~                            | 34 ms       | 5.8 ms    |
+| ~grouping (pairing summing counting)~   |             | 5.8 ms    |
+| ~summing-by~ and ~counting-by~          |             | 6.9 ms    |
+
+The key is hashed once a row instead of twice, which is most of the cost by
+strings. By longs the two are level, and a second aggregate costs about 1 ns
+a row as a ~-by~, which reads and writes a ~List~, and 0.2 ns in a ~pairing~,
+whose two sums are in the map's value.
+
+A string cell was copied out of Arrow and checked at each row. Now the
+column's strings are one Bjolang string, checked once, and a cell is a slice
+of it (~Utf8String.SliceBytes~ in BjoString, which refuses an end in the
+middle of a character, so no slice is invalid UTF-8). That took grouping by
+strings from 48 to 36 ms, and ~summing-by~ from 34 to 26 ms. It allocates as
+much as before: a slice is a small object, as big as the copy of a short
+string was. Codes for the strings of a column, found once from the bytes, so
+that a row needs no string at all, are next.
 
 A number that only ~summing~ uses is an ~int~, as Bjolang reads a literal,
 so the column is asked for as ints, and a column of doubles is an ~Err~ at

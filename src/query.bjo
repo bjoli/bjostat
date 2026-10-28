@@ -29,11 +29,17 @@
   Selecting selecting
   ColumnBuilding ColumnBuildingOption
   Grouping grouping Pairing pairing
-  map->table table-with)
+  map->table table-with
+
+  ;; Groups by number
+  GroupIndex group-index group-of! group-count group-keys
+  SummingBy summing-by CountingBy counting-by MinBy min-by MaxBy max-by
+  MeanBy mean-by groups->table)
 
 (import (std prelude))
 (import (bjostat table))
 (import (std mutable map))
+(import (std mutable vec))
 
 (import/class
   ((Builder %a) (: Bjostat.Builder))
@@ -251,6 +257,201 @@
   (defun (collector-finish p acc)
     (def (a b) acc)
     (Tuple (collector-finish (record-ref p left) a) (collector-finish (record-ref p right) b))))
+
+;; ===========================================================================
+;; Groups by number
+;; ===========================================================================
+;;
+;; The key of a row is found once, as a number, and each aggregate is an
+;; array by that number, as Polars and DuckDB do it:
+;;
+;;     (def groups (group-index))
+;;     (loop (:for r* region) (:for p* price)
+;;           (:when-let (Some r) r*) (:when-let (Some p) p*)
+;;           (:let g (group-of! groups r))
+;;           (:acc totals (summing-by groups (Tuple g p)))
+;;           (:acc counts (counting-by groups (Tuple g p)))
+;;           => (groups->table groups "region" [(Tuple "total" totals) (Tuple "n" counts)]))
+;;
+;; One hash a row, whatever the number of aggregates. Each collector is
+;; given the groups, so that the column it makes has a row for each group,
+;; including the groups that its own rows did not reach: 0 for a sum or a
+;; count, a null for the others. Their implementations have no dictionary,
+;; so nothing is built at a step.
+
+;; The groups in the order their keys were first seen, from 0.
+(type (: (GroupIndex %k) #:opaque (Record (: ids (MutableMap %k int)) (: keys (MutableVec %k)))))
+
+(: (-> (GroupIndex %k)))
+(defun (group-index) (GroupIndex (ids (mutablemap)) (keys (mutablevec))))
+
+;; The number of the group of `k`, a new one when `k` is new.
+(: (-> (GroupIndex %k) %k int))
+(defun (group-of! groups k)
+  (def ids (record-ref groups ids))
+  (match (mutablemap-try-ref ids k)
+    ((Some g) g)
+    (None
+     (def keys (record-ref groups keys))
+     (def g (mutablevec-length keys))
+     (mutablemap-set! ids k g)
+     (mutablevec-add! keys k)
+     g)))
+
+(: (-> (GroupIndex %k) int))
+(defun (group-count groups) (mutablevec-length (record-ref groups keys)))
+
+;; The keys, by group number.
+(: (-> (GroupIndex %k) (Vec %k)))
+(defun (group-keys groups) (mutablevec->vec (record-ref groups keys)))
+
+;; Adds `fill` to `v` until it has an element at `g`.
+(: (-> (MutableVec %a) int %a void))
+(defun (grow-to! v g fill)
+  (when (<= (mutablevec-length v) g)
+    (mutablevec-add! v fill)
+    (grow-to! v g fill)))
+
+;; The same, as a test and a call that is rarely made. A collector calls this
+;; at each step; the JIT inlines it, and it cannot inline grow-to!, which is
+;; recursive.
+(: (-> (MutableVec %a) int %a void))
+(defun (ensure! v g fill)
+  (when (<= (mutablevec-length v) g)
+    (grow-to! v g fill)))
+
+;; A column of the values of `v`, one for each group.
+(: (-> (MutableVec %a) int AnyColumn))
+(defun (group-column v n)
+  {column-building (mutablevec-ref v g) (:for g (range 0 n))})
+
+;; The same, of Options: a null at each None.
+(: (-> (MutableVec (Option %a)) int AnyColumn))
+(defun (group-column/option v n)
+  {column-building/option (if (< g (mutablevec-length v)) (mutablevec-ref v g) None)
+                          (:for g (range 0 n))})
+
+;; The sum of each group's values.
+(type (: (SummingBy %k %a) #:opaque (Struct (: groups (GroupIndex %k)))))
+
+(: (-> (GroupIndex %k) (SummingBy %k %a)))
+(defun (summing-by groups) (SummingBy (groups groups)))
+
+(impl (Collector (SummingBy %k %a))
+  (where (Num %a))
+  (type %elem (Tuple int %a))
+  (type %acc (MutableVec %a))
+  (type %out AnyColumn)
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc gx)
+    (def (g x) gx)
+    (ensure! acc g 0)
+    (mutablevec-set! acc g (+ (mutablevec-ref acc g) x))
+    acc)
+  (defun (collector-finish c acc)
+    (def n (group-count (record-ref c groups)))
+    (grow-to! acc (- n 1) 0)
+    (group-column acc n)))
+
+;; How many values each group has.
+(type (: (CountingBy %k %a) #:opaque (Struct (: groups (GroupIndex %k)))))
+
+(: (-> (GroupIndex %k) (CountingBy %k %a)))
+(defun (counting-by groups) (CountingBy (groups groups)))
+
+(impl (Collector (CountingBy %k %a))
+  (type %elem (Tuple int %a))
+  (type %acc (MutableVec int))
+  (type %out AnyColumn)
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc gx)
+    (def (g _) gx)
+    (ensure! acc g 0)
+    (mutablevec-set! acc g (+ (mutablevec-ref acc g) 1))
+    acc)
+  (defun (collector-finish c acc)
+    (def n (group-count (record-ref c groups)))
+    (grow-to! acc (- n 1) 0)
+    (group-column acc n)))
+
+;; The least value of each group, or a null.
+(type (: (MinBy %k %a) #:opaque (Struct (: groups (GroupIndex %k)))))
+
+(: (-> (GroupIndex %k) (MinBy %k %a)))
+(defun (min-by groups) (MinBy (groups groups)))
+
+(impl (Collector (MinBy %k %a))
+  (where (Num %a))
+  (type %elem (Tuple int %a))
+  (type %acc (MutableVec (Option %a)))
+  (type %out AnyColumn)
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc gx)
+    (def (g x) gx)
+    (ensure! acc g None)
+    (match (mutablevec-ref acc g)
+      ((Some best) (when (< x best) (mutablevec-set! acc g (Some x))))
+      (None (mutablevec-set! acc g (Some x))))
+    acc)
+  (defun (collector-finish c acc)
+    (group-column/option acc (group-count (record-ref c groups)))))
+
+;; The greatest value of each group, or a null.
+(type (: (MaxBy %k %a) #:opaque (Struct (: groups (GroupIndex %k)))))
+
+(: (-> (GroupIndex %k) (MaxBy %k %a)))
+(defun (max-by groups) (MaxBy (groups groups)))
+
+(impl (Collector (MaxBy %k %a))
+  (where (Num %a))
+  (type %elem (Tuple int %a))
+  (type %acc (MutableVec (Option %a)))
+  (type %out AnyColumn)
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc gx)
+    (def (g x) gx)
+    (ensure! acc g None)
+    (match (mutablevec-ref acc g)
+      ((Some best) (when (> x best) (mutablevec-set! acc g (Some x))))
+      (None (mutablevec-set! acc g (Some x))))
+    acc)
+  (defun (collector-finish c acc)
+    (group-column/option acc (group-count (record-ref c groups)))))
+
+;; The mean of each group's values, or a null for a group with none.
+(type (: (MeanBy %k) #:opaque (Struct (: groups (GroupIndex %k)))))
+
+(: (-> (GroupIndex %k) (MeanBy %k)))
+(defun (mean-by groups) (MeanBy (groups groups)))
+
+(impl (Collector (MeanBy %k))
+  (type %elem (Tuple int double))
+  (type %acc (Tuple (MutableVec double) (MutableVec int)))
+  (type %out AnyColumn)
+  (defun (collector-init c) (Tuple (mutablevec) (mutablevec)))
+  (defun (collector-step c acc gx)
+    (def (sums counts) acc)
+    (def (g x) gx)
+    (ensure! sums g 0.0)
+    (ensure! counts g 0)
+    (mutablevec-set! sums g (+ (mutablevec-ref sums g) x))
+    (mutablevec-set! counts g (+ (mutablevec-ref counts g) 1))
+    acc)
+  (defun (collector-finish c acc)
+    (def (sums counts) acc)
+    (def n (group-count (record-ref c groups)))
+    {column-building/option
+      (if (and (< g (mutablevec-length counts)) (> (mutablevec-ref counts g) 0))
+          (Some (/ (mutablevec-ref sums g) (cast double (mutablevec-ref counts g))))
+          None)
+      (:for g (range 0 n))}))
+
+;; The table of the groups: a column of their keys under `key-name`, and the
+;; columns the `-by` collectors made, in order.
+(: (-> (GroupIndex %k) string (Vec (Tuple string AnyColumn)) (Result TableError Table)))
+(defun (groups->table groups key-name cols)
+  (make-table (vec-add-first (vec-map (fun (p) (named-any (fst p) (snd p))) cols)
+                             (named-any key-name {column-building k (:for k (group-keys groups))}))))
 
 ;; The table of a map, as `grouping` makes: a column of the keys and a
 ;; column of the values, in the map's order.

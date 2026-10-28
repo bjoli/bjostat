@@ -38,6 +38,8 @@
     ((Ok v) v)
     ((Err e) (panic! (displayed e)))))
 
+(import/extern (any-rows (: Bjostat.Columns.Length (-> AnyColumn int))))
+
 (: (Row (Tuple double long)))
 (def price-qty (both (col "price") (col "qty")))
 
@@ -121,6 +123,48 @@
     (loop (:for q* q) (:for p* p)
           (:when-let (Some qty) q*) (:when-let (Some price) p*)
           (:acc (grouping summing (Tuple (: qty long) (: price double)))))))
+
+;; Two aggregates with grouping, for summing-by and counting-by below.
+(def/bench "grouping and pairing, long keys"
+  (def q (ok (column-as sales "qty")))
+  (def p (ok (column-as sales "price")))
+  (map-length
+    (loop (:for q* q) (:for p* p)
+          (:when-let (Some qty) q*) (:when-let (Some price) p*)
+          (:acc (grouping (pairing summing counting) (Tuple (: qty long) (Tuple (: price double) price)))))))
+
+;; The same sums with a group index and summing-by.
+(def/bench "summing-by, string keys"
+  (def r (ok (column-as sales "region")))
+  (def p (ok (column-as sales "price")))
+  (def groups (group-index))
+  (any-rows
+    (loop (:for r* r) (:for p* p)
+          (:when-let (Some region) r*) (:when-let (Some price) p*)
+          (:let g (group-of! groups (: region string)))
+          (:acc (summing-by groups (Tuple g (: price double)))))))
+
+(def/bench "summing-by, long keys"
+  (def q (ok (column-as sales "qty")))
+  (def p (ok (column-as sales "price")))
+  (def groups (group-index))
+  (any-rows
+    (loop (:for q* q) (:for p* p)
+          (:when-let (Some qty) q*) (:when-let (Some price) p*)
+          (:let g (group-of! groups (: qty long)))
+          (:acc (summing-by groups (Tuple g (: price double)))))))
+
+;; A second aggregate: one array more, and no second hash.
+(def/bench "summing-by and counting-by, long keys"
+  (def q (ok (column-as sales "qty")))
+  (def p (ok (column-as sales "price")))
+  (def groups (group-index))
+  (loop (:for q* q) (:for p* p)
+        (:when-let (Some qty) q*) (:when-let (Some price) p*)
+        (:let g (group-of! groups (: qty long)))
+        (:acc totals (summing-by groups (Tuple g (: price double))))
+        (:acc counts (counting-by groups (Tuple g price)))
+        => (+ (any-rows totals) (any-rows counts))))
 
 (def/bench "create-column"
   (table-column-count (ok (create-column sales "revenue" price-qty

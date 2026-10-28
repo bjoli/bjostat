@@ -45,6 +45,12 @@ public sealed unsafe class Cells<T>
     private readonly byte* _pointer;
     private readonly System.Buffers.MemoryHandle _pin;
 
+    // A column of strings as one string, and where it starts in Arrow's buffer.
+    // A cell is a slice of it: no copy, and no check of the cell's bytes,
+    // which the check of the whole made.
+    private readonly Utf8String _text;
+    private readonly int _textBase;
+
     public readonly int Length;
     public readonly int NullCount;
 
@@ -54,7 +60,15 @@ public sealed unsafe class Cells<T>
         Length = array.Length;
         NullCount = array.NullCount;
         _offset = array.Data.Offset;
-        if (array is not StringArray && array is not BooleanArray)
+        if (array is StringArray strings)
+        {
+            // The strings end to end, checked once as one string; a cell is
+            // a slice of it. The offsets are where Arrow's buffer has each.
+            var offsets = strings.ValueOffsets;
+            _textBase = offsets[0];
+            _text = Utf8String.FromUtf8(strings.ValueBuffer.Span.Slice(_textBase, offsets[Length] - _textBase));
+        }
+        else if (array is not BooleanArray)
         {
             _values = array.Data.Buffers[1].Memory;
             if (MemoryMarshal.TryGetArray(_values, out var segment)
@@ -78,7 +92,9 @@ public sealed unsafe class Cells<T>
     {
         if (typeof(T) == typeof(Utf8String))
         {
-            var s = Utf8String.FromUtf8(((StringArray)_array).GetBytes(i));
+            var offsets = ((StringArray)_array).ValueOffsets;
+            int from = offsets[i];
+            var s = _text.SliceBytes(from - _textBase, offsets[i + 1] - from);
             return Unsafe.As<Utf8String, T>(ref s);
         }
         if (typeof(T) == typeof(bool))

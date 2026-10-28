@@ -154,6 +154,50 @@
                 (:acc (mapping (Tuple r (/ total (cast double (: n int)))))))
           (list->map (list (Tuple "north" 8.875) (Tuple "south" 20.0) (Tuple "east" 12.0))))
 
+  ;; Groups by number
+  (def groups (group-index))
+  (def by-number
+    (ok (loop (:for r* region) (:for p* price) (:for q* qty)
+              (:when-let (Some r) r*) (:when-let (Some p) p*)
+              (:let g (group-of! groups r))
+              (:acc totals (summing-by groups (Tuple g p)))
+              (:acc counts (counting-by groups (Tuple g p)))
+              (:acc lows (min-by groups (Tuple g p)))
+              (:acc highs (max-by groups (Tuple g p)))
+              (:acc means (mean-by groups (Tuple g p)))
+              (:acc quantities (summing-by groups (Tuple g (: (option-value q* 0L) long))) #:when (some? q*))
+              => (groups->table groups "region"
+                                [(Tuple "total" totals) (Tuple "n" counts) (Tuple "low" lows)
+                                 (Tuple "high" highs) (Tuple "mean" means) (Tuple "qty" quantities)]))))
+  (expect "the groups, in the order first seen" (group-keys groups) ["north" "south" "east"])
+  (expect "the group of a key seen" (group-of! groups "south") 1)
+  (expect "groups->table: the names" (table-names by-number)
+          ["region" "total" "n" "low" "high" "mean" "qty"])
+  (expect "the keys" (texts by-number "region") ["north" "south" "east"])
+  (expect "summing-by" (double-values by-number "total") [(Some 17.75) (Some 20.0) (Some 12.0)])
+  (expect "counting-by"
+          (loop (:for n* (ok (column-as by-number "n"))) (:acc (listing (: n* (Option int)))))
+          (list (Some 2) (Some 1) (Some 1)))
+  (expect "min-by" (double-values by-number "low") [(Some 7.25) (Some 20.0) (Some 12.0)])
+  (expect "max-by" (double-values by-number "high") [(Some 10.5) (Some 20.0) (Some 12.0)])
+  (expect "mean-by" (double-values by-number "mean") [(Some 8.875) (Some 20.0) (Some 12.0)])
+  (expect "an aggregate with its own #:when"
+          (loop (:for q* (ok (column-as by-number "qty"))) (:acc (listing (: q* (Option long)))))
+          (list (Some 3L) (Some 1L) (Some 2L)))
+
+  ;; A group that an aggregate's rows do not reach
+  (def few (group-index))
+  (def sparse
+    (ok (loop (:for r* region) (:for p* price)
+              (:when-let (Some r) r*) (:when-let (Some p) p*)
+              (:let g (group-of! few r))
+              (:acc big (max-by few (Tuple g p)) #:when (> p 15.0))
+              (:acc big-total (summing-by few (Tuple g p)) #:when (> p 15.0))
+              => (groups->table few "region" [(Tuple "big" big) (Tuple "big-total" big-total)]))))
+  (expect "a null where no value came" (double-values sparse "big") [None (Some 20.0) None])
+  (expect "a zero sum where no value came" (double-values sparse "big-total")
+          [(Some 0.0) (Some 20.0) (Some 0.0)])
+
   ;; Errors, before any row
   (expect "a misspelt column"
           (error-of (where-rows sales (col "pricee") (fun (p) (> p 10.0))))
