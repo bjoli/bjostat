@@ -1,0 +1,169 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/query.bjo — row specs, where-rows and create-column: the
+;; values, the nulls, and the errors before any row is read.
+;;
+;;     bjo run tests/query.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjostat table))
+(import (bjostat csv))
+(import (bjostat query))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result TableError %a) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+(: (-> Table string (Vec string)))
+(defun (texts t name)
+  (def c (ok (strings t name)))
+  {vecing (match (string-column-ref c i) ((Some s) s) (None "null"))
+          (:for i (range 0 (string-column-length c)))})
+
+(: (-> Table string (Vec (Option double))))
+(defun (double-values t name)
+  (def c (ok (doubles t name)))
+  {vecing (column-ref c i) (:for i (range 0 (column-length c)))})
+
+(: Table)
+(def sales
+  (ok (csv->table
+        (str "region,price,qty,day\n"
+             "north,10.5,3,2026-01-02\n"
+             "south,20,1,2026-01-03\n"
+             "north,7.25,,2026-01-04\n"
+             "east,12,2,2026-01-05\n"
+             ",30,5,2026-01-06\n"))))
+
+(defun (main)
+  ;; where-rows
+  (def big (ok (where-rows sales (col "price") (fun (p) (> p 10.0)))))
+  (expect "kept rows" (table-row-count big) 4)
+  (expect "every column comes along" (texts big "day")
+          ["2026-01-02" "2026-01-03" "2026-01-05" "2026-01-06"])
+  (expect "a null comes along" (texts big "region") ["north" "south" "east" "null"])
+
+  (def two (ok (where-rows sales (both (col "price") (col "qty"))
+                           (fun ((Tuple p q)) (and (> p 10.0) (> q 1L))))))
+  (expect "two columns" (texts two "region") ["north" "east" "null"])
+  (expect "a null drops the row" (table-row-count
+                                   (ok (where-rows sales (col "qty") (fun (q) (>= q 0L)))))
+          4)
+  (expect "a string column"
+          (texts (ok (where-rows sales (col "region") (fun (r) (= r "north")))) "day")
+          ["2026-01-02" "2026-01-04"])
+  (expect "no rows" (table-row-count (ok (where-rows sales (col "price") (fun (p) (> p 1000.0))))) 0)
+
+  ;; create-column
+  (def with-revenue
+    (ok (create-column sales "revenue" (both (col "price") (col "qty"))
+                       (fun ((Tuple p q)) (* p (cast double (: q long)))))))
+  (expect "a new column" (table-names with-revenue) ["region" "price" "qty" "day" "revenue"])
+  (expect "its values, a null where an input is"
+          (double-values with-revenue "revenue")
+          [(Some 31.5) (Some 20.0) None (Some 24.0) (Some 150.0)])
+  (def relabelled
+    (ok (create-column sales "region" (col "region") (fun (r) (string-append r "!")))))
+  (expect "a column replaced, in its place" (table-names relabelled) ["region" "price" "qty" "day"])
+  (expect "its values" (texts relabelled "region") ["north!" "south!" "north!" "east!" "null"])
+  (def flagged (ok (create-column sales "dear" (col "price") (fun (p) (> p 15.0)))))
+  (expect "a column of bool" (column-type flagged "dear") (Some (Other "Boolean")))
+  (expect "a step after a step"
+          (table-row-count (ok (where-rows with-revenue (col "revenue") (fun (r) (> r 25.0)))))
+          2)
+
+  ;; Loops over cells, with the collectors
+  (def price (ok (column-as sales "price")))
+  (def qty (ok (column-as sales "qty")))
+  (def region (ok (column-as sales "region")))
+  (def rows (table-row-count sales))
+
+  (def kept
+    (loop (:for row (range 0 rows))
+          (:for p* price) (:for q* qty)
+          (:when-let (Some p) p*) (:when-let (Some q) q*)
+          (:when (and (> p 10.0) (> q 1L)))
+          (:acc (selecting sales row))))
+  (expect "selecting: the rows kept" (texts kept "region") ["north" "east" "null"])
+  (expect "selecting: every column" (table-names kept) ["region" "price" "qty" "day"])
+  (expect "selecting nothing"
+          (table-row-count (loop (:for row (range 0 rows)) (:when #f) (:acc (selecting sales row))))
+          0)
+
+  (def revenue
+    (loop (:for p* price) (:for q* qty)
+          (:acc (column-building/option
+                  (match (Tuple p* q*)
+                    ((Tuple (Some p) (Some q)) (Some (* p (cast double (: q long)))))
+                    (_ None))))))
+  (def with-revenue2 (ok (table-with sales "revenue" revenue)))
+  (expect "column-building/option: a null at None"
+          (double-values with-revenue2 "revenue")
+          [(Some 31.5) (Some 20.0) None (Some 24.0) (Some 150.0)])
+  (expect "column-building: strings"
+          (texts (ok (table-with sales "shout"
+                                 (loop (:for r* region)
+                                       (:acc (column-building (match r* ((Some r) (string-upcase r)) (None "-")))))))
+                 "shout")
+          ["NORTH" "SOUTH" "NORTH" "EAST" "-"])
+  (expect "table-with: a column of another length"
+          (error-of (table-with sales "short" (loop (:for p (skip-nulls qty)) (:acc (column-building p)))))
+          "the column 'short' has 4 rows, and the table has 5.")
+  (expect "a step after a step, in one loop"
+          (loop (:for p* price) (:for q* qty)
+                (:when-let (Some p) p*) (:when-let (Some q) q*)
+                (:let revenue (* p (cast double (: q long))))
+                (:when (> revenue 25.0))
+                (:acc (summing revenue)))
+          181.5)
+
+  ;; Groups
+  (def by-region
+    (loop (:for r* region) (:for p* price)
+          (:when-let (Some r) r*) (:when-let (Some p) p*)
+          (:acc (grouping summing (Tuple r p)))))
+  (expect "grouping: a sum for each key"
+          by-region
+          (list->map (list (Tuple "north" 17.75) (Tuple "south" 20.0) (Tuple "east" 12.0))))
+  (def by-region-table (ok (map->table by-region "region" "total")))
+  (expect "map->table: the names" (table-names by-region-table) ["region" "total"])
+  (expect "map->table: the totals" (column-sum (ok (doubles by-region-table "total"))) 49.75)
+  (def two-aggregates
+    (loop (:for r* region) (:for p* price)
+          (:when-let (Some r) r*) (:when-let (Some p) p*)
+          (:acc (grouping (pairing summing counting) (Tuple r (Tuple p p))))))
+  (expect "pairing: a sum and a count for each key"
+          (map-ref two-aggregates "north")
+          (Tuple 17.75 2))
+  (expect "grouping, then a mean"
+          (loop (:for (Tuple r agg) two-aggregates)
+                (:let (Tuple total n) agg)
+                (:acc (mapping (Tuple r (/ total (cast double (: n int)))))))
+          (list->map (list (Tuple "north" 8.875) (Tuple "south" 20.0) (Tuple "east" 12.0))))
+
+  ;; Errors, before any row
+  (expect "a misspelt column"
+          (error-of (where-rows sales (col "pricee") (fun (p) (> p 10.0))))
+          "the table has no column 'pricee'. Its columns are: region, price, qty, day.")
+  (expect "a column of another type"
+          (error-of (where-rows sales (both (col "price") (col "qty"))
+                                (fun ((Tuple p q)) (and (> p 10.0) (> q 1.0)))))
+          "'qty' is a column of long, not of double.")
+  (expect "the names a spec reads"
+          (row-names (: (both (col "price") (both (col "qty") (col "day")))
+                        (Row (Tuple double (Tuple long string)))))
+          ["price" "qty" "day"])
+  0)

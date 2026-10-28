@@ -1,0 +1,269 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/src/query.bjo — the module (bjostat query): steps over a table,
+;; as functions.
+;;
+;; A step reads some columns of each row. Which ones, and at what types, is a
+;; row spec, made of `col` and `both`:
+;;
+;;     (both (col "price") (col "qty"))      ; (Row (Tuple double long))
+;;
+;; No type is written: the function the step is given decides them, as
+;; (fun ((Tuple p q)) (> p 10.0)) makes "price" a column of double. The spec
+;; is checked against the table's schema before the step reads a row, so a
+;; misspelt column, or one of another type, is an Err about the step.
+;;
+;; Nulls are as in SQL: `where-rows` drops a row where a column it reads is
+;; null, and `create-column` gives a null there.
+;;
+;; The macros of sawzall's names, `where` and `create`, are to be written
+;; over these.
+
+(export
+  Row col both row-names
+  where-rows count-rows create-column
+
+  ;; Collectors, for a loop over cells
+  Selecting selecting
+  ColumnBuilding ColumnBuildingOption
+  Grouping grouping Pairing pairing
+  map->table table-with)
+
+(import (std prelude))
+(import (bjostat table))
+(import (std mutable map))
+
+(import/class
+  ((Builder %a) (: Bjostat.Builder))
+  (Selection (: Bjostat.Selection)))
+
+(import/extern
+  (clr-take (: Bjostat.Query.Take (-> Table (Array int) int Table)))
+  (clr-with-column (: Bjostat.Query.WithColumn (-> Table string AnyColumn Table)))
+  (any-length (: Bjostat.Columns.Length (-> AnyColumn int)))
+
+  ;; A builder is changed in place, and answered so that it is a
+  ;; collector's accumulator.
+  (builder-make (: Bjostat.BuilderOps.Make (-> int (Builder %a))))
+  (builder-add (: Bjostat.BuilderOps.Add (-> (Builder %a) %a (Builder %a))))
+  (builder-add-option (: Bjostat.BuilderOps.AddOption (-> (Builder %a) (Option %a) (Builder %a))))
+  (builder-build (: Bjostat.BuilderOps.Build (-> (Builder %a) AnyColumn)))
+
+  (selection-make (: Bjostat.Selection.Make (-> Selection)))
+  (selection-add (: Bjostat.Selection.Add (-> Selection int Selection)))
+  (selection-take (: Bjostat.Selection.Take (-> Selection Table Table))))
+
+;; ===========================================================================
+;; Row specs
+;; ===========================================================================
+
+;; One row's values, after the columns were found: the values at a row, and
+;; whether none of them is null there.
+(type (: (RowReader %r) (Record (: ref (-> int %r)) (: valid? (-> int bool)))))
+
+;; The columns a step reads, and how to find them in a table.
+(type (: (Row %r) #:opaque (Record (: names (Vec string))
+                                   (: bind (-> Table (Result TableError (RowReader %r)))))))
+
+;; The names of the columns the spec reads, in order.
+(: (-> (Row %r) (Vec string)))
+(defun (row-names spec) (record-ref spec names))
+
+;; The column `name`, at the type its use gives.
+(: (-> string (Row %a)))
+(defun (col name)
+  (Row (names [name])
+       (bind (fun (t)
+               (def (Ok c) (column-as t name) :propagate)
+               (Ok (RowReader (ref (fun (i) (cells-ref c i)))
+                              (valid? (if (= (cells-null-count c) 0)
+                                          (fun (i) #t)
+                                          (fun (i) (cells-valid? c i))))))))))
+
+;; The values of two specs, as a tuple.
+(: (-> (Row %a) (Row %b) (Row (Tuple %a %b))))
+(defun (both ra rb)
+  (Row (names (vec-merge (record-ref ra names) (record-ref rb names)))
+       (bind (fun (t)
+               (def (Ok a) ((record-ref ra bind) t) :propagate)
+               (def (Ok b) ((record-ref rb bind) t) :propagate)
+               (def a-ref (record-ref a ref))
+               (def b-ref (record-ref b ref))
+               (def a-valid? (record-ref a valid?))
+               (def b-valid? (record-ref b valid?))
+               (Ok (RowReader (ref (fun (i) (Tuple (a-ref i) (b-ref i))))
+                              (valid? (fun (i) (and (a-valid? i) (b-valid? i))))))))))
+
+;; ===========================================================================
+;; Steps
+;; ===========================================================================
+
+;; The rows where `keep?` holds and no column the spec reads is null, in
+;; their order.
+(: (-> Table (Row %r) (-> %r bool) (Result TableError Table)))
+(defun (where-rows t spec keep?)
+  (def (Ok rd) ((record-ref spec bind) t) :propagate)
+  (def row-ref (record-ref rd ref))
+  (def valid? (record-ref rd valid?))
+  (def n (table-row-count t))
+  (def picked (make-array n))
+  (def count
+    (let loop ((i 0) (k 0))
+      (cond
+        ((= i n) k)
+        ((and (valid? i) (keep? (row-ref i)))
+         (array-set! picked k i)
+         (loop (+ i 1) (+ k 1)))
+        (else (loop (+ i 1) k)))))
+  (Ok (clr-take t picked count)))
+
+;; How many rows `where-rows` would keep.
+(: (-> Table (Row %r) (-> %r bool) (Result TableError int)))
+(defun (count-rows t spec keep?)
+  (def (Ok rd) ((record-ref spec bind) t) :propagate)
+  (def row-ref (record-ref rd ref))
+  (def valid? (record-ref rd valid?))
+  (def n (table-row-count t))
+  (Ok (let loop ((i 0) (k 0))
+        (cond
+          ((= i n) k)
+          ((and (valid? i) (keep? (row-ref i))) (loop (+ i 1) (+ k 1)))
+          (else (loop (+ i 1) k))))))
+
+;; The table with a column `name` of `f` of each row: in place of the column
+;; of that name, or after the others. A row where a column the spec reads is
+;; null has a null.
+(: (-> Table string (Row %r) (-> %r %b) (Result TableError Table)))
+(defun (create-column t name spec f)
+  (def (Ok rd) ((record-ref spec bind) t) :propagate)
+  (def row-ref (record-ref rd ref))
+  (def valid? (record-ref rd valid?))
+  (table-with t name
+    (loop (:for i (range 0 (table-row-count t)))
+          (:acc (column-building/option (if (valid? i) (Some (f (row-ref i))) None))))))
+
+;; ===========================================================================
+;; Collectors
+;; ===========================================================================
+;;
+;; The columns are found before the loop, where an Err can propagate, and the
+;; loop walks their cells side by side, one Option per row:
+;;
+;;     (def* ((Ok price) (column-as sales "price") :propagate)
+;;           ((Ok qty) (column-as sales "qty") :propagate))
+;;     (loop (:for row (range 0 (table-row-count sales)))
+;;           (:for p* price) (:for q* qty)
+;;           (:when-let (Some p) p*) (:when-let (Some q) q*)
+;;           (:when (> p 250.0))
+;;           (:acc (selecting sales row)))
+;;
+;; `selecting` makes the table of the rows it was given, and the two
+;; `column-building`s make a column, which `table-with` adds to a table.
+
+;; The rows of a table whose numbers it is given, in that order.
+(type (: Selecting #:opaque (Struct (: table Table))))
+
+(: (-> Table Selecting))
+(defun (selecting t) (Selecting (table t)))
+
+(impl (Collector Selecting)
+  (type %elem int)
+  (type %acc Selection)
+  (type %out Table)
+  (defun (collector-init c) (selection-make))
+  (defun (collector-step c acc row) (selection-add acc row))
+  (defun (collector-finish c acc) (selection-take acc (record-ref c table))))
+
+;; A column of the values it is given. The type of the column is theirs: a
+;; number, bool or string.
+(type (: (ColumnBuilding %a) (Union column-building)))
+
+(impl (Collector (ColumnBuilding %a))
+  (type %elem %a)
+  (type %acc (Builder %a))
+  (type %out AnyColumn)
+  (defun (collector-init c) (builder-make 1024))
+  (defun (collector-step c acc x) (builder-add acc x))
+  (defun (collector-finish c acc) (builder-build acc)))
+
+;; The same, of Options: a null at each None.
+(type (: (ColumnBuildingOption %a) (Union column-building/option)))
+
+(impl (Collector (ColumnBuildingOption %a))
+  (type %elem (Option %a))
+  (type %acc (Builder %a))
+  (type %out AnyColumn)
+  (defun (collector-init c) (builder-make 1024))
+  (defun (collector-step c acc x) (builder-add-option acc x))
+  (defun (collector-finish c acc) (builder-build acc)))
+
+;; For each key, what the inner collector makes of the values with that key:
+;;
+;;     (:acc by-region (grouping summing (Tuple region price)))
+;;
+;; is a map from each region to the sum of its prices. Each key has an
+;; accumulator of the inner collector, made at its first value.
+(type (: (Grouping %c %k) #:opaque (Struct (: inner %c))))
+
+(: (-> %c (Grouping %c %k)))
+(defun (grouping inner) (Grouping (inner inner)))
+
+(impl (Collector (Grouping %c %k))
+  (where (Collector %c) (Eq %k))
+  (type %elem (Tuple %k (assoc Collector elem %c)))
+  (type %acc (MutableMap %k (assoc Collector acc %c)))
+  (type %out (Map %k (assoc Collector out %c)))
+  (defun (collector-init g) (mutablemap))
+  (defun (collector-step g m kx)
+    (def (k x) kx)
+    (def inner (record-ref g inner))
+    (def before (match (mutablemap-try-ref m k)
+                  ((Some a) a)
+                  (None (collector-init inner))))
+    (mutablemap-set! m k (collector-step inner before x))
+    m)
+  (defun (collector-finish g m)
+    (def inner (record-ref g inner))
+    {mapping (Tuple k (collector-finish inner a)) (:for (Tuple k a) m)}))
+
+;; Two collectors at once, of the two sides of each element: with
+;; `grouping`, two aggregates of each group.
+;;
+;;     (grouping (pairing summing counting) (Tuple region (Tuple price price)))
+(type (: (Pairing %c %d) #:opaque (Struct (: left %c) (: right %d))))
+
+(: (-> %c %d (Pairing %c %d)))
+(defun (pairing c d) (Pairing (left c) (right d)))
+
+(impl (Collector (Pairing %c %d))
+  (where (Collector %c) (Collector %d))
+  (type %elem (Tuple (assoc Collector elem %c) (assoc Collector elem %d)))
+  (type %acc (Tuple (assoc Collector acc %c) (assoc Collector acc %d)))
+  (type %out (Tuple (assoc Collector out %c) (assoc Collector out %d)))
+  (defun (collector-init p)
+    (Tuple (collector-init (record-ref p left)) (collector-init (record-ref p right))))
+  (defun (collector-step p acc xy)
+    (def (a b) acc)
+    (def (x y) xy)
+    (Tuple (collector-step (record-ref p left) a x) (collector-step (record-ref p right) b y)))
+  (defun (collector-finish p acc)
+    (def (a b) acc)
+    (Tuple (collector-finish (record-ref p left) a) (collector-finish (record-ref p right) b))))
+
+;; The table of a map, as `grouping` makes: a column of the keys and a
+;; column of the values, in the map's order.
+(: (-> (Map %k %v) string string (Result TableError Table)))
+(defun (map->table m key-name value-name)
+  (make-table [(named-any key-name {column-building k (:for (Tuple k _) m)})
+               (named-any value-name {column-building v (:for (Tuple _ v) m)})]))
+
+;; The table with the column under `name`: in place of the column of that
+;; name, or after the others. It has to have a value or a null for each row.
+(: (-> Table string AnyColumn (Result TableError Table)))
+(defun (table-with t name c)
+  (if (= (any-length c) (table-row-count t))
+      (Ok (clr-with-column t name c))
+      (Err (TableError (message (str "the column '" name "' has " (int->string (any-length c))
+                                     " rows, and the table has " (int->string (table-row-count t)) "."))))))

@@ -1,0 +1,129 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/query.bjo — the function layer of (bjostat query) against
+;; loops written by hand over the same columns.
+;;
+;;     bjo bench bench/query.bjo --all
+;;
+;; A table of 1 000 000 rows: a price (double), a quantity (long) and a
+;; region (string), without nulls. The test keeps the rows where the price is
+;; over 250 and the quantity over 20, about a quarter of them.
+
+(import (std prelude))
+(import (std bench))
+(import (bjostat table))
+(import (bjostat query))
+
+(: int)
+(def rows 1000000)
+
+(: Table)
+(def sales
+  (match (make-table
+           [(named "price" (array->column (vec->array {vecing (cast double (% (* i 7919) 500))
+                                                              (:for i (range 0 rows))})))
+            (named "qty" (array->column (vec->array {vecing (cast long (% (* i 31) 40))
+                                                            (:for i (range 0 rows))})))
+            (named-strings "region" (array->string-column
+                                      (vec->array {vecing (vec-ref ["north" "south" "east" "west"] (% i 4))
+                                                          (:for i (range 0 rows))})))])
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: (Row (Tuple double long)))
+(def price-qty (both (col "price") (col "qty")))
+
+;; The test, through a row spec: a closure for the row, one for each column,
+;; and a tuple.
+(def/bench "count-rows"
+  (ok (count-rows sales price-qty (fun ((Tuple p q)) (and (> p 250.0) (> q 20L))))))
+
+;; The same test through cells, with no closure: what a macro could write.
+(def/bench "cells loop"
+  (def p (ok (column-as sales "price")))
+  (def q (ok (column-as sales "qty")))
+  (let loop ((i 0) (k 0))
+    (cond
+      ((= i rows) k)
+      ((and (> (cells-ref p i) 250.0) (> (cells-ref q i) 20L)) (loop (+ i 1) (+ k 1)))
+      (else (loop (+ i 1) k)))))
+
+;; The same test as a loop form over the cells, with the SQL rule written
+;; out: what the macros are to write.
+(def/bench "loop form"
+  (def p (ok (column-as sales "price")))
+  (def q (ok (column-as sales "qty")))
+  (loop (:for p* p) (:for q* q)
+        (:when-let (Some price) p*) (:when-let (Some qty) q*)
+        (:when (and (> price 250.0) (> qty 20L)))
+        (:acc (counting price))))
+
+;; The same test over the spans of the typed columns.
+(def/bench "span loop"
+  (def p (column-values (ok (doubles sales "price"))))
+  (def q (column-values (ok (longs sales "qty"))))
+  (let loop ((i 0) (k 0))
+    (cond
+      ((= i rows) k)
+      ((and (> (ro-span-ref p i) 250.0) (> (ro-span-ref q i) 20L)) (loop (+ i 1) (+ k 1)))
+      (else (loop (+ i 1) k)))))
+
+;; where-rows: the count above and the gather of the rows kept, all three
+;; columns.
+(def/bench "where-rows"
+  (table-row-count (ok (where-rows sales price-qty (fun ((Tuple p q)) (and (> p 250.0) (> q 20L)))))))
+
+;; where-rows as a loop over cells with `selecting`.
+(def/bench "loop, selecting"
+  (def p (ok (column-as sales "price")))
+  (def q (ok (column-as sales "qty")))
+  (table-row-count
+    (loop (:for row (range 0 rows))
+          (:for p* p) (:for q* q)
+          (:when-let (Some price) p*) (:when-let (Some qty) q*)
+          (:when (and (> price 250.0) (> qty 20L)))
+          (:acc (selecting sales row)))))
+
+;; create-column as a loop over cells with `column-building/option`.
+(def/bench "loop, column-building"
+  (def p (ok (column-as sales "price")))
+  (def q (ok (column-as sales "qty")))
+  (table-column-count
+    (ok (table-with sales "revenue"
+          (loop (:for p* p) (:for q* q)
+                (:acc (column-building/option
+                        (match (Tuple p* q*)
+                          ((Tuple (Some price) (Some qty)) (Some (* price (cast double (: qty long)))))
+                          (_ None)))))))))
+
+;; The sum of the prices of each region: four keys, strings.
+(def/bench "grouping, string keys"
+  (def r (ok (column-as sales "region")))
+  (def p (ok (column-as sales "price")))
+  (map-length
+    (loop (:for r* r) (:for p* p)
+          (:when-let (Some region) r*) (:when-let (Some price) p*)
+          (:acc (grouping summing (Tuple (: region string) (: price double)))))))
+
+;; The same, by quantity: forty keys, longs.
+(def/bench "grouping, long keys"
+  (def q (ok (column-as sales "qty")))
+  (def p (ok (column-as sales "price")))
+  (map-length
+    (loop (:for q* q) (:for p* p)
+          (:when-let (Some qty) q*) (:when-let (Some price) p*)
+          (:acc (grouping summing (Tuple (: qty long) (: price double)))))))
+
+(def/bench "create-column"
+  (table-column-count (ok (create-column sales "revenue" price-qty
+                                         (fun ((Tuple p q)) (* p (cast double q)))))))
+
+(run-benches)

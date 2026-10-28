@@ -34,6 +34,10 @@
   column-values column-length column-null-count column-valid? column-ref
   string-column-length string-column-null-count string-column-ref
 
+  ;; Cells: a column at the type its use gives
+  Cells column-as cells-ref cells-get cells-valid? cells-length cells-null-count
+  NotNull skip-nulls
+
   ;; Aggregates
   column-sum column-mean column-min column-max column-count
 
@@ -53,7 +57,8 @@
   (Table (: Apache.Arrow.RecordBatch))
   (AnyColumn (: Apache.Arrow.IArrowArray))
   ((Column %a) (: Apache.Arrow.PrimitiveArray))
-  (StringColumn (: Apache.Arrow.StringArray)))
+  (StringColumn (: Apache.Arrow.StringArray))
+  ((ClrCells %a) (: Bjostat.Cells)))
 
 (import/extern
   ;; Any column
@@ -78,6 +83,15 @@
   (string-column-length (: Bjostat.Columns.StringsLength (-> StringColumn int)))
   (string-column-null-count (: Bjostat.Columns.StringsNullCount (-> StringColumn int)))
   (string-column-ref (: Bjostat.Columns.StringRef (-> StringColumn int (Option string))))
+
+  ;; Cells, at the type their use gives
+  (clr-cells-of (: Bjostat.CellsOps.Of (-> AnyColumn (Option (ClrCells %a)))))
+  (clr-cells-name (: Bjostat.CellsOps.NameOf (-> (Option (ClrCells %a)) string)))
+  (clr-cells-ref (: Bjostat.CellsOps.Ref (-> (ClrCells %a) int %a)))
+  (clr-cells-get (: Bjostat.CellsOps.Get (-> (ClrCells %a) int (Option %a))))
+  (clr-cells-valid? (: Bjostat.CellsOps.IsValid (-> (ClrCells %a) int bool)))
+  (clr-cells-length (: Bjostat.CellsOps.Length (-> (ClrCells %a) int)))
+  (clr-cells-null-count (: Bjostat.CellsOps.NullCount (-> (ClrCells %a) int)))
 
   ;; Building. The flags are empty for a column with no nulls, or one for
   ;; each value, #f at a null.
@@ -199,6 +213,84 @@
 
 (: (-> Table string (Result TableError StringColumn)))
 (defun (strings t name) (typed t name String as-strings))
+
+;; The column `name` as cells of the type the caller uses them at, or an Err
+;; that says what the column holds. No type is written: in
+;;
+;;     (def (Ok price) (column-as t "price") :propagate)
+;;     (> (cells-ref price 0) 10.0)
+;;
+;; the comparison with 10.0 makes them cells of double.
+;; A column read at one type. A struct around the cells of the glue, so that
+;; it can be Iterable, which a .NET type cannot be outside the prelude.
+(type (: (Cells %a) #:opaque (Struct (: clr (ClrCells %a)))))
+
+(: (-> (Cells %a) int %a))
+(defun (cells-ref c i) (clr-cells-ref (record-ref c clr) i))
+
+;; The value at row `i`, or None at a null.
+(: (-> (Cells %a) int (Option %a)))
+(defun (cells-get c i) (clr-cells-get (record-ref c clr) i))
+
+(: (-> (Cells %a) int bool))
+(defun (cells-valid? c i) (clr-cells-valid? (record-ref c clr) i))
+
+(: (-> (Cells %a) int))
+(defun (cells-length c) (clr-cells-length (record-ref c clr)))
+
+(: (-> (Cells %a) int))
+(defun (cells-null-count c) (clr-cells-null-count (record-ref c clr)))
+
+(: (-> Table string (Result TableError (Cells %a))))
+(defun (column-as t name)
+  (def (Ok c) (find-column t name) :propagate)
+  (def found (clr-cells-of c))
+  (match found
+    ((Some cells) (Ok (Cells (clr cells))))
+    (None (refuse (str "'" name "' is a column of " (type-text (type-of-column c))
+                       ", not of " (clr-cells-name found) ".")))))
+
+;; A loop over cells has an Option for each row, None at a null, so that two
+;; columns walked side by side stay on one row:
+;;
+;;     (loop (:for p* price) (:for q* qty)
+;;           (:when-let (Some p) p*) (:when-let (Some q) q*)
+;;           (:acc (summing (* p q))))
+;;
+;; An Option is a struct, so a null costs a flag, not an allocation.
+(impl (Iterable (Cells %a))
+  (type %elem (Option %a))
+  (type %cursor int)
+  (defun (iterable-start c) 0)
+  (defun (iterable-done? c i) (>= i (cells-length c)))
+  (defun (iterable-current c i) (cells-get c i))
+  (defun (iterable-next c i) (+ i 1))
+  (defun (count c) (cells-length c)))
+
+;; The values of cells that are not null, as Julia's skipmissing: for a loop
+;; over one column. Next to another column it would not stay on its row.
+(type (: (NotNull %a) #:opaque (Record (: cells (Cells %a)))))
+
+(: (-> (Cells %a) (NotNull %a)))
+(defun (skip-nulls c) (NotNull (cells c)))
+
+;; The first row from `i` on that is not null, or the length.
+(: (-> (Cells %a) int int))
+(defun (next-valid c i)
+  (cond
+    ((= (cells-null-count c) 0) i)
+    ((>= i (cells-length c)) i)
+    ((cells-valid? c i) i)
+    (else (next-valid c (+ i 1)))))
+
+(impl (Iterable (NotNull %a))
+  (type %elem %a)
+  (type %cursor int)
+  (defun (iterable-start s) (next-valid (record-ref s cells) 0))
+  (defun (iterable-done? s i) (>= i (cells-length (record-ref s cells))))
+  (defun (iterable-current s i) (cells-ref (record-ref s cells) i))
+  (defun (iterable-next s i) (next-valid (record-ref s cells) (+ i 1)))
+  (defun (count s) (- (cells-length (record-ref s cells)) (cells-null-count (record-ref s cells)))))
 
 ;; How many values are not null.
 (: (-> (Column %a) int))

@@ -30,6 +30,87 @@ program wants static types.
 - Not yet: other null markers such as ~NA~, booleans, dates, and columns
   that are skipped.
 
+** Done: the function layer of queries (bjostat query)
+
+- ~(column-as t name)~ gives ~(Cells %a)~ at the type its use gives; the
+  check of the Arrow type against ~%a~ is in the glue, by ~typeof(T)~.
+- A row spec is ~col~ and ~both~, as the applicative of Laurent Mazare's
+  OCaml ~dataframe~: ~(both (col "price") (col "qty"))~ is a
+  ~(Row (Tuple double long))~, checked against the schema before a row is
+  read.
+- ~where-rows~, ~count-rows~ and ~create-column~ take a spec and a
+  function. Nulls are as in SQL. ~where-rows~ gathers the rows kept in the
+  glue: fixed-width types by their width, strings, booleans, and runs of
+  slices for the rest.
+
+Measured on 1 000 000 rows, two columns read (bench/query.bjo):
+
+| Loop                          | Time        | Against spans |
+|-------------------------------+-------------+---------------|
+| over the spans, by hand       | 0.38–0.50 ms | 1             |
+| over cells, by hand           | 0.75–1.3 ms | 2–3           |
+| ~count-rows~: closures, tuple | 5.8–6.7 ms  | 12–15         |
+| ~where-rows~: count and gather | 7.4–8.9 ms |               |
+
+So the macros write the loop over cells themselves, with the body in it,
+and the function layer is for names known only at run time. A cell read
+first made a span of the buffer each time; Arrow's own buffers are native
+memory, so cells now pin them once and read through a pointer (1.8 to
+1.3 ms in one run). A struct for cells gained nothing.
+
+Cells are ~Iterable~, with an ~(Option %a)~ for each row, so a ~loop~ walks
+columns side by side and the SQL rule is ~:when-let~:
+
+#+BEGIN_SRC scheme
+(loop (:for p* price) (:for q* qty)
+      (:when-let (Some p) p*) (:when-let (Some q) q*)
+      (:when (and (> p 250.0) (> q 20L)))
+      (:acc (counting p)))
+#+END_SRC
+
+That loop takes 1.51 ms where the loop over cells by hand takes 1.44 ms, in
+one run: an Option is a struct, and the null costs about 5%. So the macros
+expand to this loop form, and a program can write it too. ~skip-nulls~ walks
+only the values, as Julia's ~skipmissing~, for one column on its own.
+
+** Done: collectors, for loops over cells
+
+The columns are found before the loop, with ~column-as~ in a ~def~ where an
+~Err~ can propagate, and the loop does the rest. There is no query form of
+its own: ~where~ is a ~:when~, ~create~ a ~:let~, and ~aggregate~ an ~:acc~,
+so a pipeline is one loop and makes no table between its steps.
+
+- ~(selecting t row)~: the table of the rows kept. 4.4 ms on 1 000 000 rows,
+  against 8.6 ms for ~where-rows~.
+- ~(column-building x)~ and ~(column-building/option o)~: a column, with a
+  null at each ~None~; ~table-with~ adds it. 3.5 ms; the arrays come from the
+  shared pool, as in the CSV reader, and before that it took 13.4 ms.
+- ~(grouping c (Tuple key x))~: a map from each key to what the collector
+  ~c~ makes of its values. ~(pairing c d)~ is two collectors at once, so
+  ~(grouping (pairing summing counting) ...)~ gives two aggregates of each
+  group. ~map->table~ makes a table of a map. A collector over a collector
+  needed nothing new in Bjolang: the implementation names the associated
+  types of the inner one, as ~(assoc Collector acc %c)~.
+
+~grouping~ is slow yet: 52 ms by four string keys, 12 ms by forty long
+keys. A string key is copied out of Arrow and hashed at each row; the long
+keys allocate 30 bytes a row, maybe the inner collector's values boxed
+through its dictionary. To do: codes for the strings of a column, found
+once, so that a group is found by an int; and a look at what the long keys
+allocate.
+
+A number that only ~summing~ uses is an ~int~, as Bjolang reads a literal,
+so the column is asked for as ints, and a column of doubles is an ~Err~ at
+run time. Such a value needs its type written.
+
+Found in the Bjolang compiler:
+- A column type that nothing decides is left as ~object~, and C# then
+  refuses the call of ~col~. It should be a Bjolang error that asks for the
+  type.
+- The inferred ~where~ clauses are on functions only, not on type
+  declarations: a Bjolang struct holding a ~Cells<T>~ with ~where T : struct~
+  is refused by C#. The glue's ~Cells<T>~ has no constraint for that reason.
+
 ** Next: queries, checked before they run
 
 A query is a value, a plan, not a series of calls:

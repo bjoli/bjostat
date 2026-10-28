@@ -27,6 +27,12 @@
     ((Ok _) "no error")
     ((Err e) (displayed e))))
 
+(: (-> int int))
+(defun (int-of n) n)
+
+(: (-> Table string (Result TableError (Cells double))))
+(defun (double-cells t name) (column-as t name))
+
 (: (-> Table))
 (defun (sales)
   (ok (make-table
@@ -76,6 +82,35 @@
   (expect "a null" (column-ref rating 1) None)
   (expect "the nulls" (column-null-count rating) 1)
   (expect "valid?" (column-valid? rating 1) #f)
+
+  ;; Cells: the type comes from their use
+  (def price-cells (ok (column-as t "price")))
+  (expect "cells of double, from a comparison" (> (cells-ref price-cells 1) 15.0) #t)
+  (def region-cells (ok (column-as t "region")))
+  (expect "cells of string" (string-append (cells-ref region-cells 2) "!") "north!")
+  (def rating-cells (ok (column-as t "rating")))
+  (expect "cells of int" (+ (cells-ref rating-cells 0) (int-of 1)) 6)
+  (expect "a null in cells" (cells-valid? rating-cells 1) #f)
+  (expect "the nulls of cells" (cells-null-count rating-cells) 1)
+  (expect "the length of cells" (cells-length price-cells) 4)
+  (expect "cells of another type"
+          (error-of (double-cells t "qty"))
+          "'qty' is a column of long, not of double.")
+  (expect "cells of a missing column"
+          (error-of (double-cells t "pricee"))
+          "the table has no column 'pricee'. Its columns are: region, price, qty, rating.")
+
+  ;; Cells in a loop: an Option for each row
+  (expect "a loop over cells" (loop (:for r rating-cells) (:acc (listing r)))
+          (list (Some 5) None (Some 3) (Some 4)))
+  (expect "two columns side by side, the SQL rule by hand"
+          (loop (:for p* price-cells) (:for r* rating-cells)
+                (:when-let (Some p) p*) (:when-let (Some r) r*)
+                (:acc (summing (* p (cast double (: r int))))))
+          122.25)
+  (expect "skip-nulls" (loop (:for r (skip-nulls rating-cells)) (:acc (listing r))) (list 5 3 4))
+  (expect "skip-nulls, a count" (count (skip-nulls rating-cells)) 3)
+  (expect "skip-nulls without nulls" (loop (:for p (skip-nulls price-cells)) (:acc (summing p))) 49.75)
 
   ;; Aggregates: vectorized without nulls, skipping them with
   (expect "sum" (column-sum price) 49.75)
