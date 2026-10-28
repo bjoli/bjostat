@@ -1,0 +1,158 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/dates.bjo — columns of dates and times, as values of
+;; (std datetime): read from CSV, read as cells, made by a loop, sorted,
+;; joined and printed.
+;;
+;;     bjo run tests/dates.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (std datetime))
+(import (bjostat table))
+(import (bjostat csv))
+(import (bjostat query))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result TableError %a) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+;; Dates and times that are there, for the expected values.
+(: (-> (Option %a) %a))
+(defun (there o)
+  (match o
+    ((Some x) x)
+    (None (panic! "no such date or time"))))
+
+(: (-> int int int Date))
+(defun (day y m d) (there (date y m d)))
+
+(: (-> int int int int int int DateTime))
+(defun (at y mo d h mi s) (there (datetime y mo d #:hours h #:minutes mi #:seconds s)))
+
+(: (-> int int int int int int Instant))
+(defun (utc y mo d h mi s) (utc-datetime->instant (at y mo d h mi s)))
+
+(: Table)
+(def visits
+  (ok (csv->table
+        (str "day,at,seen,n\n"
+             "2026-10-28,2026-10-28T14:05,2026-10-28T12:05:30Z,1\n"
+             "1969-12-31,1969-12-31 23:59:59.5,2026-10-28T14:05:30+02:00,2\n"
+             ",,,3\n"
+             "2000-02-29,2000-02-29,1970-01-01T00:00:00.000001-01:30,4\n"))))
+
+(: (-> Table string (Vec (Option Date))))
+(defun (dates-of t name)
+  {vecing d (:for d (ok (date-cells t name)))})
+
+(: (-> Table string (Vec (Option DateTime))))
+(defun (datetimes-of t name)
+  {vecing d (:for d (ok (datetime-cells t name)))})
+
+(: (-> Table string (Vec (Option Instant))))
+(defun (instants-of t name)
+  {vecing d (:for d (ok (instant-cells t name)))})
+
+(: (-> Table string (Result TableError (Cells long))))
+(defun (longs-as t name) (column-as t name))
+
+(: (-> Table string (Vec (Option long))))
+(defun (longs-of t name)
+  {vecing x (:for x (ok (column-as t name)))})
+
+(defun (main)
+  ;; Read from CSV
+  (expect "the types guessed"
+          (vec-map snd (table-schema visits))
+          [Dates DateTimes Instants Long])
+  (expect "dates, as (std datetime) dates"
+          (dates-of visits "day")
+          [(Some (day 2026 10 28)) (Some (day 1969 12 31)) None (Some (day 2000 2 29))])
+  (expect "dates and times, a date alone at midnight"
+          (datetimes-of visits "at")
+          [(Some (at 2026 10 28 14 5 0))
+           (Some (+milliseconds (at 1969 12 31 23 59 59) 500L))
+           None
+           (Some (at 2000 2 29 0 0 0))])
+  (expect "instants, the offsets taken away"
+          (instants-of visits "seen")
+          [(Some (utc 2026 10 28 12 5 30))
+           (Some (utc 2026 10 28 12 5 30))
+           None
+           (Some (+duration (utc 1970 1 1 1 30 0) (duration #:nanoseconds 1000L)))])
+  (expect "a column of dates read at another type"
+          (error-of (longs-as visits "day"))
+          "'day' is a column of date, not of long.")
+  (expect "a column of instants read as dates"
+          (error-of (date-cells visits "seen"))
+          "'seen' is a column of instant, not of date.")
+  (expect "a column of instants read as local dates and times"
+          (error-of (datetime-cells visits "seen"))
+          "'seen' is a column of instant, not of datetime.")
+
+  ;; Made by a loop, and read back
+  (def days (ok (date-cells visits "day")))
+  (def later
+    (loop (:for d* days)
+          (:acc (dates-building (match d* ((Some d) (Some (+days d 1))) (None None))))))
+  (def t2 (ok (table-with visits "next" later)))
+  (expect "a column of dates made by a loop"
+          (dates-of t2 "next")
+          [(Some (day 2026 10 29)) (Some (day 1970 1 1)) None (Some (day 2000 3 1))])
+  (def stamps
+    (loop (:for d* days)
+          (:acc (instants-building
+                  (match d* ((Some d) (Some (utc-datetime->instant (date+time->datetime d (there (time 6 0)))))) (None None))))))
+  (def t3 (ok (table-with visits "stamp" stamps)))
+  (expect "a column of instants made by a loop"
+          (instants-of t3 "stamp")
+          [(Some (utc 2026 10 28 6 0 0)) (Some (utc 1969 12 31 6 0 0)) None (Some (utc 2000 2 29 6 0 0))])
+  (expect "its type" (column-type t3 "stamp") (Some Instants))
+  (def ats (ok (datetime-cells visits "at")))
+  (def hour-later
+    (loop (:for a* ats)
+          (:acc (datetimes-building (match a* ((Some a) (Some (+hours a 1L))) (None None))))))
+  (expect "a column of local dates and times made by a loop"
+          (datetimes-of (ok (table-with visits "later" hour-later)) "later")
+          [(Some (at 2026 10 28 15 5 0))
+           (Some (+milliseconds (at 1970 1 1 0 59 59) 500L))
+           None
+           (Some (at 2000 2 29 1 0 0))])
+
+  ;; Sorted and joined
+  (expect "sorted by date, the null last"
+          (longs-of (ok (table-sort visits [(ascending "day")])) "n")
+          [(Some 2L) (Some 4L) (Some 1L) (Some 3L)])
+  (expect "sorted by instant, down"
+          (longs-of (ok (table-sort visits [(descending "seen")])) "n")
+          [(Some 1L) (Some 2L) (Some 4L) (Some 3L)])
+  (def holidays
+    (ok (csv->table "day,name\n2000-02-29,leap\n2026-10-28,today\n")))
+  (expect "joined by date"
+          (longs-of (ok (inner-join visits holidays ["day"])) "n")
+          [(Some 1L) (Some 4L)])
+
+  ;; Given, and printed
+  (def given (ok (csv->table "when\n2026-10-28\n" #:types [(Tuple "when" DateTimes)])))
+  (expect "a type given" (datetimes-of given "when") [(Some (at 2026 10 28 0 0 0))])
+  (expect "printed"
+          (table->string (ok (table-select visits ["day" "at" "seen"])) #:rows 2)
+          (str "day         at                     seen                \n"
+               "date        datetime               instant             \n"
+               "2026-10-28  2026-10-28T14:05       2026-10-28T12:05:30Z\n"
+               "1969-12-31  1969-12-31T23:59:59.5  2026-10-28T12:05:30Z\n"
+               "… 2 more rows\n"))
+  0)

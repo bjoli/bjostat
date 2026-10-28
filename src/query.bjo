@@ -28,6 +28,7 @@
   ;; Collectors, for a loop over cells
   Selecting selecting
   ColumnBuilding ColumnBuildingOption
+  DatesBuilding DateTimesBuilding InstantsBuilding
   Grouping grouping Pairing pairing
   map->table table-with
 
@@ -37,6 +38,8 @@
   MeanBy mean-by groups->table)
 
 (import (std prelude))
+(import (only (std datetime) Date DateTime Instant date->unix-days instant->unix-microseconds
+              utc-datetime->instant))
 (import (bjostat table))
 (import (std mutable map))
 (import (std mutable vec))
@@ -57,6 +60,8 @@
   (builder-add-option (: Bjostat.BuilderOps.AddOption (-> (Builder %a) (Option %a) (Builder %a))))
   (builder-build (: Bjostat.BuilderOps.Build (-> (Builder %a) AnyColumn)))
   (builder-count (: Bjostat.BuilderOps.Count (-> (Builder %a) int)))
+  (builder-build-dates (: Bjostat.BuilderOps.BuildDates (-> (Builder int) AnyColumn)))
+  (builder-build-micros (: Bjostat.BuilderOps.BuildMicros (-> (Builder long) bool AnyColumn)))
   (builder-extend (: Bjostat.BuilderOps.Extend (-> (Builder %a) int (Builder %a))))
   (builder-span (: Bjostat.BuilderOps.Span (-> (Builder %a) int int (Span %a))))
   (builder-set-null! (: Bjostat.BuilderOps.SetNull (-> (Builder %a) int void)))
@@ -239,6 +244,45 @@
   (defun (block-grow c acc n) (builder-extend acc n))
   (defun (block-span c acc start n) (builder-span acc start n))
   (defun (block-none! c acc i) (builder-set-null! acc i)))
+
+;; Columns of the values of (std datetime), a null at each None: of dates,
+;; of local dates and times (timestamps with no time zone), and of instants
+;; (timestamps in UTC). A column holds days since 1970-01-01, or
+;; microseconds since 1970-01-01T00:00, rounded down.
+(type (: DatesBuilding (Union dates-building)))
+(type (: DateTimesBuilding (Union datetimes-building)))
+(type (: InstantsBuilding (Union instants-building)))
+
+(: (-> (Builder %a) (Option %b) (-> %b %a) (Builder %a)))
+(defun (add-converted acc x convert)
+  (match x
+    ((Some v) (builder-add acc (convert v)))
+    (None (builder-add-option acc None))))
+
+(impl (Collector DatesBuilding)
+  (type %elem (Option Date))
+  (type %acc (Builder int))
+  (type %out AnyColumn)
+  (defun (collector-init c) (builder-make 1024))
+  (defun (collector-step c acc x) (add-converted acc x (fun (d) (cast int (date->unix-days d)))))
+  (defun (collector-finish c acc) (builder-build-dates acc)))
+
+(impl (Collector DateTimesBuilding)
+  (type %elem (Option DateTime))
+  (type %acc (Builder long))
+  (type %out AnyColumn)
+  (defun (collector-init c) (builder-make 1024))
+  (defun (collector-step c acc x)
+    (add-converted acc x (fun (dt) (instant->unix-microseconds (utc-datetime->instant dt)))))
+  (defun (collector-finish c acc) (builder-build-micros acc #f)))
+
+(impl (Collector InstantsBuilding)
+  (type %elem (Option Instant))
+  (type %acc (Builder long))
+  (type %out AnyColumn)
+  (defun (collector-init c) (builder-make 1024))
+  (defun (collector-step c acc x) (add-converted acc x instant->unix-microseconds))
+  (defun (collector-finish c acc) (builder-build-micros acc #t)))
 
 ;; For each key, what the inner collector makes of the values with that key:
 ;;

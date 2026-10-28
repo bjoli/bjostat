@@ -407,7 +407,13 @@ public sealed class Builder<T>
         }
     }
 
-    public IArrowArray Build()
+    public IArrowArray Build() => Build(null);
+
+    /// <summary>
+    /// The column, of <paramref name="type"/> when it is given: a column of
+    /// ints can be one of dates, and one of longs one of timestamps.
+    /// </summary>
+    public IArrowArray Build(IArrowType? type)
     {
         var bitmap = _valid == null ? ArrowBuffer.Empty : new ArrowBuffer(_valid.AsSpan(0, (_count + 7) / 8).ToArray());
         ArrayData data;
@@ -426,7 +432,7 @@ public sealed class Builder<T>
                 System.Buffers.ArrayPool<byte>.Shared.Return(_bytes);
             }
             _bytes = System.Array.Empty<byte>();
-            data = new ArrayData(ArrowType(), _count, _nulls, 0, new[] { bitmap, buffer });
+            data = new ArrayData(type ?? ArrowType(), _count, _nulls, 0, new[] { bitmap, buffer });
         }
         else if (typeof(T) == typeof(Utf8String))
         {
@@ -500,6 +506,16 @@ public static class BuilderOps
     }
 
     public static IArrowArray Build<T>(Builder<T> b) => b.Build();
+
+    /// <summary>A column of dates of a builder of days since 1970.</summary>
+    public static IArrowArray BuildDates(Builder<int> b) => b.Build(TimeKind.ArrowType(TimeKind.Date));
+
+    /// <summary>
+    /// A column of timestamps of a builder of microseconds since 1970: with
+    /// the time zone UTC when <paramref name="zoned"/>, and with none when not.
+    /// </summary>
+    public static IArrowArray BuildMicros(Builder<long> b, bool zoned) =>
+        b.Build(TimeKind.ArrowType(zoned ? TimeKind.Instant : TimeKind.DateTime));
 
     public static int Count<T>(Builder<T> b) => b.Count;
 

@@ -9,7 +9,10 @@
 ;;
 ;; The first row is the names, unless `#:header? #f`. The type of each column
 ;; is guessed from the first `#:guess-rows` rows: long when every field is an
-;; integer, double when every field is a number, string otherwise. Integers
+;; integer, double when every field is a number, date when each is an ISO
+;; date (2026-10-28), datetime when each is an ISO date or date and time
+;; (2026-10-28T14:05:00), instant when each is a date and time with a zone
+;; ('Z' or an offset), string otherwise. Integers
 ;; are guessed as long, not int, so that a large value later in the file
 ;; still fits. `#:types` gives the type of a column by its name, and then
 ;; nothing is guessed for it.
@@ -39,6 +42,7 @@
   (column-add! (: Bjostat.CsvColumn.AddTo (-> CsvColumn string bool)))
   (widen! (: Bjostat.CsvColumn.Widen (-> CsvColumn bool)))
   (column-kind (: Bjostat.CsvColumn.KindOf (-> CsvColumn int)))
+  (join-kinds (: Bjostat.CsvColumn.JoinKinds (-> int int int)))
   (build-column (: Bjostat.CsvColumn.BuildOf (-> CsvColumn AnyColumn))))
 
 (: int) (def kind-empty -1)
@@ -47,10 +51,14 @@
 (: int) (def kind-string 2)
 (: int) (def kind-int 3)
 (: int) (def kind-float 4)
+(: int) (def kind-date 5)
+(: int) (def kind-datetime 6)
+(: int) (def kind-instant 7)
 
 (: (-> int string))
 (defun (kind-name k)
-  (match k (0 "long") (1 "double") (2 "string") (3 "int") (_ "float")))
+  (match k (0 "long") (1 "double") (2 "string") (3 "int") (4 "float")
+           (5 "date") (6 "datetime") (_ "instant")))
 
 (: (-> ColumnType (Option int)))
 (defun (kind-of-type t)
@@ -60,6 +68,9 @@
     (String (Some kind-string))
     (Int (Some kind-int))
     (Float (Some kind-float))
+    (Dates (Some kind-date))
+    (DateTimes (Some kind-datetime))
+    (Instants (Some kind-instant))
     ((Other _) None)))
 
 (: (-> string (Result TableError %a)))
@@ -142,7 +153,7 @@
                   (string-join (array->vec names) ", ") ".")))
     ((Tuple _ (Some p))
      (refuse (str "#:types gives '" (fst p) "' the type " (displayed (snd p))
-                  ", and a CSV column can be int, long, float, double or string.")))
+                  ", and a CSV column can be int, long, float, double, string, date, datetime or instant.")))
     (_ (Ok {vecing (match (find (fun (p) (= (fst p) name)) types)
                      ((Some p) (kind-of-type (snd p)))
                      (None None))
@@ -179,7 +190,7 @@
 ;; column with no value.
 (: (-> (Vec (Tuple int (IArray string))) int int))
 (defun (guess-column rows i)
-  (def k (fold (fun (r k) (max k (guess-field (iarray-ref (snd r) i)))) kind-empty rows))
+  (def k (fold (fun (r k) (join-kinds k (guess-field (iarray-ref (snd r) i)))) kind-empty rows))
   (if (= k kind-empty) kind-string k))
 
 (: (-> (Array CsvColumn) (Array bool) Shape (Vec (Tuple int (IArray string))) (Result TableError Unit)))

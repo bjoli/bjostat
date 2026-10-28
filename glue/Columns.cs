@@ -20,13 +20,14 @@ using Apache.Arrow.Types;
 
 namespace Bjostat;
 
-public static class Columns
+public static partial class Columns
 {
     // ---------------------------------------------------------------------
     // Any column
 
     /// <summary>The name of the Arrow type id: Double, Int64, String and so on.</summary>
-    public static string TypeName(IArrowArray a) => a.Data.DataType.TypeId.ToString();
+    public static string TypeName(IArrowArray a) =>
+        a.Data.DataType is TimestampType { Timezone: not (null or "") } ? "TimestampTz" : a.Data.DataType.TypeId.ToString();
 
     public static int Length(IArrowArray a) => a.Length;
 
@@ -212,8 +213,27 @@ public static class Columns
             UInt8Array b => b.GetValue(i)!.Value.ToString(c),
             BooleanArray b => b.GetValue(i)!.Value ? "#t" : "#f",
             StringArray s => s.GetString(i),
+            // ISO 8601, as (std datetime) writes them.
+            Date32Array d => DateOnly.FromDayNumber(d.GetValue(i)!.Value + TimeKind.EpochDayNumber).ToString("yyyy-MM-dd", c),
+            TimestampArray t => TimestampText(t, i),
             _ => "<" + a.Data.DataType.Name + ">",
         };
+    }
+}
+
+public static partial class Columns
+{
+    // A timestamp as ISO 8601: the date and time, with the seconds and their
+    // fraction only when they are not 0, and "Z" for one with a time zone.
+    private static string TimestampText(TimestampArray a, int i)
+    {
+        var type = (TimestampType)a.Data.DataType;
+        var dt = new DateTime(TimeKind.Ticks(a.GetValue(i)!.Value, type.Unit), DateTimeKind.Unspecified);
+        string format = dt.Ticks % TimeSpan.TicksPerSecond != 0 ? "yyyy-MM-ddTHH:mm:ss.FFFFFFF"
+            : dt.Second != 0 ? "yyyy-MM-ddTHH:mm:ss"
+            : "yyyy-MM-ddTHH:mm";
+        string zone = string.IsNullOrEmpty(type.Timezone) ? "" : "Z";
+        return dt.ToString(format, CultureInfo.InvariantCulture) + zone;
     }
 }
 

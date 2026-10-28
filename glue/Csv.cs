@@ -45,6 +45,11 @@ public sealed class CsvColumn
     public const int String = 2;
     public const int Int = 3;
     public const int Float = 4;
+    // ISO 8601: a date, a date and time with no zone, and one with a zone
+    // ('Z' or an offset), which is an instant. See Times.cs.
+    public const int Date = 5;
+    public const int DateTime = 6;
+    public const int Instant = 7;
 
     private int _kind;
     private int _count;
@@ -70,8 +75,11 @@ public sealed class CsvColumn
         _kind = kind;
         switch (kind)
         {
-            case Int: _ints = Rent<int>(FirstCapacity); break;
-            case Long: _longs = Rent<long>(FirstCapacity); break;
+            case Int:
+            case Date: _ints = Rent<int>(FirstCapacity); break;
+            case Long:
+            case DateTime:
+            case Instant: _longs = Rent<long>(FirstCapacity); break;
             case Float: _floats = Rent<float>(FirstCapacity); break;
             case Double: _doubles = Rent<double>(FirstCapacity); break;
             case String:
@@ -111,6 +119,15 @@ public sealed class CsvColumn
                 if (!ParseDouble(s, out double d)) return false;
                 Put(ref _doubles!, d);
                 break;
+            case Date:
+                if (!TryDate(s, out int days)) return false;
+                Put(ref _ints!, days);
+                break;
+            case DateTime:
+            case Instant:
+                if (!TryTimestamp(s, out long micros, out bool zoned) || zoned != (_kind == Instant)) return false;
+                Put(ref _longs!, micros);
+                break;
             default:
                 PutBytes(s);
                 break;
@@ -125,8 +142,11 @@ public sealed class CsvColumn
         // The value under a null is 0, or no bytes.
         switch (_kind)
         {
-            case Int: Put(ref _ints!, 0); break;
-            case Long: Put(ref _longs!, 0L); break;
+            case Int:
+            case Date: Put(ref _ints!, 0); break;
+            case Long:
+            case DateTime:
+            case Instant: Put(ref _longs!, 0L); break;
             case Float: Put(ref _floats!, 0f); break;
             case Double: Put(ref _doubles!, 0.0); break;
             default: PutBytes(default); break;
@@ -197,6 +217,9 @@ public sealed class CsvColumn
             Long => Primitive(Int64Type.Default, _longs!, bitmap),
             Float => Primitive(FloatType.Default, _floats!, bitmap),
             Double => Primitive(DoubleType.Default, _doubles!, bitmap),
+            Date => Primitive(Date32Type.Default, _ints!, bitmap),
+            DateTime => Primitive(TimeKind.ArrowType(TimeKind.DateTime), _longs!, bitmap),
+            Instant => Primitive(TimeKind.ArrowType(TimeKind.Instant), _longs!, bitmap),
             _ => Strings(bitmap),
         };
         Release();
@@ -288,14 +311,121 @@ public sealed class CsvColumn
         }
     }
 
-    /// <summary>The narrowest kind of Long, Double and String that holds the field, or Empty.</summary>
+    /// <summary>The narrowest kind that holds the field, or Empty.</summary>
     public static int Guess(Utf8String field)
     {
         var s = field.AsSpan();
         if (s.IsEmpty) return Empty;
         if (TryLong(s, out _)) return Long;
         if (TryDouble(s, out _)) return Double;
+        if (TryDate(s, out _)) return Date;
+        if (TryTimestamp(s, out _, out bool zoned)) return zoned ? Instant : DateTime;
         return String;
+    }
+
+    /// <summary>
+    /// The narrowest kind that holds the values of two kinds: longs and
+    /// doubles are doubles, dates and dates with times are dates with times,
+    /// and other kinds together are strings.
+    /// </summary>
+    public static int Join(int a, int b)
+    {
+        if (a == Empty) return b;
+        if (b == Empty || a == b) return a;
+        if ((a == Long && b == Double) || (a == Double && b == Long)) return Double;
+        if ((a == Date && b == DateTime) || (a == DateTime && b == Date)) return DateTime;
+        return String;
+    }
+
+    // ---------------------------------------------------------------------
+    // Dates and times, ISO 8601: 2026-10-28 is a date; 2026-10-28T14:05,
+    // with seconds and a fraction if any, and 'T' or ' ' between, is a date
+    // and time; one that ends in 'Z', +02:00, -0530 or +02 is an instant. A
+    // date alone is a date and time at midnight where a column has both.
+
+    private static int Digits(ReadOnlySpan<byte> s, int at, int n)
+    {
+        int v = 0;
+        for (int i = at; i < at + n; i++)
+        {
+            int d = s[i] - '0';
+            if ((uint)d > 9) return -1;
+            v = v * 10 + d;
+        }
+        return v;
+    }
+
+    private static bool TryDate(ReadOnlySpan<byte> s, out int days)
+    {
+        days = 0;
+        if (s.Length != 10 || s[4] != '-' || s[7] != '-') return false;
+        int y = Digits(s, 0, 4), m = Digits(s, 5, 2), d = Digits(s, 8, 2);
+        if (y < 1 || m < 1 || m > 12 || d < 1 || d > System.DateTime.DaysInMonth(y, m)) return false;
+        days = new DateOnly(y, m, d).DayNumber - TimeKind.EpochDayNumber;
+        return true;
+    }
+
+    private static bool TryTimestamp(ReadOnlySpan<byte> s, out long micros, out bool zoned)
+    {
+        micros = 0;
+        zoned = false;
+        if (s.Length == 10)
+        {
+            if (!TryDate(s, out int dateOnly)) return false;
+            micros = dateOnly * 86_400_000_000L;
+            return true;
+        }
+        if (s.Length < 16 || (s[10] != 'T' && s[10] != ' ') || s[13] != ':') return false;
+        if (!TryDate(s[..10], out int days)) return false;
+        int h = Digits(s, 11, 2), min = Digits(s, 14, 2);
+        if (h < 0 || h > 23 || min < 0 || min > 59) return false;
+        long ticks = h * TimeSpan.TicksPerHour + min * TimeSpan.TicksPerMinute;
+        int at = 16;
+        if (at < s.Length && s[at] == ':')
+        {
+            if (at + 3 > s.Length) return false;
+            int sec = Digits(s, at + 1, 2);
+            if (sec < 0 || sec > 59) return false;
+            ticks += sec * TimeSpan.TicksPerSecond;
+            at += 3;
+            if (at < s.Length && s[at] == '.')
+            {
+                int start = ++at;
+                long fraction = 0, scale = TimeSpan.TicksPerSecond;
+                while (at < s.Length && (uint)(s[at] - '0') <= 9)
+                {
+                    if (scale > 1)
+                    {
+                        scale /= 10;
+                        fraction += (s[at] - '0') * scale;
+                    }
+                    at++;
+                }
+                if (at == start) return false;
+                ticks += fraction;
+            }
+        }
+        if (at < s.Length)
+        {
+            int offset;
+            if (s[at] == 'Z' && at + 1 == s.Length) offset = 0;
+            else if (s[at] == '+' || s[at] == '-')
+            {
+                var z = s[(at + 1)..];
+                int oh, om = 0;
+                if (z.Length == 2) oh = Digits(z, 0, 2);
+                else if (z.Length == 4) { oh = Digits(z, 0, 2); om = Digits(z, 2, 2); }
+                else if (z.Length == 5 && z[2] == ':') { oh = Digits(z, 0, 2); om = Digits(z, 3, 2); }
+                else return false;
+                if (oh < 0 || oh > 23 || om < 0 || om > 59) return false;
+                offset = (oh * 60 + om) * (s[at] == '-' ? -1 : 1);
+            }
+            else return false;
+            zoned = true;
+            ticks -= offset * TimeSpan.TicksPerMinute;
+        }
+        micros = days * 86_400_000_000L + (ticks >= 0 ? ticks / 10 : -((-ticks + 9) / 10));
+        return true;
     }
 
     // Static forms, for Bjolang's import/extern.
@@ -307,6 +437,8 @@ public sealed class CsvColumn
     public static bool Widen(CsvColumn c) => c.WidenToDouble();
 
     public static int KindOf(CsvColumn c) => c.Kind;
+
+    public static int JoinKinds(int a, int b) => Join(a, b);
 
     public static IArrowArray BuildOf(CsvColumn c) => c.Build();
 }

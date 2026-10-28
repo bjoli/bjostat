@@ -46,6 +46,7 @@ a copy.
 | ~(named-any name c)~ | The same, for an Arrow column of any type |
 | ~(table-select t names)~, ~(table-slice t #:from #:to)~ | Part of a table, without a copy |
 | ~(table-sort t [(ascending name) (descending name) …])~ | The rows in the order of the keys, as R's ~order~: stable, nulls last |
+| ~(date-cells t name)~, ~datetime-cells~, ~instant-cells~ | A column of dates or timestamps; a loop over it gets ~Date~, ~DateTime~ or ~Instant~ of ~(std datetime)~ |
 | ~(inner-join a b keys)~, ~left-join~, ~semi-join~, ~anti-join~ | The rows whose keys are equal, as dplyr's joins: left order, two nulls equal, ~.x~ and ~.y~ on shared names |
 | ~(read-arrow path)~, ~(write-arrow t path)~ | Arrow IPC files |
 | ~(table->string t #:rows 10 #:digits 1)~ | The names, the types and the first rows, as text; ~#:digits~ rounds the doubles |
@@ -59,7 +60,11 @@ over ~column-values~ reads ~column-valid?~ when ~column-null-count~ is not 0.
 ~column-values~ is a loop over a span, as fast as one over an array.
 
 *Types.* A column of ~double~, ~float~, ~long~, ~int~ or ~string~ can be
-taken out typed. Every other Arrow type, such as timestamps and booleans, is
+taken out typed. A column of dates holds days since 1970-01-01, and one of
+timestamps microseconds since 1970-01-01T00:00, as in Arrow and Polars; its
+cells are ~Date~, ~DateTime~ (no time zone) or ~Instant~ (a time zone) of
+~(std datetime)~, made with ~unix-days->date~ and
+~unix-microseconds->instant~. Every other Arrow type, such as booleans, is
 ~(Other name)~ in the schema: a table holds it, prints it and writes it.
 
 ** The module (bjostat csv)
@@ -83,9 +88,13 @@ Both take ~#:header?~ (~#t~), ~#:separator~ (~#\,~), ~#:types~ and
 *Types.* The first row is the names, unless ~#:header? #f~; then the columns
 are ~column-1~, ~column-2~ and so on. The type of a column is guessed from
 the first ~#:guess-rows~ rows: ~long~ when every field is an integer,
-~double~ when every field is a number, ~string~ otherwise. Integers are
+~double~ when every field is a number, ~date~ when each is an ISO date
+(~2026-10-28~), ~datetime~ when each is an ISO date or date and time
+(~2026-10-28T14:05~), ~instant~ when each has a time zone (~Z~ or an
+offset), ~string~ otherwise. Integers are
 guessed as ~long~, not ~int~, so that a large value later in the file still
-fits. ~#:types~ gives the type of a column by name, ~int~ and ~float~ too.
+fits. ~#:types~ gives the type of a column by name, ~int~ and ~float~ too, and
+~Dates~, ~DateTimes~ and ~Instants~.
 
 *Nulls.* An empty field is a null, in a column of any type.
 
@@ -220,6 +229,7 @@ The columns are found first, where a misspelt name is an ~Err~:
 |------------------------+---------------|
 | ~(selecting t row)~ | The table of the rows kept |
 | ~(column-building x)~, ~(column-building/option o)~ | A column, a null at each ~None~ |
+| ~(dates-building o)~, ~datetimes-building~, ~instants-building~ | A column of dates or timestamps of ~(std datetime)~ values, a null at each ~None~ |
 | ~(group-of! groups key)~ and ~summing-by~, ~counting-by~, ~min-by~, ~max-by~, ~mean-by~ | Aggregates by group, ~groups->table~ the table of them |
 | ~(grouping c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |
 | ~(table-with t name c)~ | The table with a column more, or one replaced |

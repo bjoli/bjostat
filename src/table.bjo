@@ -36,6 +36,7 @@
 
   ;; Cells: a column at the type its use gives
   Cells column-as cells-ref cells-get cells-valid? cells-length cells-null-count
+  DateCells DateTimeCells InstantCells date-cells datetime-cells instant-cells
   NotNull skip-nulls
 
   ;; Aggregates
@@ -54,6 +55,8 @@
   table->string)
 
 (import (std prelude))
+(import (only (std datetime) Date DateTime Instant unix-days->date unix-microseconds->instant
+              instant->utc-datetime))
 
 (import/class
   (Table (: Apache.Arrow.RecordBatch))
@@ -97,6 +100,8 @@
   (clr-cells-contiguous? (: Bjostat.CellsOps.IsContiguous (-> (ClrCells %a) bool)))
   (clr-cells-values (: Bjostat.CellsOps.Values (-> (ClrCells %a) (RoSpan %a))))
   (clr-cells-valid (: Bjostat.CellsOps.Valid (-> (ClrCells %a) (RoSpan byte))))
+  (clr-day-cells (: Bjostat.TimeCells.Days (-> AnyColumn (Option (ClrCells int)))))
+  (clr-micro-cells (: Bjostat.TimeCells.Micros (-> AnyColumn bool (Option (ClrCells long)))))
 
   ;; Building. The flags are empty for a column with no nulls, or one for
   ;; each value, #f at a null.
@@ -143,10 +148,12 @@
 (: (-> string (Result TableError %a)))
 (defun (refuse message) (Err (TableError (message message))))
 
-;; The type of a column's values. `Other` is any Arrow type this module does
-;; not take apart yet, by Arrow's name for it: Timestamp, Date32, Boolean and
-;; so on. A table holds it, prints it and writes it.
-(type (: ColumnType (Union Double Float Long Int String (: Other string))))
+;; The type of a column's values. `Dates`, `DateTimes` and `Instants` are
+;; columns of the types Date, DateTime and Instant of (std datetime): Arrow's
+;; Date32, timestamps with no time zone, and timestamps with one. `Other` is any Arrow type this
+;; module does not take apart yet, by Arrow's name for it: Boolean, Decimal
+;; and so on. A table holds it, prints it and writes it.
+(type (: ColumnType (Union Double Float Long Int String Dates DateTimes Instants (: Other string))))
 
 (: (-> AnyColumn ColumnType))
 (defun (type-of-column c)
@@ -156,6 +163,9 @@
     ("Int64" Long)
     ("Int32" Int)
     ("String" String)
+    ("Date32" Dates)
+    ("Timestamp" DateTimes)
+    ("TimestampTz" Instants)
     (name (Other name))))
 
 (: (-> ColumnType string))
@@ -166,6 +176,9 @@
     (Long "long")
     (Int "int")
     (String "string")
+    (Dates "date")
+    (DateTimes "datetime")
+    (Instants "instant")
     ((Other name) name)))
 
 (impl (Displayed ColumnType)
@@ -283,6 +296,88 @@
   (defun (contiguous? c) (clr-cells-contiguous? (record-ref c clr)))
   (defun (contiguous-values c) (clr-cells-values (record-ref c clr)))
   (defun (contiguous-valid c) (clr-cells-valid (record-ref c clr))))
+
+;; Columns of dates and timestamps, as values of (std datetime). A column of
+;; dates holds days since 1970-01-01, and one of timestamps microseconds since
+;; 1970-01-01T00:00; a loop over their cells gets each as an Option of a Date,
+;; a DateTime or an Instant:
+;;
+;;     (def (Ok days) (date-cells t "day") :propagate)
+;;     (loop (:for d* days) (:when-let (Some d) d*) (:acc (counting (->weekday d))))
+;;
+;; A timestamp with no time zone is a DateTime, a local date and time; one
+;; with a time zone is an Instant, a point in time.
+(type (: DateCells #:opaque (Struct (: days (ClrCells int)))))
+(type (: DateTimeCells #:opaque (Struct (: micros (ClrCells long)))))
+(type (: InstantCells #:opaque (Struct (: micros (ClrCells long)))))
+
+(: (-> Table string string (-> AnyColumn (Option %c)) (Result TableError %c)))
+(defun (time-cells t name wanted convert)
+  (def (Ok c) (find-column t name) :propagate)
+  (match (convert c)
+    ((Some cells) (Ok cells))
+    (None (refuse (str "'" name "' is a column of " (type-text (type-of-column c))
+                       ", not of " wanted ".")))))
+
+(: (-> (-> %a %b) (Option %a) (Option %b)))
+(defun (map-some f o)
+  (match o
+    ((Some x) (Some (f x)))
+    (None None)))
+
+(: (-> Table string (Result TableError DateCells)))
+(defun (date-cells t name)
+  (time-cells t name "date" (fun (c) (map-some (fun (d) (DateCells (days d))) (clr-day-cells c)))))
+
+(: (-> Table string (Result TableError DateTimeCells)))
+(defun (datetime-cells t name)
+  (time-cells t name "datetime" (fun (c) (map-some (fun (m) (DateTimeCells (micros m))) (clr-micro-cells c #f)))))
+
+(: (-> Table string (Result TableError InstantCells)))
+(defun (instant-cells t name)
+  (time-cells t name "instant" (fun (c) (map-some (fun (m) (InstantCells (micros m))) (clr-micro-cells c #t)))))
+
+;; A value that (std datetime) has, which is each value of years 1 to 9999.
+(: (-> (Option %a) %a))
+(defun (in-calendar o)
+  (match o
+    ((Some x) x)
+    (None (panic! "(bjostat table): a date or time outside the years 1 to 9999"))))
+
+(: (-> (ClrCells %a) int (-> %a %b) (Option %b)))
+(defun (time-cell c i convert)
+  (if (clr-cells-valid? c i) (Some (convert (clr-cells-ref c i))) None))
+
+(impl (Iterable DateCells)
+  (type %elem (Option Date))
+  (type %cursor int)
+  (defun (iterable-start c) 0)
+  (defun (iterable-done? c i) (>= i (clr-cells-length (record-ref c days))))
+  (defun (iterable-current c i)
+    (time-cell (record-ref c days) i (fun (n) (in-calendar (unix-days->date (cast long n))))))
+  (defun (iterable-next c i) (+ i 1))
+  (defun (count c) (clr-cells-length (record-ref c days))))
+
+(impl (Iterable DateTimeCells)
+  (type %elem (Option DateTime))
+  (type %cursor int)
+  (defun (iterable-start c) 0)
+  (defun (iterable-done? c i) (>= i (clr-cells-length (record-ref c micros))))
+  (defun (iterable-current c i)
+    (time-cell (record-ref c micros) i
+               (fun (us) (instant->utc-datetime (in-calendar (unix-microseconds->instant us))))))
+  (defun (iterable-next c i) (+ i 1))
+  (defun (count c) (clr-cells-length (record-ref c micros))))
+
+(impl (Iterable InstantCells)
+  (type %elem (Option Instant))
+  (type %cursor int)
+  (defun (iterable-start c) 0)
+  (defun (iterable-done? c i) (>= i (clr-cells-length (record-ref c micros))))
+  (defun (iterable-current c i)
+    (time-cell (record-ref c micros) i (fun (us) (in-calendar (unix-microseconds->instant us)))))
+  (defun (iterable-next c i) (+ i 1))
+  (defun (count c) (clr-cells-length (record-ref c micros))))
 
 ;; The values of cells that are not null, as Julia's skipmissing: for a loop
 ;; over one column. Next to another column it would not stay on its row.
