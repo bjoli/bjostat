@@ -1,0 +1,118 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/csv.bjo — CSV into tables: the guess of types, nulls,
+;; #:types, the errors, and files.
+;;
+;;     bjo run tests/csv.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjostat table))
+(import (bjostat csv))
+
+(import/extern (temp-dir (: System.IO.Path.GetTempPath (-> string))))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result TableError %a) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+(: (-> Table (Vec string)))
+(defun (types-of t)
+  (vec-map (fun (p) (str (fst p) ":" (displayed (snd p)))) (table-schema t)))
+
+(: string)
+(def sales
+  (str "region,price,qty,note\n"
+       "north,10.5,3,\"big, red\"\n"
+       "south,20,1,\n"
+       "north,7.25,,small\n"
+       "east,12,2,\n"))
+
+(defun (main)
+  ;; The guess
+  (def t (ok (csv->table sales)))
+  (expect "the names" (table-names t) ["region" "price" "qty" "note"])
+  (expect "the rows" (table-row-count t) 4)
+  (expect "the guessed types" (types-of t)
+          ["region:string" "price:double" "qty:long" "note:string"])
+  (expect "a double" (column-sum (ok (doubles t "price"))) 49.75)
+  (expect "a quoted field" (string-column-ref (ok (strings t "note")) 0) (Some "big, red"))
+
+  ;; Nulls
+  (expect "an empty number is a null" (column-ref (ok (longs t "qty")) 2) None)
+  (expect "the sum without it" (column-sum (ok (longs t "qty"))) 6L)
+  (expect "an empty string is a null" (string-column-ref (ok (strings t "note")) 1) None)
+  (expect "a column with no value is of strings"
+          (types-of (ok (csv->table "a,b\n1,\n2,\n")))
+          ["a:long" "b:string"])
+
+  ;; #:types
+  (def typed (ok (csv->table sales #:types [(Tuple "qty" Int) (Tuple "price" Float)])))
+  (expect "given types" (types-of typed)
+          ["region:string" "price:float" "qty:int" "note:string"])
+  (expect "an int" (column-sum (ok (ints typed "qty"))) 6)
+  (expect "a name that is not a column"
+          (error-of (csv->table sales #:types [(Tuple "qtty" Int)]))
+          "#:types names 'qtty', and the CSV has no such column. Its columns are: region, price, qty, note.")
+  (expect "a field not of its given type"
+          (error-of (csv->table sales #:types [(Tuple "region" Long)]))
+          "line 2: 'north' in column 'region' is not a long.")
+
+  ;; After the guess
+  (def widened (ok (csv->table "n\n1\n2\n2.5\n" #:guess-rows 2)))
+  (expect "a long that meets a decimal becomes a double" (types-of widened) ["n:double"])
+  (expect "the values before it" (column-sum (ok (doubles widened "n"))) 5.5)
+  (expect "a long that meets a word"
+          (error-of (csv->table "n\n1\n2\nmany\n" #:guess-rows 2))
+          (str "line 4: 'many' in column 'n' is not a long. The type was guessed from the first 2 rows;"
+               " give it with #:types, or guess from more with #:guess-rows."))
+
+  ;; The shape
+  (expect "a short row"
+          (error-of (csv->table "a,b\n1,2\n3\n"))
+          "line 3 has 1 fields, and the header has 2.")
+  (expect "a short row after the guess"
+          (error-of (csv->table "a,b\n1,2\n3,4\n5\n" #:guess-rows 1))
+          "line 4 has 1 fields, and the header has 2.")
+  (expect "two columns of one name"
+          (error-of (csv->table "a,a\n1,2\n"))
+          "two columns are named 'a'.")
+  (expect "a CSV error"
+          (string-contains? (error-of (csv->table "a\n\"open\n")) "line 2")
+          #t)
+  (expect "no rows" (table-row-count (ok (csv->table "a,b\n"))) 0)
+  (expect "nothing" (table-column-count (ok (csv->table ""))) 0)
+
+  ;; No header
+  (def bare (ok (csv->table "1,x\n2,y\n" #:header? #f)))
+  (expect "names of their own" (table-names bare) ["column-1" "column-2"])
+  (expect "the first row is data" (table-row-count bare) 2)
+  (expect "a short row, no header"
+          (error-of (csv->table "1,x\n2\n" #:header? #f))
+          "line 2 has 1 fields, and the first row has 2.")
+
+  ;; Another separator
+  (expect "semicolons" (types-of (ok (csv->table "a;b\n1;2.5\n" #:separator #\;)))
+          ["a:long" "b:double"])
+
+  ;; Files
+  (def path (path-combine (temp-dir) "bjostat-test.csv"))
+  (file-write-text path sales)
+  (def from-file (ok (read-csv path)))
+  (expect "from a file" (column-sum (ok (doubles from-file "price"))) 49.75)
+  (expect "a file that is not there"
+          (string-starts-with? (error-of (read-csv "/nonexistent/x.csv")) "/nonexistent/x.csv: ")
+          #t)
+  0)

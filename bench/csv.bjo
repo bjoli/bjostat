@@ -1,0 +1,60 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/csv.bjo — reading CSV into a table, against (text csv)
+;; alone on the same file.
+;;
+;;     bjo bench bench/csv.bjo --all
+;;
+;; The file has 1 000 000 rows of five columns, about 26 MB: an id, a region
+;; of four words, a price with two decimals, a quantity, and a note that two
+;; rows of three leave empty. "rows only" reads every row and keeps nothing,
+;; which is what read-csv cannot be faster than. "all strings" parses no
+;; number, so the difference to "read-csv" is the cost of the parsing.
+
+(import (std prelude))
+(import (std bench))
+(import (text csv))
+(import (bjostat table))
+(import (bjostat csv))
+
+(import/extern (temp-dir (: System.IO.Path.GetTempPath (-> string))))
+
+(: int)
+(def rows 1000000)
+
+(: (-> string))
+(defun (write-file)
+  (def path (path-combine (temp-dir) "bjostat-bench.csv"))
+  (def sb (stringbuilder-empty))
+  (def regions ["north" "south" "east" "west"])
+  (stringbuilder-add-string! sb "id,region,price,qty,note\n")
+  (loop (:for i (range 0 rows))
+        (:do (stringbuilder-add-string!
+               sb (str (int->string i) ","
+                       (vec-ref regions (% (* i 7) 4)) ","
+                       (int->string (+ 1 (% (* i 7919) 500))) "." (int->string (+ 10 (% i 90))) ","
+                       (int->string (+ 1 (% i 40))) ","
+                       (if (= (% i 3) 0) (str "item " (int->string i)) "")
+                       "\n"))))
+  (file-write-text path (stringbuilder->string sb))
+  path)
+
+(: string)
+(def path (write-file))
+
+(def/bench "rows only"
+  (csv-fold (csv-file path) 0 (fun (row n) (+ n 1))))
+
+(def/bench "read-csv"
+  (match (read-csv path)
+    ((Ok t) (table-row-count t))
+    ((Err e) (panic! (displayed e)))))
+
+(def/bench "read-csv, all strings"
+  (match (read-csv path #:types [(Tuple "id" String) (Tuple "price" String) (Tuple "qty" String)])
+    ((Ok t) (table-row-count t))
+    ((Err e) (panic! (displayed e)))))
+
+(run-benches)

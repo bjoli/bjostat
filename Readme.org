@@ -43,6 +43,7 @@ a copy.
 | ~(array->column a [#:valid v])~ | A column of a copy of the array; a null at each ~#f~ of ~v~ |
 | ~(array->string-column a [#:valid v])~ | The same, of strings |
 | ~(named name c)~, ~(named-strings name c)~, ~(make-table cols)~ | A table of columns |
+| ~(named-any name c)~ | The same, for an Arrow column of any type |
 | ~(table-select t names)~, ~(table-slice t #:from #:to)~ | Part of a table, without a copy |
 | ~(read-arrow path)~, ~(write-arrow t path)~ | Arrow IPC files |
 | ~(table->string t #:rows 10)~ | The names, the types and the first rows, as text |
@@ -59,6 +60,44 @@ over ~column-values~ reads ~column-valid?~ when ~column-null-count~ is not 0.
 taken out typed. Every other Arrow type, such as timestamps and booleans, is
 ~(Other name)~ in the schema: a table holds it, prints it and writes it.
 
+** The module (bjostat csv)
+
+#+BEGIN_SRC scheme
+(import (bjostat csv))
+
+(def (Ok t) (read-csv "sales.csv") :propagate)
+(def (Ok t) (read-csv "sales.csv" #:types [(Tuple "qty" Int)]) :propagate)
+(def (Ok t) (csv->table "a,b\n1,x\n") :propagate)
+#+END_SRC
+
+| Function | What it does |
+|----------+--------------|
+| ~(read-csv path)~ | The table of a CSV file; a file that does not open is an ~Err~ |
+| ~(csv->table text)~ | The table of CSV text |
+
+Both take ~#:header?~ (~#t~), ~#:separator~ (~#\,~), ~#:types~ and
+~#:guess-rows~ (1000).
+
+*Types.* The first row is the names, unless ~#:header? #f~; then the columns
+are ~column-1~, ~column-2~ and so on. The type of a column is guessed from
+the first ~#:guess-rows~ rows: ~long~ when every field is an integer,
+~double~ when every field is a number, ~string~ otherwise. Integers are
+guessed as ~long~, not ~int~, so that a large value later in the file still
+fits. ~#:types~ gives the type of a column by name, ~int~ and ~float~ too.
+
+*Nulls.* An empty field is a null, in a column of any type.
+
+*Errors.* A row with too many or too few fields, and a field that is not of
+its column's type, are an ~Err~ with the line. A column guessed as ~long~
+that meets a decimal after the guess becomes a column of ~double~ instead.
+A number is in the plain form: no white space, no thousands separators, ~.~
+as the decimal point.
+
+*Speed.* The rows are read by ~(text csv)~, one at a time. A field becomes a
+number from its UTF-8 bytes, and a string is kept as its bytes. A file of
+1 000 000 rows and five columns, 26 MB, reads in about 175 ms, against
+95 ms for ~(text csv)~ reading the rows alone (~bench/csv.bjo~).
+
 ** Plans
 
 The query layer is next: see [[file:plan.org][plan.org]].
@@ -67,4 +106,6 @@ The query layer is next: see [[file:plan.org][plan.org]].
 
 #+BEGIN_SRC sh
 bjo run tests/table.bjo    # every line starts with "ok:"
+bjo run tests/csv.bjo
+bjo bench bench/csv.bjo --all
 #+END_SRC

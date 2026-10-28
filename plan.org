@@ -16,6 +16,20 @@ program wants static types.
 - Arrow IPC files in and out. A file of several batches is read as one
   table, each column in one piece.
 
+** Done: CSV (bjostat csv)
+
+- ~read-csv~ and ~csv->table~ read through ~(text csv)~. The types are
+  guessed from the first rows, or given by name with ~#:types~. An empty
+  field is a null.
+- The glue parses each field from its UTF-8 bytes into arrays from the
+  shared pools, and makes Arrow buffers once. 1 000 000 rows of five columns
+  in 175 ms; ~(text csv)~ alone takes 95 ms.
+- Faster still would be fields as spans of the reader's chunk: ~(text csv)~
+  now makes a string of each field and an array of each row, which is most
+  of what it allocates, and read-csv only copies the bytes on.
+- Not yet: other null markers such as ~NA~, booleans, dates, and columns
+  that are skipped.
+
 ** Next: queries, checked before they run
 
 A query is a value, a plan, not a series of calls:
@@ -51,7 +65,7 @@ A query is a value, a plan, not a series of calls:
 - *DuckDB* for joins, windows and Parquet, with Arrow between it and the
   tables, so a query too large or too relational for the kernels here goes
   there.
-- *Parquet and CSV* into tables. CSV through ~(text csv)~.
+- *Parquet* into tables.
 - *Chunked columns.* A table is one record batch now, and reading a file of
   many batches copies each column into one. A column of many chunks keeps
   them, for files larger than memory and for streams.

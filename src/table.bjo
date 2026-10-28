@@ -38,7 +38,7 @@
   column-sum column-mean column-min column-max column-count
 
   ;; Making tables
-  array->column array->string-column named named-strings make-table
+  array->column array->string-column named named-strings named-any make-table
   table-select table-slice
 
   ;; Files
@@ -226,6 +226,11 @@
 
 (: (-> string StringColumn NamedColumn))
 (defun (named-strings name c) (NamedColumn (name name) (column (strings->any c))))
+
+;; A column of any type and its name, for a module that makes Arrow columns
+;; itself, as (bjostat csv) does.
+(: (-> string AnyColumn NamedColumn))
+(defun (named-any name c) (NamedColumn (name name) (column c)))
 
 ;; A table of the columns, in order. They have to be of one length and have
 ;; names that differ.

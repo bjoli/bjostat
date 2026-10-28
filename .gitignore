@@ -1,5 +1,6 @@
 .bjo/
 publish/
+scratch/
 *.dll
 *.exe
 *.pdb

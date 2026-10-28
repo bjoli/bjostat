@@ -1,0 +1,229 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/src/csv.bjo — the module (bjostat csv): CSV into tables.
+;;
+;;     (def t (read-csv "sales.csv") :propagate)
+;;     (def t (read-csv "sales.csv" #:types [(Tuple "qty" Int)]) :propagate)
+;;
+;; The first row is the names, unless `#:header? #f`. The type of each column
+;; is guessed from the first `#:guess-rows` rows: long when every field is an
+;; integer, double when every field is a number, string otherwise. Integers
+;; are guessed as long, not int, so that a large value later in the file
+;; still fits. `#:types` gives the type of a column by its name, and then
+;; nothing is guessed for it.
+;;
+;; An empty field is a null, in a column of any type. A number is the plain
+;; form only: no white space, no thousands separators, '.' as the decimal
+;; point. A field that is not of its column's type is an error, with the line,
+;; with one exception: a column guessed as long that meets a decimal later
+;; becomes a column of doubles.
+;;
+;; The rows are read one at a time by (text csv). Only the rows of the guess
+;; are held as strings; after them each field goes into its column at once.
+
+(export read-csv csv->table)
+
+(import (std prelude))
+(import (text csv))
+(import (bjostat table))
+
+(import/class (CsvColumn (: Bjostat.CsvColumn)))
+
+;; The kinds of a CsvColumn. Long, Double and String are the order of a
+;; guess: each holds what the one before it holds.
+(import/extern
+  (guess-field (: Bjostat.CsvColumn.Guess (-> string int)))
+  (make-column (: Bjostat.CsvColumn.Make (-> int CsvColumn)))
+  (column-add! (: Bjostat.CsvColumn.AddTo (-> CsvColumn string bool)))
+  (widen! (: Bjostat.CsvColumn.Widen (-> CsvColumn bool)))
+  (column-kind (: Bjostat.CsvColumn.KindOf (-> CsvColumn int)))
+  (build-column (: Bjostat.CsvColumn.BuildOf (-> CsvColumn AnyColumn))))
+
+(: int) (def kind-empty -1)
+(: int) (def kind-long 0)
+(: int) (def kind-double 1)
+(: int) (def kind-string 2)
+(: int) (def kind-int 3)
+(: int) (def kind-float 4)
+
+(: (-> int string))
+(defun (kind-name k)
+  (match k (0 "long") (1 "double") (2 "string") (3 "int") (_ "float")))
+
+(: (-> ColumnType (Option int)))
+(defun (kind-of-type t)
+  (match t
+    (Long (Some kind-long))
+    (Double (Some kind-double))
+    (String (Some kind-string))
+    (Int (Some kind-int))
+    (Float (Some kind-float))
+    ((Other _) None)))
+
+(: (-> string (Result TableError %a)))
+(defun (refuse message) (Err (TableError (message message))))
+
+;; ===========================================================================
+;; Reading
+;; ===========================================================================
+
+;; What the reader knows of the file after its first row.
+(type (: Shape (Record (: names (Array string))
+                       (: header? bool)
+                       (: guess-rows int))))
+
+;; The table of the CSV file at `path`. A file that does not open is an Err.
+(: (-> string (#:header? bool) (#:separator char) (#:types (Vec (Tuple string ColumnType)))
+       (#:guess-rows int)
+       (Result TableError Table)))
+(defun (read-csv path #:header? #t #:separator #\, #:types [] #:guess-rows 1000)
+  (match (try (read-source (csv-file path) header? separator types guess-rows)
+              #:catch (System.IO.IOException System.UnauthorizedAccessException))
+    ((Ok r) r)
+    ((Err e) (refuse (str path ": " (.-Message e))))))
+
+;; The table of CSV text.
+(: (-> string (#:header? bool) (#:separator char) (#:types (Vec (Tuple string ColumnType)))
+       (#:guess-rows int)
+       (Result TableError Table)))
+(defun (csv->table text #:header? #t #:separator #\, #:types [] #:guess-rows 1000)
+  (read-source text header? separator types guess-rows))
+
+(: (-> %s bool char (Vec (Tuple string ColumnType)) int (Result TableError Table))
+   (where (CsvSource %s)))
+(defun (read-source source header? separator types guess-rows)
+  (call-with-csv-reader source
+    (fun (rd) (read-table rd header? types guess-rows))
+    #:separator separator))
+
+(: (-> CsvError (Result TableError %a)))
+(defun (csv-refuse e) (refuse (displayed e)))
+
+(: (-> CsvReader bool (Vec (Tuple string ColumnType)) int (Result TableError Table)))
+(defun (read-table rd header? types guess-rows)
+  (match (csv-next! rd)
+    ((Err e) (csv-refuse e))
+    ((Ok None) (make-table []))
+    ((Ok (Some first))
+     (def names
+       (if header?
+           (iarray->array first)
+           (vec->array {vecing (str "column-" (int->string (+ i 1)))
+                               (:for i (range 0 (iarray-length first)))})))
+     (def shape (Shape (names names) (header? header?) (guess-rows guess-rows)))
+     (def (Ok given) (given-kinds names types) :propagate)
+     ;; The rows of the guess, with the line each starts on.
+     (def held (transientvec-empty))
+     (unless header? (transientvec-add! held (Tuple (csv-row-line rd) first)))
+     (def (Ok more?) (hold-rows! rd shape held) :propagate)
+     (def rows (transientvec->vec held))
+     (def kinds {vecing (match (vec-ref given i)
+                          ((Some k) k)
+                          (None (guess-column rows i)))
+                        (:for i (range 0 (array-length names)))})
+     (def guessed (vec->array (vec-map (fun (g) (none? g)) given)))
+     (def cols (vec->array (vec-map make-column kinds)))
+     (def (Ok _) (add-held! cols guessed shape rows) :propagate)
+     (def (Ok _) (if more? (add-rest! rd cols guessed shape) (Ok unit)) :propagate)
+     (make-table {vecing (named-any (array-ref names i) (build-column (array-ref cols i)))
+                         (:for i (range 0 (array-length names)))}))))
+
+;; The kind `#:types` gives each column, or None. A name that is not a
+;; column, and a type a CSV column cannot be, are errors.
+(: (-> (Array string) (Vec (Tuple string ColumnType)) (Result TableError (Vec (Option int)))))
+(defun (given-kinds names types)
+  (def missing (find (fun (p) (not (array-contains? names (fst p)))) types))
+  (def other (find (fun (p) (none? (kind-of-type (snd p)))) types))
+  (match (Tuple missing other)
+    ((Tuple (Some p) _)
+     (refuse (str "#:types names '" (fst p) "', and the CSV has no such column. Its columns are: "
+                  (string-join (array->vec names) ", ") ".")))
+    ((Tuple _ (Some p))
+     (refuse (str "#:types gives '" (fst p) "' the type " (displayed (snd p))
+                  ", and a CSV column can be int, long, float, double or string.")))
+    (_ (Ok {vecing (match (find (fun (p) (= (fst p) name)) types)
+                     ((Some p) (kind-of-type (snd p)))
+                     (None None))
+                   (:for name (array->vec names))}))))
+
+(: (-> (Array string) string bool))
+(defun (array-contains? a s)
+  (some? (find (fun (i) (= (array-ref a i) s)) (range 0 (array-length a)))))
+
+;; Reads rows into `held` until it has the rows of the guess. #t when the
+;; file has rows after them.
+(: (-> CsvReader Shape (TransientVec (Tuple int (IArray string))) (Result TableError bool)))
+(defun (hold-rows! rd shape held)
+  (if (>= (transientvec-length held) (record-ref shape guess-rows))
+      (Ok #t)
+      (match (csv-next! rd)
+        ((Err e) (csv-refuse e))
+        ((Ok None) (Ok #f))
+        ((Ok (Some row))
+         (def (Ok _) (check-width shape (csv-row-line rd) row) :propagate)
+         (transientvec-add! held (Tuple (csv-row-line rd) row))
+         (hold-rows! rd shape held)))))
+
+(: (-> Shape int (IArray string) (Result TableError Unit)))
+(defun (check-width shape line row)
+  (def want (array-length (record-ref shape names)))
+  (if (= (iarray-length row) want)
+      (Ok unit)
+      (refuse (str "line " (int->string line) " has " (int->string (iarray-length row))
+                   " fields, and the " (if (record-ref shape header?) "header" "first row")
+                   " has " (int->string want) "."))))
+
+;; The narrowest kind that holds column `i` of every row, string for a
+;; column with no value.
+(: (-> (Vec (Tuple int (IArray string))) int int))
+(defun (guess-column rows i)
+  (def k (fold (fun (r k) (max k (guess-field (iarray-ref (snd r) i)))) kind-empty rows))
+  (if (= k kind-empty) kind-string k))
+
+(: (-> (Array CsvColumn) (Array bool) Shape (Vec (Tuple int (IArray string))) (Result TableError Unit)))
+(defun (add-held! cols guessed shape rows)
+  (let loop ((i 0))
+    (if (= i (vec-length rows))
+        (Ok unit)
+        (match (vec-ref rows i)
+          ((Tuple line row)
+           (def (Ok _) (add-row! cols guessed shape line row) :propagate)
+           (loop (+ i 1)))))))
+
+(: (-> CsvReader (Array CsvColumn) (Array bool) Shape (Result TableError Unit)))
+(defun (add-rest! rd cols guessed shape)
+  (match (csv-next! rd)
+    ((Err e) (csv-refuse e))
+    ((Ok None) (Ok unit))
+    ((Ok (Some row))
+     (def line (csv-row-line rd))
+     (def (Ok _) (check-width shape line row) :propagate)
+     (def (Ok _) (add-row! cols guessed shape line row) :propagate)
+     (add-rest! rd cols guessed shape))))
+
+;; Each field into its column. A guessed column of longs that meets a decimal
+;; becomes one of doubles.
+(: (-> (Array CsvColumn) (Array bool) Shape int (IArray string) (Result TableError Unit)))
+(defun (add-row! cols guessed shape line row)
+  (let loop ((i 0))
+    (cond
+      ((= i (array-length cols)) (Ok unit))
+      ((column-add! (array-ref cols i) (iarray-ref row i)) (loop (+ i 1)))
+      ((and (array-ref guessed i)
+            (= (guess-field (iarray-ref row i)) kind-double)
+            (widen! (array-ref cols i))
+            (column-add! (array-ref cols i) (iarray-ref row i)))
+       (loop (+ i 1)))
+      (else (refuse (bad-field shape line (array-ref (record-ref shape names) i)
+                               (iarray-ref row i) (column-kind (array-ref cols i))
+                               (array-ref guessed i)))))))
+
+(: (-> Shape int string string int bool string))
+(defun (bad-field shape line name field kind guessed?)
+  (str "line " (int->string line) ": '" field "' in column '" name "' is not a " (kind-name kind) "."
+       (if guessed?
+           (str " The type was guessed from the first " (int->string (record-ref shape guess-rows))
+                " rows; give it with #:types, or guess from more with #:guess-rows.")
+           "")))
