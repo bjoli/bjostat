@@ -1,0 +1,315 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/src/table.bjo — the module (bjostat table).
+;;
+;; A table of named columns, held as an Apache Arrow record batch. Its schema
+;; is known when the program runs, not when it compiles: a table read from a
+;; file has the columns the file has. A column is taken out by name and type,
+;; and the type is checked once, there:
+;;
+;;     (def t (read-arrow "sales.arrow") :propagate)
+;;     (def price (doubles t "price") :propagate)   ; (Column double), or an Err
+;;     (column-sum price)                           ; vectorized, nulls skipped
+;;     (column-values price)                        ; the values, as a span
+;;
+;; From there on the column is typed, and a loop over its span is as fast as
+;; one over an array. A `Table` is Arrow's `RecordBatch` itself, so it goes to
+;; and from other Arrow code without a copy.
+;;
+;; A column may have nulls. Arrow keeps a value at a null too, and that value
+;; is unspecified: `column-ref` answers None there, and a loop over
+;; `column-values` reads `column-valid?` when `column-null-count` is not 0.
+
+(export
+  Table AnyColumn Column StringColumn
+  ColumnType TableError NamedColumn
+
+  ;; The schema
+  table-names table-schema column-type table-row-count table-column-count
+
+  ;; Columns, typed
+  doubles floats longs ints strings
+  column-values column-length column-null-count column-valid? column-ref
+  string-column-length string-column-null-count string-column-ref
+
+  ;; Aggregates
+  column-sum column-mean column-min column-max column-count
+
+  ;; Making tables
+  array->column array->string-column named named-strings make-table
+  table-select table-slice
+
+  ;; Files
+  read-arrow write-arrow
+
+  ;; Printing
+  table->string)
+
+(import (std prelude))
+
+(import/class
+  (Table (: Apache.Arrow.RecordBatch))
+  (AnyColumn (: Apache.Arrow.IArrowArray))
+  ((Column %a) (: Apache.Arrow.PrimitiveArray))
+  (StringColumn (: Apache.Arrow.StringArray)))
+
+(import/extern
+  ;; Any column
+  (clr-type-name (: Bjostat.Columns.TypeName (-> AnyColumn string)))
+  (any-length (: Bjostat.Columns.Length (-> AnyColumn int)))
+  (any->string (: Bjostat.Columns.CellText (-> AnyColumn int string)))
+  (column->any (: Bjostat.Columns.Any (-> (Column %a) AnyColumn)))
+  (strings->any (: Bjostat.Columns.AnyStrings (-> StringColumn AnyColumn)))
+
+  ;; Typed columns, after the type was checked
+  (as-doubles (: Bjostat.Columns.AsDoubles (-> AnyColumn (Column double))))
+  (as-floats (: Bjostat.Columns.AsFloats (-> AnyColumn (Column float))))
+  (as-longs (: Bjostat.Columns.AsLongs (-> AnyColumn (Column long))))
+  (as-ints (: Bjostat.Columns.AsInts (-> AnyColumn (Column int))))
+  (as-strings (: Bjostat.Columns.AsStrings (-> AnyColumn StringColumn)))
+
+  (column-values (: Bjostat.Columns.Values (-> (Column %a) (RoSpan %a))))
+  (column-length (: Bjostat.Columns.TypedLength (-> (Column %a) int)))
+  (column-null-count (: Bjostat.Columns.TypedNullCount (-> (Column %a) int)))
+  (column-valid? (: Bjostat.Columns.TypedIsValid (-> (Column %a) int bool)))
+  (column-ref (: Bjostat.Columns.Ref (-> (Column %a) int (Option %a))))
+  (string-column-length (: Bjostat.Columns.StringsLength (-> StringColumn int)))
+  (string-column-null-count (: Bjostat.Columns.StringsNullCount (-> StringColumn int)))
+  (string-column-ref (: Bjostat.Columns.StringRef (-> StringColumn int (Option string))))
+
+  ;; Building. The flags are empty for a column with no nulls, or one for
+  ;; each value, #f at a null.
+  (clr-from-array (: Bjostat.Columns.FromArray (-> (Array %a) (Array bool) (Column %a))))
+  (clr-from-strings (: Bjostat.Columns.FromStrings (-> (Array string) (Array bool) StringColumn)))
+
+  ;; Aggregates. A column of a type that is not a number is a C# error, for
+  ;; now: (Column %a) does not say that %a is a number.
+  (column-sum (: Bjostat.Columns.Sum (-> (Column %a) %a)))
+  (column-mean (: Bjostat.Columns.Mean (-> (Column %a) double)))
+  (column-min (: Bjostat.Columns.Min (-> (Column %a) (Option %a))))
+  (column-max (: Bjostat.Columns.Max (-> (Column %a) (Option %a))))
+
+  ;; Tables
+  (clr-make-table (: Bjostat.Tables.Make (-> (Array string) (Array AnyColumn) int Table)))
+  (clr-names (: Bjostat.Tables.Names (-> Table (Array string))))
+  (table-column-count (: Bjostat.Tables.ColumnCount (-> Table int)))
+  (table-row-count (: Bjostat.Tables.RowCount (-> Table int)))
+  (clr-column (: Bjostat.Tables.Column (-> Table int AnyColumn)))
+  (clr-index-of (: Bjostat.Tables.IndexOf (-> Table string int)))
+  (clr-slice (: Bjostat.Tables.Slice (-> Table int int Table)))
+
+  ;; Files. Arrow reports a file it cannot read with exceptions of several
+  ;; types, so every exception is an Err.
+  (clr-read-file (: Bjostat.Tables.ReadFile (-> string Table) #:exceptions (System.Exception)))
+  (clr-write-file (: Bjostat.Tables.WriteFile (-> Table string void) #:exceptions (System.Exception))))
+
+;; ===========================================================================
+;; Errors and types
+;; ===========================================================================
+
+;; What a table refused: a column it does not have, one of another type, or
+;; columns that do not make a table.
+(type (: TableError (Record (: message string))))
+
+(impl (Displayed TableError)
+  (defun (displayed e) (record-ref e message))
+  (defun (display-into e b) (stringbuilder-add-string! b (record-ref e message))))
+
+(: (-> string (Result TableError %a)))
+(defun (refuse message) (Err (TableError (message message))))
+
+;; The type of a column's values. `Other` is any Arrow type this module does
+;; not take apart yet, by Arrow's name for it: Timestamp, Date32, Boolean and
+;; so on. A table holds it, prints it and writes it.
+(type (: ColumnType (Union Double Float Long Int String (: Other string))))
+
+(: (-> AnyColumn ColumnType))
+(defun (type-of-column c)
+  (match (clr-type-name c)
+    ("Double" Double)
+    ("Float" Float)
+    ("Int64" Long)
+    ("Int32" Int)
+    ("String" String)
+    (name (Other name))))
+
+(: (-> ColumnType string))
+(defun (type-text t)
+  (match t
+    (Double "double")
+    (Float "float")
+    (Long "long")
+    (Int "int")
+    (String "string")
+    ((Other name) name)))
+
+(impl (Displayed ColumnType)
+  (defun (displayed t) (type-text t))
+  (defun (display-into t b) (stringbuilder-add-string! b (type-text t))))
+
+;; ===========================================================================
+;; The schema
+;; ===========================================================================
+
+(: (-> Table (Vec string)))
+(defun (table-names t) (array->vec (clr-names t)))
+
+;; Each column's name and type, in order.
+(: (-> Table (Vec (Tuple string ColumnType))))
+(defun (table-schema t)
+  {vecing (Tuple name (type-of-column (clr-column t i)))
+          (:for (Tuple i name) (enumerate (table-names t)))})
+
+(: (-> Table string (Option ColumnType)))
+(defun (column-type t name)
+  (def i (clr-index-of t name))
+  (if (< i 0) None (Some (type-of-column (clr-column t i)))))
+
+(: (-> Table string (Result TableError AnyColumn)))
+(defun (find-column t name)
+  (def i (clr-index-of t name))
+  (if (< i 0)
+      (refuse (str "the table has no column '" name "'. Its columns are: "
+                   (string-join (table-names t) ", ") "."))
+      (Ok (clr-column t i))))
+
+;; The column `name` as the type `wanted`, through `convert`, or an Err that
+;; says what it is instead. The one check of a column's type.
+(: (-> Table string ColumnType (-> AnyColumn %c) (Result TableError %c)))
+(defun (typed t name wanted convert)
+  (def (Ok c) (find-column t name) :propagate)
+  (def have (type-of-column c))
+  (if (= (type-text have) (type-text wanted))
+      (Ok (convert c))
+      (refuse (str "'" name "' is a column of " (type-text have) ", not of " (type-text wanted) "."))))
+
+(: (-> Table string (Result TableError (Column double))))
+(defun (doubles t name) (typed t name Double as-doubles))
+
+(: (-> Table string (Result TableError (Column float))))
+(defun (floats t name) (typed t name Float as-floats))
+
+(: (-> Table string (Result TableError (Column long))))
+(defun (longs t name) (typed t name Long as-longs))
+
+(: (-> Table string (Result TableError (Column int))))
+(defun (ints t name) (typed t name Int as-ints))
+
+(: (-> Table string (Result TableError StringColumn)))
+(defun (strings t name) (typed t name String as-strings))
+
+;; How many values are not null.
+(: (-> (Column %a) int))
+(defun (column-count c) (- (column-length c) (column-null-count c)))
+
+;; ===========================================================================
+;; Making tables
+;; ===========================================================================
+
+;; A column holding a copy of the array. With `#:valid`, as long as the array,
+;; the value at each #f is a null.
+(: (-> (Array %a) (#:valid (Array bool)) (Column %a)))
+(defun (array->column a #:valid (make-array 0))
+  (clr-from-array a valid))
+
+(: (-> (Array string) (#:valid (Array bool)) StringColumn))
+(defun (array->string-column a #:valid (make-array 0))
+  (clr-from-strings a valid))
+
+;; A column and the name it has in a table.
+(type (: NamedColumn #:opaque (Record (: name string) (: column AnyColumn))))
+
+(: (-> string (Column %a) NamedColumn))
+(defun (named name c) (NamedColumn (name name) (column (column->any c))))
+
+(: (-> string StringColumn NamedColumn))
+(defun (named-strings name c) (NamedColumn (name name) (column (strings->any c))))
+
+;; A table of the columns, in order. They have to be of one length and have
+;; names that differ.
+(: (-> (Vec NamedColumn) (Result TableError Table)))
+(defun (make-table cols)
+  (def names (vec-map (fun (c) (record-ref c name)) cols))
+  (def arrays (vec-map (fun (c) (record-ref c column)) cols))
+  (def rows (if (= (vec-length arrays) 0) 0 (any-length (vec-ref arrays 0))))
+  (def twice
+    (let loop ((i 0) (seen (map-empty)))
+      (cond
+        ((= i (vec-length names)) None)
+        ((map-has-key? seen (vec-ref names i)) (Some (vec-ref names i)))
+        (else (loop (+ i 1) (map-set seen (vec-ref names i) #t))))))
+  (def uneven
+    (find (fun (i) (not (= (any-length (vec-ref arrays i)) rows))) (range 0 (vec-length arrays))))
+  (match (Tuple twice uneven)
+    ((Tuple (Some name) _) (refuse (str "two columns are named '" name "'.")))
+    ((Tuple _ (Some i))
+     (refuse (str "'" (vec-ref names i) "' has " (int->string (any-length (vec-ref arrays i)))
+                  " rows, and '" (vec-ref names 0) "' has " (int->string rows) ".")))
+    (_ (Ok (clr-make-table (vec->array names) (vec->array arrays) rows)))))
+
+;; A table of the named columns, in the order given, without a copy.
+(: (-> Table (Vec string) (Result TableError Table)))
+(defun (table-select t names)
+  (def cols (vec-map (fun (n) (find-column t n)) names))
+  (match (find (fun (r) (err? r)) cols)
+    ((Some (Err e)) (Err e))
+    (_ (Ok (clr-make-table (vec->array names)
+                           (vec->array (vec-map (fun (r) (match r ((Ok c) c) ((Err _) (panic! "unreachable")))) cols))
+                           (table-row-count t))))))
+
+;; The rows from `#:from` up to `#:to`, without a copy.
+(: (-> Table (#:from int) (#:to int) Table))
+(defun (table-slice t #:from 0 #:to (table-row-count t))
+  (clr-slice t from to))
+
+;; ===========================================================================
+;; Files
+;; ===========================================================================
+
+;; The table of an Arrow IPC file. A file of several record batches is read
+;; as one table, each column in one piece, so that it is one span.
+(: (-> string (Result TableError Table)))
+(defun (read-arrow path)
+  (match (clr-read-file path)
+    ((Ok t) (Ok t))
+    ((Err e) (refuse (str path ": " (.-Message e))))))
+
+(: (-> Table string (Result TableError Unit)))
+(defun (write-arrow t path)
+  (match (clr-write-file t path)
+    ((Ok _) (Ok unit))
+    ((Err e) (refuse (str path ": " (.-Message e))))))
+
+;; ===========================================================================
+;; Printing
+;; ===========================================================================
+
+;; The table as text: the names, the types, and the first `#:rows` rows, each
+;; column as wide as its widest cell.
+(: (-> Table (#:rows int) string))
+(defun (table->string t #:rows 10)
+  (def shown (min rows (table-row-count t)))
+  (def columns {vecing (clr-column t i) (:for i (range 0 (table-column-count t)))})
+  (def cells
+    (vec-map (fun (i)
+               (def c (vec-ref columns i))
+               (vec-add-first (vec-add-first {vecing (any->string c r) (:for r (range 0 shown))}
+                                             (type-text (type-of-column c)))
+                              (vec-ref (table-names t) i)))
+             (range-vec (vec-length columns))))
+  (def widths (vec-map (fun (col) (fold (fun (s w) (max w (string-length s))) 0 col)) cells))
+  (def sb (stringbuilder-empty))
+  (loop (:for line (range 0 (+ shown 2)))
+        (:do (loop (:for i (range 0 (vec-length cells)))
+                   (:do (when (> i 0) (stringbuilder-add-string! sb "  "))
+                        (stringbuilder-add-string! sb (string-pad-right (vec-ref (vec-ref cells i) line)
+                                                                        (vec-ref widths i)))))
+             (stringbuilder-add-string! sb "\n")))
+  (when (> (table-row-count t) shown)
+    (stringbuilder-add-string! sb (str "… " (int->string (- (table-row-count t) shown)) " more rows\n")))
+  (stringbuilder->string sb))
+
+(: (-> int (Vec int)))
+(defun (range-vec n) {vecing i (:for i (range 0 n))})

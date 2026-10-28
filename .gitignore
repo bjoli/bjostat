@@ -1,0 +1,8 @@
+.bjo/
+publish/
+*.dll
+*.exe
+*.pdb
+*.bjobuild
+*.runtimeconfig.json
+*.deps.json

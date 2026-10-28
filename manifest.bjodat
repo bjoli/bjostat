@@ -1,0 +1,19 @@
+(package
+  (name (bjostat))
+  (version "0.1.0")
+  (description "Tables of data for Bjolang: Apache Arrow columns, a schema known when the program runs, and fast kernels over spans.")
+  (license "MPL-2.0")
+
+  ;; Arrow is the layout of the columns, so a table goes to and from any other
+  ;; Arrow tool without a copy. Tensors has the vectorized kernels that the
+  ;; aggregates call on a column's span.
+  (packages
+    (nuget (id "Apache.Arrow") (version "23.0.0"))
+    (nuget (id "System.Numerics.Tensors") (version "10.0.14")))
+
+  ;; What Bjolang's interop cannot reach in Arrow: members of its generic
+  ;; array types, and its builders.
+  (csharp "glue")
+
+  ;; A library: there is no src/main.bjo.
+  )

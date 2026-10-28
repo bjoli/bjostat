@@ -1,0 +1,72 @@
+* bjostat: the plan
+
+What is done, and what comes next. The design is in three layers, as in Polars
+and Spark: a table whose schema is known when the program runs, a query that
+is checked against that schema before it runs, and typed views where a
+program wants static types.
+
+** Done: tables (bjostat table)
+
+- A ~Table~ is an Arrow ~RecordBatch~. Its schema is read at run time.
+- A column is taken out by name and type, and the type is checked once:
+  ~(doubles t "price")~ is a ~(Column double)~ or an ~Err~ that names the
+  columns the table has.
+- A typed column gives its values as a span. The aggregates use
+  ~TensorPrimitives~ when the column has no nulls.
+- Arrow IPC files in and out. A file of several batches is read as one
+  table, each column in one piece.
+
+** Next: queries, checked before they run
+
+A query is a value, a plan, not a series of calls:
+
+#+BEGIN_SRC scheme
+(query sales
+  (where (> price 10.0))
+  (group-by region)
+  (summarise (total (sum price)) (n (count))))
+#+END_SRC
+
+- *The plan is checked against the table's schema before any row is read.*
+  Each step gives the schema it makes from the one it gets, so a misspelt
+  column or a type that does not fit is an error about the query, at once:
+  "~price~ is a column of string, and ~sum~ takes a number". This is what
+  ~LazyFrame.collect_schema()~ is in Polars, and it is what makes a table
+  whose schema is dynamic safe to work with.
+- *The query is a macro.* It reads the expressions when the program
+  compiles, so ~(> price 10.0)~ becomes a loop over the column's span, with
+  no interpreter between. The column's type is found when the plan is
+  checked, so the macro makes the loop for each type it can be.
+- *Steps:* ~where~, ~select~, ~mutate~ (new columns), ~group-by~ with
+  ~summarise~, ~order-by~, ~limit~, ~join~. ~where~ makes a selection vector,
+  not a copy, and the next step reads through it.
+- *The order of work:* ~where~ and ~select~ with plan checking, then the
+  aggregates with ~group-by~ (a hash table on the keys), then ~order-by~ and
+  ~join~.
+
+** Later
+
+- *Typed views.* A macro over a record type that checks a table's schema
+  once and makes typed accessors: ~Dataset[T]~ in Spark.
+- *DuckDB* for joins, windows and Parquet, with Arrow between it and the
+  tables, so a query too large or too relational for the kernels here goes
+  there.
+- *Parquet and CSV* into tables. CSV through ~(text csv)~.
+- *Chunked columns.* A table is one record batch now, and reading a file of
+  many batches copies each column into one. A column of many chunks keeps
+  them, for files larger than memory and for streams.
+- *More types:* booleans, timestamps and dates, decimals, dictionaries.
+- *Notebooks.* A Jupyter kernel over Bjolang's REPL, with tables shown as
+  HTML and plots as Vega-Lite.
+
+** Found in Bjolang while writing this
+
+Both are fixed in Bjolang, and the generic code is now in Bjolang, not in
+the glue.
+
+- A generic ~import/extern~ did not take Bjolang's ~string~ for a .NET
+  ~System.String~ parameter. Now it does, and the call converts it.
+- A Bjolang function generic over ~(Column %a)~ was a C# method generic over
+  ~T~ without Arrow's constraint ~where T : struct~, which C# refused. Now
+  Bjolang finds the constraints and writes them as ~where~ clauses. A call at
+  a type that breaks one is a Bjolang type error.

@@ -1,0 +1,70 @@
+* bjostat — tables of data for Bjolang
+
+A table is a set of named columns in Apache Arrow's layout. Its schema is
+known when the program runs: a table read from a file has the columns that
+the file has. A column is taken out by name and type, and the type is checked
+once, there. After that the column is typed, and a loop over its values is a
+loop over a span.
+
+#+BEGIN_SRC scheme
+(import (bjostat table))
+
+(def (Ok t) (read-arrow "sales.arrow") :propagate)
+(println (table->string t))
+
+(def (Ok price) (doubles t "price") :propagate)   ; (Column double), or an Err
+(column-sum price)                               ; vectorized; nulls are skipped
+(column-values price)                            ; the values, as a (RoSpan double)
+#+END_SRC
+
+A misspelt column, or a column of another type, is an ~Err~ that says what
+the table has:
+
+#+BEGIN_SRC text
+the table has no column 'pricee'. Its columns are: region, price, qty, rating.
+'qty' is a column of long, not of double.
+#+END_SRC
+
+A ~Table~ is Arrow's ~RecordBatch~, and a ~(Column %a)~ is Arrow's
+~PrimitiveArray<T>~. So a table goes to and from other .NET Arrow code without
+a copy.
+
+** The module (bjostat table)
+
+| Function | What it does |
+|----------+--------------|
+| ~(table-names t)~, ~(table-schema t)~, ~(column-type t name)~ | The schema: names, and each column's ~ColumnType~ |
+| ~(table-row-count t)~, ~(table-column-count t)~ | The size |
+| ~(doubles t name)~, ~floats~, ~longs~, ~ints~, ~strings~ | A column, typed, or an ~Err~ |
+| ~(column-values c)~ | The values, as a ~(RoSpan %a)~, in place |
+| ~(column-ref c i)~, ~(string-column-ref c i)~ | One value, or ~None~ at a null |
+| ~(column-valid? c i)~, ~(column-null-count c)~, ~(column-length c)~ | The nulls |
+| ~(column-sum c)~, ~column-mean~, ~column-min~, ~column-max~, ~column-count~ | Aggregates, with the nulls skipped |
+| ~(array->column a [#:valid v])~ | A column of a copy of the array; a null at each ~#f~ of ~v~ |
+| ~(array->string-column a [#:valid v])~ | The same, of strings |
+| ~(named name c)~, ~(named-strings name c)~, ~(make-table cols)~ | A table of columns |
+| ~(table-select t names)~, ~(table-slice t #:from #:to)~ | Part of a table, without a copy |
+| ~(read-arrow path)~, ~(write-arrow t path)~ | Arrow IPC files |
+| ~(table->string t #:rows 10)~ | The names, the types and the first rows, as text |
+
+*Nulls.* Arrow keeps a value at a null too, and that value is unspecified.
+~column-ref~ answers ~None~ there, and the aggregates skip the nulls. A loop
+over ~column-values~ reads ~column-valid?~ when ~column-null-count~ is not 0.
+
+*Speed.* Without nulls, ~column-sum~, ~column-min~ and ~column-max~ go to
+.NET's ~TensorPrimitives~, which is vectorized. A loop of your own over
+~column-values~ is a loop over a span, as fast as one over an array.
+
+*Types.* A column of ~double~, ~float~, ~long~, ~int~ or ~string~ can be
+taken out typed. Every other Arrow type, such as timestamps and booleans, is
+~(Other name)~ in the schema: a table holds it, prints it and writes it.
+
+** Plans
+
+The query layer is next: see [[file:plan.org][plan.org]].
+
+** Tests
+
+#+BEGIN_SRC sh
+bjo run tests/table.bjo    # every line starts with "ok:"
+#+END_SRC
