@@ -228,9 +228,8 @@ and statistics. In the order that lets an analysis be done from start to
 end:
 
 1. *Table operations that are not loops:* sort (done: ~table-sort~), joins
-   (inner, left and anti, by one or more keys, on the hash index of
-   ~group-index~), distinct rows, tables appended by rows, and pivots
-   (longer and wider).
+   (done: ~inner-join~, ~left-join~, ~semi-join~, ~anti-join~), distinct
+   rows, tables appended by rows, and pivots (longer and wider).
 2. *Column types:* dates and timestamps (Arrow ~Date32~ and ~Timestamp~,
    read from CSV), categorical columns (Arrow dictionaries: a group-by on
    them is a group-by on small ints), and booleans.
@@ -256,6 +255,16 @@ threads; measured):
 |---------------------------------+---------+-----------+------------|
 | by a number                     | 49.6 ms | 53.5 ms   | 25.4 ms    |
 | by a string, then a number down | 104 ms  | 334 ms    | 48.7 ms    |
+
+| Join (inner, 1M rows)           | bjostat | Polars, 1 | Polars, 24 |
+|---------------------------------+---------+-----------+------------|
+| by a string, to 4 rows          | 75–85 ms | 44.1 ms  | 12.9 ms    |
+| by a long, one to one           | 116–122 ms | 105 ms | 25.3 ms    |
+
+A join puts the right rows in a hash table by the hash of their keys, with
+the rows of a hash in a chain in their order, and each left row goes down
+the chain of its hash. The hash of a string key is made from its bytes for
+each row; a column of few distinct strings would be faster with codes.
 
 Each key is one stable pass, from the last key to the first: a radix sort
 of 64-bit keys whose unsigned order is the order of the values, and a

@@ -118,6 +118,19 @@
 (def/bench "filter, kept rows" (table-row-count (kept)))
 (def/bench "group by string, sum" (table-row-count (by-region)))
 (def/bench "group by long, sum and count" (table-row-count (by-qty)))
+;; A table of the four regions, and one of each id with a number.
+(: Table)
+(def region-rates
+  (ok (make-table [(named-strings "region" (array->string-column (vec->array ["north" "south" "east" "west"])))
+                   (named "rate" (array->column (vec->array [1.0 1.5 2.0 2.5])))])))
+(: Table)
+(def id-scores
+  (ok (make-table [(named "id" (array->column {arraying (cast long i) (:for i (range 0 (table-row-count t)))}))
+                   (named "score" (array->column {arraying (cast double (% i 7)) (:for i (range 0 (table-row-count t)))}))])))
+
+(def/bench "join by a string to 4 rows" (table-row-count (ok (inner-join t region-rates ["region"]))))
+(def/bench "join by a long, one to one" (table-row-count (ok (inner-join t id-scores ["id"]))))
+
 (def/bench "sort by a number" (table-row-count (ok (table-sort t [(ascending "price")]))))
 (def/bench "sort by a string, then a number"
   (table-row-count (ok (table-sort t [(ascending "region") (descending "price")]))))

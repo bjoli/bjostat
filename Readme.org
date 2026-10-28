@@ -46,6 +46,7 @@ a copy.
 | ~(named-any name c)~ | The same, for an Arrow column of any type |
 | ~(table-select t names)~, ~(table-slice t #:from #:to)~ | Part of a table, without a copy |
 | ~(table-sort t [(ascending name) (descending name) …])~ | The rows in the order of the keys, as R's ~order~: stable, nulls last |
+| ~(inner-join a b keys)~, ~left-join~, ~semi-join~, ~anti-join~ | The rows whose keys are equal, as dplyr's joins: left order, two nulls equal, ~.x~ and ~.y~ on shared names |
 | ~(read-arrow path)~, ~(write-arrow t path)~ | Arrow IPC files |
 | ~(table->string t #:rows 10 #:digits 1)~ | The names, the types and the first rows, as text; ~#:digits~ rounds the doubles |
 

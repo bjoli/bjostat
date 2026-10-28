@@ -45,6 +45,7 @@
   array->column array->string-column named named-strings named-any make-table
   table-select table-slice
   SortKey table-sort
+  inner-join left-join semi-join anti-join
 
   ;; Files
   read-arrow write-arrow
@@ -119,6 +120,8 @@
   (clr-slice (: Bjostat.Tables.Slice (-> Table int int Table)))
   (clr-unsortable (: Bjostat.Sorting.Unsortable (-> AnyColumn string)))
   (clr-sort-by (: Bjostat.Sorting.SortBy (-> Table (Array int) (Array bool) Table)))
+  (clr-join (: Bjostat.Joins.Join (-> Table Table (Array string) int Table)))
+  (clr-key-problem (: Bjostat.Joins.KeyProblem (-> Table Table (Array string) string)))
 
   ;; Files. Arrow reports a file it cannot read with exceptions of several
   ;; types, so every exception is an Err.
@@ -416,6 +419,44 @@
       (Ok (clr-sort-by t
                        {arraying (clr-index-of t (sort-key-name k)) (:for k keys)}
                        {arraying (match k ((descending _) #t) (_ #f)) (:for k keys)}))))
+
+;; Joins, as dplyr's: the rows of two tables whose keys, columns of the same
+;; names in both, are equal. The rows of the left table keep their order, and
+;; for each, the right rows it matches come in their order. Two nulls are
+;; equal keys, as in dplyr and R's merge.
+;;
+;;     (inner-join sales regions ["region"])
+;;
+;; The columns are the keys, then the other columns of the left table, then
+;; those of the right. A name that both tables have for columns that are not
+;; keys gets ".x" in the left one and ".y" in the right. An Err for a key that
+;; a table does not have, or one of other types in the two tables.
+(: (-> Table Table (Vec string) int (Result TableError Table)))
+(defun (join left right keys kind)
+  (def names (vec->array keys))
+  (def problem (clr-key-problem left right names))
+  (if (= problem "")
+      (Ok (clr-join left right names kind))
+      (refuse problem)))
+
+;; The pairs of rows whose keys are equal.
+(: (-> Table Table (Vec string) (Result TableError Table)))
+(defun (inner-join left right keys) (join left right keys 0))
+
+;; As inner-join, and also each left row that matches none, with nulls in the
+;; columns of the right table.
+(: (-> Table Table (Vec string) (Result TableError Table)))
+(defun (left-join left right keys) (join left right keys 1))
+
+;; The left rows that match a right row, each once, with the columns of the
+;; left table only.
+(: (-> Table Table (Vec string) (Result TableError Table)))
+(defun (semi-join left right keys) (join left right keys 2))
+
+;; The left rows that match no right row, with the columns of the left table
+;; only.
+(: (-> Table Table (Vec string) (Result TableError Table)))
+(defun (anti-join left right keys) (join left right keys 3))
 
 ;; ===========================================================================
 ;; Files

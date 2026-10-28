@@ -218,6 +218,44 @@
           (string-starts-with? (error-of (table-sort u [(ascending "y")])) "the table has no column 'y'")
           #t)
 
+  ;; Joins
+  (def orders (ok (make-table
+                    [(named-strings "region" (array->string-column (vec->array ["north" "south" "west" "north" "x"])
+                                                                    #:valid (vec->array [#t #t #t #t #f])))
+                     (named "qty" (array->column (vec->array [1L 2L 3L 4L 5L])))])))
+  (def regions (ok (make-table
+                     [(named-strings "region" (array->string-column (vec->array ["south" "north" "east" "north" "y"])
+                                                                     #:valid (vec->array [#t #t #t #t #f])))
+                      (named "qty" (array->column (vec->array [10L 20L 30L 40L 50L])))
+                      (named "rate" (array->column (vec->array [0.5 1.5 2.5 3.5 4.5])))])))
+  (def inner (ok (inner-join orders regions ["region"])))
+  (expect "inner join: the columns, a shared name with .x and .y"
+          (table-names inner) ["region" "qty.x" "qty.y" "rate"])
+  (expect "inner join: left order, then right order; two nulls match"
+          (longs-of inner "qty.x") [(Some 1L) (Some 1L) (Some 2L) (Some 4L) (Some 4L) (Some 5L)])
+  (expect "inner join: the right rows"
+          (longs-of inner "qty.y") [(Some 20L) (Some 40L) (Some 10L) (Some 20L) (Some 40L) (Some 50L)])
+  (def lefts (ok (left-join orders regions ["region"])))
+  (expect "left join: a left row with no match has nulls"
+          (longs-of lefts "qty.y") [(Some 20L) (Some 40L) (Some 10L) None (Some 20L) (Some 40L) (Some 50L)])
+  (expect "left join: its doubles too"
+          (prices-of lefts "rate") [(Some 1.5) (Some 3.5) (Some 0.5) None (Some 1.5) (Some 3.5) (Some 4.5)])
+  (expect "semi join: each matching left row once"
+          (longs-of (ok (semi-join orders regions ["region"])) "qty") [(Some 1L) (Some 2L) (Some 4L) (Some 5L)])
+  (expect "anti join: the left rows with no match"
+          (longs-of (ok (anti-join orders regions ["region"])) "qty") [(Some 3L)])
+  (expect "a join on two keys"
+          (table-row-count (ok (inner-join orders regions ["region" "qty"]))) 0)
+  (expect "a left join to an empty table"
+          (longs-of (ok (left-join orders (table-slice regions #:from 0 #:to 0) ["region"])) "qty.y")
+          [None None None None None])
+  (expect "a key of other types"
+          (error-of (inner-join orders (ok (make-table [(named "region" (array->column (vec->array [1L])))])) ["region"]))
+          "'region' is a column of utf8 in the left table and of int64 in the right.")
+  (expect "a key that is not there"
+          (error-of (inner-join orders regions ["day"]))
+          "the left table has no column 'day'.")
+
   ;; Printed
   (expect "printed"
           (table->string t #:rows 2)
