@@ -46,3 +46,7 @@ rates = pl.DataFrame({"region": ["north", "south", "east", "west"], "rate": [1.0
 scores = pl.DataFrame({"id": list(range(df.height)), "score": [float(i % 7) for i in range(df.height)]})
 bench("join by a string to 4 rows", lambda: df.join(rates, on="region", how="inner", maintain_order="left").height)
 bench("join by a long, one to one", lambda: df.join(scores, on="id", how="inner", maintain_order="left").height)
+bench("standard deviation", lambda: df["price"].std())
+bench("median", lambda: df["price"].median())
+bench("correlation", lambda: df.select(pl.corr("price", "qty")).item())
+bench("summary of the table", lambda: df.describe().height)

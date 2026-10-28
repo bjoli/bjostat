@@ -27,7 +27,7 @@
   ColumnType TableError NamedColumn
 
   ;; The schema
-  table-names table-schema column-type table-row-count table-column-count
+  table-names table-schema column-type column-nulls table-row-count table-column-count
 
   ;; Columns, typed
   doubles floats longs ints strings
@@ -69,6 +69,7 @@
   ;; Any column
   (clr-type-name (: Bjostat.Columns.TypeName (-> AnyColumn string)))
   (any-length (: Bjostat.Columns.Length (-> AnyColumn int)))
+  (any-null-count (: Bjostat.Columns.NullCount (-> AnyColumn int)))
   (any->string (: Bjostat.Columns.CellText (-> AnyColumn int int string)))
   (column->any (: Bjostat.Columns.Any (-> (Column %a) AnyColumn)))
   (strings->any (: Bjostat.Columns.AnyStrings (-> StringColumn AnyColumn)))
@@ -202,6 +203,12 @@
 (defun (column-type t name)
   (def i (clr-index-of t name))
   (if (< i 0) None (Some (type-of-column (clr-column t i)))))
+
+;; How many nulls the column of the name has, or None when there is none.
+(: (-> Table string (Option int)))
+(defun (column-nulls t name)
+  (def i (clr-index-of t name))
+  (if (< i 0) None (Some (any-null-count (clr-column t i)))))
 
 (: (-> Table string (Result TableError AnyColumn)))
 (defun (find-column t name)

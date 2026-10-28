@@ -238,14 +238,42 @@ The loop is the one way to make a column, a filter or a group. Bjolang is to
 make vector code of simple loops (Docs/Vectorisation-design.org in Bjolang),
 so that the same loop becomes faster, with no second API for speed.
 
+** The module (bjostat stats)
+
+Statistics are collectors of doubles, so they are loops too. A null is left
+out by the loop, where R needs ~na.rm = TRUE~:
+
+#+BEGIN_SRC scheme
+(loop (:for p* price) (:when-let (Some p) p*) (:acc (summarizing p)))
+;; Some summary: n, min, q1, median, mean, q3, max, sd
+(loop (:for p* price) (:for q* qty)
+      (:when-let (Some p) p*) (:when-let (Some q) q*)
+      (:acc (correlation (Tuple p (cast double q)))))
+#+END_SRC
+
+| Collector or function | What it makes |
+|------------------------+---------------|
+| ~(mean x)~, ~(variance x)~, ~(standard-deviation x)~ | One pass; the variance of a sample, as R's ~var~ and ~sd~ |
+| ~(covariance (Tuple x y))~, ~(correlation (Tuple x y))~ | One pass; Pearson's correlation, as R's ~cor~ |
+| ~(median x)~, ~(quantile p x)~, ~(quantiles ps x)~ | As R's ~quantile~ by default (type 7) |
+| ~(summarizing x)~, ~(summary->string s)~ | R's ~summary~ of numbers, with the count and the standard deviation |
+| ~(table-summary t)~ | A table of a row for each column: type, count, nulls, and the summary of numbers |
+
+Each is None of too few values: the mean of none, the variance of fewer than
+two. A quantile of values with a NaN is NaN.
+
 ** Plans
 
-The query layer is next: see [[file:plan.org][plan.org]].
+What comes next is in [[file:plan.org][plan.org]].
 
 ** Tests
 
 #+BEGIN_SRC sh
 bjo run tests/table.bjo    # every line starts with "ok:"
 bjo run tests/csv.bjo
+bjo run tests/query.bjo
+bjo run tests/vectors.bjo
+bjo run tests/dates.bjo
+bjo run tests/stats.bjo
 bjo bench bench/csv.bjo --all
 #+END_SRC

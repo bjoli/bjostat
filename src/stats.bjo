@@ -1,0 +1,346 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/src/stats.bjo — the module (bjostat stats): statistics as
+;; collectors, and the summary of a table.
+;;
+;; Each statistic is a collector of doubles, so it is a loop like any other:
+;;
+;;     (loop (:for p* price) (:when-let (Some p) p*) (:acc (standard-deviation p)))
+;;     (loop (:for p* price) (:for q* qty)
+;;           (:when-let (Some p) p*) (:when-let (Some q) q*)
+;;           (:acc (correlation (Tuple p (cast double q)))))
+;;
+;; A null is left out by the loop, with :when-let, where R would need
+;; `na.rm = TRUE`. A statistic of too few values is None: the mean of none,
+;; the variance of fewer than two. The variance and the standard deviation
+;; are those of a sample, with n - 1, as R's `var` and `sd`. The mean, the
+;; variance and the covariance are computed in one pass, from sums of the
+;; differences from the first value: subtracting a value near the mean first
+;; keeps the precision that plain sums of squares lose, and needs no division
+;; for each value, as Welford's method does.
+;;
+;; The quantiles keep all the values and sort them, as R's `quantile` does by
+;; default (its type 7).
+
+(export
+  Mean Variance StandardDeviation Covariance Correlation
+  Quantile quantile Quantiles quantiles Median
+  Summary Summarizing summary->string
+  table-summary
+  ;; The accumulators, opaque
+  Moments CoMoments SummaryAcc)
+
+(import (std prelude))
+
+(import (std mutable vec))
+(import (bjostat table))
+(import (bjostat query))
+
+(import/extern
+  (clr-quantiles (: Bjostat.Stats.Quantiles (-> (MutableVec double) (Array double) (Array double)))))
+
+;; ===========================================================================
+;; Mean and variance, in one pass
+;; ===========================================================================
+
+;; How many values, the first of them, and the sums of their differences
+;; from the first and of the squares of those.
+(type (: Moments #:opaque (Struct (: n long) (: k double) (: s1 double) (: s2 double))))
+
+(: Moments)
+(def no-moments (Moments (n 0L) (k 0.0) (s1 0.0) (s2 0.0)))
+
+(: (-> Moments double Moments))
+(defun (moments-add m x)
+  (def k (if (= (record-ref m n) 0L) x (record-ref m k)))
+  (def d (- x k))
+  (Moments (n (+ (record-ref m n) 1L)) (k k)
+           (s1 (+ (record-ref m s1) d)) (s2 (+ (record-ref m s2) (* d d)))))
+
+(: (-> Moments double))
+(defun (moments-mean m)
+  (+ (record-ref m k) (/ (record-ref m s1) (cast double (record-ref m n)))))
+
+(: (-> Moments (Option double)))
+(defun (moments-variance m)
+  (def n (cast double (record-ref m n)))
+  (def s1 (record-ref m s1))
+  (if (< n 2.0) None (Some (max 0.0 (/ (- (record-ref m s2) (/ (* s1 s1) n)) (- n 1.0))))))
+
+(type (: Mean (Union mean)))
+
+(impl (Collector Mean)
+  (type %elem double)
+  (type %acc Moments)
+  (type %out (Option double))
+  (defun (collector-init c) no-moments)
+  (defun (collector-step c m x) (moments-add m x))
+  (defun (collector-finish c m)
+    (if (= (record-ref m n) 0L) None (Some (moments-mean m)))))
+
+(type (: Variance (Union variance)))
+
+(impl (Collector Variance)
+  (type %elem double)
+  (type %acc Moments)
+  (type %out (Option double))
+  (defun (collector-init c) no-moments)
+  (defun (collector-step c m x) (moments-add m x))
+  (defun (collector-finish c m) (moments-variance m)))
+
+(type (: StandardDeviation (Union standard-deviation)))
+
+(impl (Collector StandardDeviation)
+  (type %elem double)
+  (type %acc Moments)
+  (type %out (Option double))
+  (defun (collector-init c) no-moments)
+  (defun (collector-step c m x) (moments-add m x))
+  (defun (collector-finish c m)
+    (match (moments-variance m)
+      ((Some v) (Some (sqrt v)))
+      (None None))))
+
+;; ===========================================================================
+;; Covariance and correlation, in one pass
+;; ===========================================================================
+
+;; Of pairs: the count, the first pair, and the sums of the differences from
+;; it, of their squares and of their products.
+(type (: CoMoments #:opaque (Struct (: n long) (: kx double) (: ky double)
+                                    (: sx double) (: sy double)
+                                    (: sxx double) (: syy double) (: sxy double))))
+
+(: CoMoments)
+(def no-co-moments (CoMoments (n 0L) (kx 0.0) (ky 0.0) (sx 0.0) (sy 0.0) (sxx 0.0) (syy 0.0) (sxy 0.0)))
+
+(: (-> CoMoments (Tuple double double) CoMoments))
+(defun (co-moments-add m xy)
+  (def (x y) xy)
+  (def first? (= (record-ref m n) 0L))
+  (def kx (if first? x (record-ref m kx)))
+  (def ky (if first? y (record-ref m ky)))
+  (def dx (- x kx))
+  (def dy (- y ky))
+  (CoMoments (n (+ (record-ref m n) 1L)) (kx kx) (ky ky)
+             (sx (+ (record-ref m sx) dx)) (sy (+ (record-ref m sy) dy))
+             (sxx (+ (record-ref m sxx) (* dx dx)))
+             (syy (+ (record-ref m syy) (* dy dy)))
+             (sxy (+ (record-ref m sxy) (* dx dy)))))
+
+;; The sums of squares and of products about the means: what the sums about
+;; the first pair become.
+(: (-> CoMoments (Tuple double double double)))
+(defun (centred m)
+  (def n (cast double (record-ref m n)))
+  (def sx (record-ref m sx))
+  (def sy (record-ref m sy))
+  (Tuple (max 0.0 (- (record-ref m sxx) (/ (* sx sx) n)))
+         (max 0.0 (- (record-ref m syy) (/ (* sy sy) n)))
+         (- (record-ref m sxy) (/ (* sx sy) n))))
+
+(type (: Covariance (Union covariance)))
+
+(impl (Collector Covariance)
+  (type %elem (Tuple double double))
+  (type %acc CoMoments)
+  (type %out (Option double))
+  (defun (collector-init c) no-co-moments)
+  (defun (collector-step c m xy) (co-moments-add m xy))
+  (defun (collector-finish c m)
+    (def n (record-ref m n))
+    (def (_ _ sxy) (centred m))
+    (if (< n 2L) None (Some (/ sxy (cast double (- n 1L)))))))
+
+;; Pearson's correlation. None for fewer than two pairs, and when one side
+;; has the same value in each pair, as R's `cor` is NA then.
+(type (: Correlation (Union correlation)))
+
+(impl (Collector Correlation)
+  (type %elem (Tuple double double))
+  (type %acc CoMoments)
+  (type %out (Option double))
+  (defun (collector-init c) no-co-moments)
+  (defun (collector-step c m xy) (co-moments-add m xy))
+  (defun (collector-finish c m)
+    (def (sxx syy sxy) (centred m))
+    (if (or (< (record-ref m n) 2L) (= sxx 0.0) (= syy 0.0))
+        None
+        (Some (/ sxy (sqrt (* sxx syy)))))))
+
+;; ===========================================================================
+;; Quantiles
+;; ===========================================================================
+
+;; The quantile at p, 0 to 1, as R's `quantile` gives it by default: the
+;; value at (n - 1) p in the sorted values, and between two values a straight
+;; line between them. NaN when a value is NaN; None when there are none.
+(type (: Quantile #:opaque (Struct (: p double))))
+
+(: (-> double Quantile))
+(defun (quantile p) (Quantile (p p)))
+
+(: (-> (MutableVec double) (Array double) (Option (Array double))))
+(defun (quantiles-of values ps)
+  (if (= (mutablevec-length values) 0)
+      None
+      (Some (clr-quantiles values ps))))
+
+(impl (Collector Quantile)
+  (type %elem double)
+  (type %acc (MutableVec double))
+  (type %out (Option double))
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc x) (mutablevec-add! acc x) acc)
+  (defun (collector-finish c acc)
+    (match (quantiles-of acc (vec->array [(record-ref c p)]))
+      ((Some qs) (Some (array-ref qs 0)))
+      (None None))))
+
+;; The quantiles at several p, from one sort.
+(type (: Quantiles #:opaque (Struct (: ps (Vec double)))))
+
+(: (-> (Vec double) Quantiles))
+(defun (quantiles ps) (Quantiles (ps ps)))
+
+(impl (Collector Quantiles)
+  (type %elem double)
+  (type %acc (MutableVec double))
+  (type %out (Option (Vec double)))
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc x) (mutablevec-add! acc x) acc)
+  (defun (collector-finish c acc)
+    (match (quantiles-of acc (vec->array (record-ref c ps)))
+      ((Some qs) (Some (array->vec qs)))
+      (None None))))
+
+;; The median: the quantile at 0.5.
+(type (: Median (Union median)))
+
+(impl (Collector Median)
+  (type %elem double)
+  (type %acc (MutableVec double))
+  (type %out (Option double))
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc x) (mutablevec-add! acc x) acc)
+  (defun (collector-finish c acc)
+    (match (quantiles-of acc (vec->array [0.5]))
+      ((Some qs) (Some (array-ref qs 0)))
+      (None None))))
+
+;; ===========================================================================
+;; Summary
+;; ===========================================================================
+
+;; What R's `summary` says of numbers: the least, the quartiles, the mean and
+;; the greatest, and here also how many there are and the standard deviation.
+(type (: Summary (Record (: count long)
+                         (: min double) (: q1 double) (: median double)
+                         (: mean double) (: q3 double) (: max double)
+                         (: sd (Option double)))))
+
+;; The summary of the values, or None when there are none.
+(type (: Summarizing (Union summarizing)))
+
+(type (: SummaryAcc #:opaque (Struct (: values (MutableVec double)) (: moments Moments))))
+
+(impl (Collector Summarizing)
+  (type %elem double)
+  (type %acc SummaryAcc)
+  (type %out (Option Summary))
+  (defun (collector-init c) (SummaryAcc (values (mutablevec)) (moments no-moments)))
+  (defun (collector-step c acc x)
+    (mutablevec-add! (record-ref acc values) x)
+    (SummaryAcc (values (record-ref acc values)) (moments (moments-add (record-ref acc moments) x))))
+  (defun (collector-finish c acc)
+    (def m (record-ref acc moments))
+    (match (quantiles-of (record-ref acc values) (vec->array [0.0 0.25 0.5 0.75 1.0]))
+      ((Some q)
+       (Some (Summary (count (record-ref m n))
+                      (min (array-ref q 0)) (q1 (array-ref q 1)) (median (array-ref q 2))
+                      (mean (moments-mean m)) (q3 (array-ref q 3)) (max (array-ref q 4))
+                      (sd (match (moments-variance m) ((Some v) (Some (sqrt v))) (None None))))))
+      (None None))))
+
+(: (-> double string))
+(defun (number-text x) (displayed x))
+
+(: (-> Summary string))
+(defun (summary->string s)
+  (str "n " (displayed (record-ref s count))
+       ", min " (number-text (record-ref s min))
+       ", q1 " (number-text (record-ref s q1))
+       ", median " (number-text (record-ref s median))
+       ", mean " (number-text (record-ref s mean))
+       ", q3 " (number-text (record-ref s q3))
+       ", max " (number-text (record-ref s max))
+       (match (record-ref s sd) ((Some sd) (str ", sd " (number-text sd))) (None ""))))
+
+;; The values of a column of numbers as doubles, nulls left out, or None for
+;; a column of another type.
+(: (-> Table string ColumnType (Option (Option Summary))))
+(defun (column-summary t name type)
+  (match type
+    (Double (Some (loop (:for x* (ok-cells (doubles-of t name))) (:when-let (Some x) x*)
+                        (:acc (summarizing x)))))
+    (Float (Some (loop (:for x* (ok-cells (floats-of t name))) (:when-let (Some x) x*)
+                       (:acc (summarizing (cast double x))))))
+    (Long (Some (loop (:for x* (ok-cells (longs-of t name))) (:when-let (Some x) x*)
+                      (:acc (summarizing (cast double x))))))
+    (Int (Some (loop (:for x* (ok-cells (ints-of t name))) (:when-let (Some x) x*)
+                     (:acc (summarizing (cast double x))))))
+    (_ None)))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok-cells r)
+  (match r
+    ((Ok c) c)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> Table string (Result TableError (Cells double))))
+(defun (doubles-of t name) (column-as t name))
+(: (-> Table string (Result TableError (Cells float))))
+(defun (floats-of t name) (column-as t name))
+(: (-> Table string (Result TableError (Cells long))))
+(defun (longs-of t name) (column-as t name))
+(: (-> Table string (Result TableError (Cells int))))
+(defun (ints-of t name) (column-as t name))
+
+;; A table with a row for each column of `t`, as R's `summary` of a data
+;; frame: its name, its type, how many values and nulls it has, and for a
+;; column of numbers the least, the quartiles, the mean, the greatest and the
+;; standard deviation, which are null for other columns and for a column of
+;; nulls only.
+(: (-> Table Table))
+(defun (table-summary t)
+  (def schema (table-schema t))
+  (def rows (cast long (table-row-count t)))
+  (def stats
+    {vecing (match (column-summary t name type)
+              ((Some s) s)
+              (None None))
+            (:for (Tuple name type) schema)})
+  (def nulls {arraying (match (column-nulls t name) ((Some n) (cast long n)) (None 0L))
+                       (:for (Tuple name _) schema)})
+  (: (-> (-> Summary double) AnyColumn))
+  (defun (stat f)
+    (loop (:for s stats)
+          (:acc (column-building/option (match s ((Some x) (Some (f x))) (None None))))))
+  (match (make-table
+           [(named-strings "column" (array->string-column {arraying name (:for (Tuple name _) schema)}))
+            (named-strings "type" (array->string-column {arraying (displayed type) (:for (Tuple _ type) schema)}))
+            (named "count" (array->column {arraying (- rows (array-ref nulls i)) (:for i (range 0 (array-length nulls)))}))
+            (named "nulls" (array->column nulls))
+            (named-any "min" (stat (fun (s) (record-ref s min))))
+            (named-any "q1" (stat (fun (s) (record-ref s q1))))
+            (named-any "median" (stat (fun (s) (record-ref s median))))
+            (named-any "mean" (stat (fun (s) (record-ref s mean))))
+            (named-any "q3" (stat (fun (s) (record-ref s q3))))
+            (named-any "max" (stat (fun (s) (record-ref s max))))
+            (named-any "sd" (loop (:for s stats)
+                                  (:acc (column-building/option
+                                          (match s ((Some x) (record-ref x sd)) (None None))))))])
+    ((Ok summary) summary)
+    ((Err e) (panic! (displayed e)))))

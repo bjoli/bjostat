@@ -230,13 +230,14 @@ end:
 1. *Table operations that are not loops:* sort (done: ~table-sort~), joins
    (done: ~inner-join~, ~left-join~, ~semi-join~, ~anti-join~), distinct
    rows, tables appended by rows, and pivots (longer and wider).
-2. *Column types:* dates and timestamps (Arrow ~Date32~ and ~Timestamp~,
-   read from CSV), categorical columns (Arrow dictionaries: a group-by on
+2. *Column types:* dates and timestamps (done: ~date-cells~,
+   ~dates-building~ and the others, read from CSV, as values of
+   ~(std datetime)~), categorical columns (Arrow dictionaries: a group-by on
    them is a group-by on small ints), and booleans.
-3. *Statistics as collectors:* variance and standard deviation (Welford),
-   covariance and correlation, quantiles and the median (exact from a sort,
-   or a t-digest in one pass), counts by one or two keys (R's ~table~), and
-   a ~summary~ of a table.
+3. *Statistics as collectors:* done in ~(bjostat stats)~: mean, variance,
+   standard deviation, covariance, correlation, quantiles, median, a summary
+   of numbers and of a table. Not yet: counts by one or two keys (R's
+   ~table~), and a t-digest for quantiles in one pass with little memory.
 4. *Models:* ~lm~ as a collector of a QR decomposition, with coefficients,
    standard errors, R² and p-values; then ~glm~. A formula macro later.
 5. *Distributions and random numbers:* density, distribution, quantile and
@@ -265,6 +266,17 @@ A join puts the right rows in a hash table by the hash of their keys, with
 the rows of a hash in a chain in their order, and each left row goes down
 the chain of its hash. The hash of a string key is made from its bytes for
 each row; a column of few distinct strings would be faster with codes.
+
+| Statistic (1M rows)             | bjostat | Polars, 1 | Polars, 24 |
+|---------------------------------+---------+-----------+------------|
+| standard deviation              | 2.50 ms | 0.63 ms   | 0.48 ms    |
+| median                          | 16.5 ms | 11.5 ms   | 3.0 ms     |
+| correlation                     | 2.91 ms | 1.08 ms   | 1.31 ms    |
+| summary of the table            | 95.2 ms | 46.8 ms   | 26.2 ms    |
+
+The one-pass statistics are sums of doubles, which Bjolang does not
+vectorize unless a program asks, because the vector adds in another order.
+A quantile is found by selection, not by a sort: 60 ms became 16.5.
 
 Each key is one stable pass, from the last key to the first: a radix sort
 of 64-bit keys whose unsigned order is the order of the values, and a
