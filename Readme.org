@@ -40,6 +40,7 @@ a copy.
 | ~(column-ref c i)~, ~(string-column-ref c i)~ | One value, or ~None~ at a null |
 | ~(column-valid? c i)~, ~(column-null-count c)~, ~(column-length c)~ | The nulls |
 | ~(column-sum c)~, ~column-mean~, ~column-min~, ~column-max~, ~column-count~ | Aggregates, with the nulls skipped |
+| ~(column* a b)~, ~column+~, ~column-~, ~column/~, ~(column-cast c)~ | Arithmetic on whole columns, vectorized; a null where either operand has one |
 | ~(array->column a [#:valid v])~ | A column of a copy of the array; a null at each ~#f~ of ~v~ |
 | ~(array->string-column a [#:valid v])~ | The same, of strings |
 | ~(named name c)~, ~(named-strings name c)~, ~(make-table cols)~ | A table of columns |
@@ -198,6 +199,35 @@ Prices rise fastest in Nigeria, 104% a year, and fall in Seychelles, -4.21%.
 
 Nearly two countries in three buy more than they sell. The other third,
 it seems, is very busy.
+
+** The module (bjostat query)
+
+A query is a ~loop~ over a table's cells, with collectors for its results.
+The columns are found first, where a misspelt name is an ~Err~:
+
+#+BEGIN_SRC scheme
+(def* ((Ok price) (column-as t "price") :propagate)
+      ((Ok qty) (column-as t "qty") :propagate))
+(loop (:for row (range 0 (table-row-count t)))
+      (:for p* price) (:for q* qty)
+      (:when-let (Some p) p*) (:when-let (Some q) q*)
+      (:when (> p 250.0))
+      (:acc (selecting t row)))
+#+END_SRC
+
+| Collector or function | What it makes |
+|------------------------+---------------|
+| ~(selecting t row)~, ~(selecting-if t (Tuple row keep?))~ | The table of the rows kept; ~-if~ has no jump a row |
+| ~(column-building x)~, ~(column-building/option o)~ | A column, a null at each ~None~ |
+| ~(column-building/sized n x)~, ~(column-building/option/sized n o)~ | The same, of a known number of rows: written where it ends, not grown |
+| ~(column-map c f)~, ~(column-map2 a b f)~ | A column of ~f~ of each row, a null where an input has one |
+| ~(group-of! groups key)~ and ~summing-by~, ~counting-by~, ~min-by~, ~max-by~, ~mean-by~ | Aggregates by group, ~groups->table~ the table of them |
+| ~(grouping c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |
+| ~(table-with t name c)~ | The table with a column more, or one replaced |
+
+For a new column, the kernels are the fastest, then ~column-map2~, then a loop
+with a sized builder. On 1 000 000 rows: 1.9 ms, 2.7 ms and 3.9 ms, against
+5.7 ms for a loop with ~column-building/option~ (bench/compare.bjo).
 
 ** Plans
 

@@ -28,6 +28,8 @@
   ;; Collectors, for a loop over cells
   Selecting selecting SelectingIf selecting-if
   ColumnBuilding ColumnBuildingOption
+  ColumnBuildingSized column-building/sized ColumnBuildingOptionSized column-building/option/sized
+  column-map column-map2
   Grouping grouping Pairing pairing
   map->table table-with
 
@@ -43,6 +45,7 @@
 
 (import/class
   ((Builder %a) (: Bjostat.Builder))
+  ((SizedBuilder %a) (: Bjostat.SizedBuilder))
   (Selection (: Bjostat.Selection)))
 
 (import/extern
@@ -56,6 +59,10 @@
   (builder-add (: Bjostat.BuilderOps.Add (-> (Builder %a) %a (Builder %a))))
   (builder-add-option (: Bjostat.BuilderOps.AddOption (-> (Builder %a) (Option %a) (Builder %a))))
   (builder-build (: Bjostat.BuilderOps.Build (-> (Builder %a) AnyColumn)))
+  (sized-make (: Bjostat.SizedBuilderOps.Make (-> int (SizedBuilder %a))))
+  (sized-add (: Bjostat.SizedBuilderOps.Add (-> (SizedBuilder %a) %a (SizedBuilder %a))))
+  (sized-add-option (: Bjostat.SizedBuilderOps.AddOption (-> (SizedBuilder %a) (Option %a) (SizedBuilder %a))))
+  (sized-build (: Bjostat.SizedBuilderOps.Build (-> (SizedBuilder %a) AnyColumn)))
 
   (selection-make (: Bjostat.Selection.Make (-> Selection)))
   (selection-add (: Bjostat.Selection.Add (-> Selection int Selection)))
@@ -482,6 +489,78 @@
 (defun (map->table m key-name value-name)
   (make-table [(named-any key-name {column-building k (:for (Tuple k _) m)})
                (named-any value-name {column-building v (:for (Tuple _ v) m)})]))
+
+;; The same two, for a column whose number of rows is known before the loop,
+;; as a new column of a table's is:
+;;
+;;     (:acc (column-building/sized (table-row-count t) (* p (cast double q))))
+;;
+;; A column of numbers is then written into the buffer it ends in, which is
+;; neither grown nor copied: about five times less memory moved. Fewer values
+;; than rows are allowed, and more are an error.
+(type (: (ColumnBuildingSized %a) #:opaque (Struct (: rows int))))
+
+(: (-> int (ColumnBuildingSized %a)))
+(defun (column-building/sized rows) (ColumnBuildingSized (rows rows)))
+
+(impl (Collector (ColumnBuildingSized %a))
+  (type %elem %a)
+  (type %acc (SizedBuilder %a))
+  (type %out AnyColumn)
+  (defun (collector-init c) (sized-make (record-ref c rows)))
+  (defun (collector-step c acc x) (sized-add acc x))
+  (defun (collector-finish c acc) (sized-build acc)))
+
+(type (: (ColumnBuildingOptionSized %a) #:opaque (Struct (: rows int))))
+
+(: (-> int (ColumnBuildingOptionSized %a)))
+(defun (column-building/option/sized rows) (ColumnBuildingOptionSized (rows rows)))
+
+(impl (Collector (ColumnBuildingOptionSized %a))
+  (type %elem (Option %a))
+  (type %acc (SizedBuilder %a))
+  (type %out AnyColumn)
+  (defun (collector-init c) (sized-make (record-ref c rows)))
+  (defun (collector-step c acc x) (sized-add-option acc x))
+  (defun (collector-finish c acc) (sized-build acc)))
+
+;; A new column of `f` of each row's value of `c`, a null where `c` has one:
+;;
+;;     (column-map price (fun (p) (* p 1.25)))
+;;
+;; The nulls are dealt with here, so `f` takes plain values. The column is
+;; made at its size, as `column-building/sized` makes it, and a function
+;; given a known function is spliced, so `f` is no call a row.
+(: (-> (Cells %a) (-> %a %b) AnyColumn))
+(defun (column-map c f)
+  (def n (cells-length c))
+  (def b (sized-make n))
+  (if (= (cells-null-count c) 0)
+      (loop (:for i (range 0 n))
+            (:do (ignore (sized-add b (f (cells-ref c i))))))
+      (loop (:for i (range 0 n))
+            (:do (ignore (if (cells-valid? c i)
+                             (sized-add b (f (cells-ref c i)))
+                             (sized-add-option b None))))))
+  (sized-build b))
+
+;; The same of two columns of one length, a null where either has one:
+;;
+;;     (column-map2 price qty (fun (p q) (* p (cast double q))))
+(: (-> (Cells %a) (Cells %b) (-> %a %b %c) AnyColumn))
+(defun (column-map2 c d f)
+  (def n (cells-length c))
+  (when (not (= n (cells-length d)))
+    (panic! (str "column-map2: columns of " (int->string n) " and " (int->string (cells-length d)) " rows")))
+  (def b (sized-make n))
+  (if (and (= (cells-null-count c) 0) (= (cells-null-count d) 0))
+      (loop (:for i (range 0 n))
+            (:do (ignore (sized-add b (f (cells-ref c i) (cells-ref d i))))))
+      (loop (:for i (range 0 n))
+            (:do (ignore (if (and (cells-valid? c i) (cells-valid? d i))
+                             (sized-add b (f (cells-ref c i) (cells-ref d i)))
+                             (sized-add-option b None))))))
+  (sized-build b))
 
 ;; The table with the column under `name`: in place of the column of that
 ;; name, or after the others. It has to have a value or a null for each row.

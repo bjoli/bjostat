@@ -120,6 +120,34 @@
   (expect "column-building/option: a null at None"
           (double-values with-revenue2 "revenue")
           [(Some 31.5) (Some 20.0) None (Some 24.0) (Some 150.0)])
+  (expect "column-building/option/sized: the same column"
+          (double-values
+            (ok (table-with sales "revenue"
+                  (loop (:for p* price) (:for q* qty)
+                        (:acc (column-building/option/sized
+                                rows
+                                (match (Tuple p* q*)
+                                  ((Tuple (Some p) (Some q)) (Some (* p (cast double (: q long)))))
+                                  (_ None)))))))
+            "revenue")
+          [(Some 31.5) (Some 20.0) None (Some 24.0) (Some 150.0)])
+  (expect "column-building/sized: fewer values than rows"
+          (error-of (table-with sales "few" (loop (:for p (skip-nulls qty)) (:acc (column-building/sized rows p)))))
+          "the column 'few' has 4 rows, and the table has 5.")
+  (expect "column-building/sized: strings"
+          (texts (ok (table-with sales "shout"
+                                 (loop (:for r* region)
+                                       (:acc (column-building/sized rows (match r* ((Some r) (string-upcase r)) (None "-")))))))
+                 "shout")
+          ["NORTH" "SOUTH" "NORTH" "EAST" "-"])
+  (expect "column-map: a null where the input has one"
+          (double-values (ok (table-with sales "half" (column-map price (fun (p) (/ p 2.0))))) "half")
+          [(Some 5.25) (Some 10.0) (Some 3.625) (Some 6.0) (Some 15.0)])
+  (expect "column-map2: a null where either has one"
+          (double-values (ok (table-with sales "revenue"
+                                         (column-map2 price qty (fun (p q) (* p (cast double (: q long)))))))
+                         "revenue")
+          [(Some 31.5) (Some 20.0) None (Some 24.0) (Some 150.0)])
   (expect "column-building: strings"
           (texts (ok (table-with sales "shout"
                                  (loop (:for r* region)

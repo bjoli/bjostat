@@ -172,9 +172,24 @@ The filter took 20.8 ms at first. Of that:
   are about what reading them costs: a kept row in four touches every cache
   line.
 
-Next, by what they would gain: a path for columns without nulls through
-spans (new column, 10×), codes for strings (group by string), CSV from the
-bytes, and loops over rows split across cores.
+The new column took 5.7 ms. Measured in paired rounds (--compare-within):
+- The growing builder copied the column as it grew and once more at the
+  end. ~column-building/sized~ writes into the buffer the column ends in:
+  3.9 ms.
+- ~column-map~ and ~column-map2~ deal with the nulls once, before the loop,
+  and splice the function they are given: 2.7 ms. A ~match~ on a ~Tuple~ of
+  two Options cost 2.4 ms a million rows more than two nested matches did,
+  in a loop of its own: the C# switch on the tuple. To look at in Bjolang.
+- Kernels on whole columns, ~column*~ and the others, by TensorPrimitives:
+  1.9 ms. The multiplication takes 0.7–1.0 ms, as Polars's 0.62. The cast of
+  longs to doubles takes the rest: neither ConvertChecked nor
+  ConvertTruncating is vectorized for it. A kernel of a double and a long
+  column would leave it out.
+- A loop of plain values over spans with a sized builder takes 1.2–2.2 ms:
+  about what code a row can do in .NET, which does not vectorize loops.
+
+Next, by what they would gain: codes for strings (group by string), CSV from
+the bytes, and loops over rows split across cores.
 
 ** Next: queries, checked before they run
 

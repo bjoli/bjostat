@@ -320,13 +320,123 @@ public sealed class Builder<T>
     private void Release() =>
         System.Buffers.ArrayPool<T>.Shared.Return(_values, clearArray: typeof(T) == typeof(Utf8String));
 
-    private static IArrowType ArrowType() =>
+    internal static IArrowType ArrowType() =>
         typeof(T) == typeof(double) ? DoubleType.Default
         : typeof(T) == typeof(float) ? FloatType.Default
         : typeof(T) == typeof(long) ? Int64Type.Default
         : typeof(T) == typeof(int) ? Int32Type.Default
         : typeof(T) == typeof(short) ? Int16Type.Default
         : UInt8Type.Default;
+}
+
+/// <summary>
+/// A column of T whose number of rows is known before its first value, as
+/// a new column of a table's is.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A column of numbers is written into the buffer Arrow is then given: one
+/// array of the exact size, not zeroed first, and no copy when it is built.
+/// The growing <see cref="Builder{T}"/> copies as it grows and once more at the
+/// end, which moved six times the column's bytes for a column of a million
+/// doubles. A column of strings or bools goes to a Builder made as large as
+/// the column, which never grows.
+/// </para>
+/// <para>
+/// Fewer values than rows are allowed, as a <c>:when</c> may skip some: the
+/// part written is then copied out. Under a null the value is written as 0, so
+/// that nothing of what the array held before can be read in the column.
+/// </para>
+/// </remarks>
+public sealed class SizedBuilder<T>
+{
+    private readonly int _length;
+    private readonly byte[]? _bytes;
+    private readonly Builder<T>? _other;
+    private byte[]? _valid;
+    private int _count;
+    private int _nulls;
+
+    private static bool IsNumber =>
+        typeof(T) == typeof(double) || typeof(T) == typeof(float) || typeof(T) == typeof(long)
+        || typeof(T) == typeof(int) || typeof(T) == typeof(short) || typeof(T) == typeof(byte);
+
+    public SizedBuilder(int length)
+    {
+        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+        _length = length;
+        if (IsNumber) _bytes = GC.AllocateUninitializedArray<byte>(length * Unsafe.SizeOf<T>());
+        else _other = new Builder<T>(length);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void Add(T v)
+    {
+        if (_other != null)
+        {
+            _other.Add(v);
+            return;
+        }
+        if ((uint)_count >= (uint)_length) TooMany();
+        Unsafe.WriteUnaligned(
+            ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_bytes!), (nint)_count * Unsafe.SizeOf<T>()), v);
+        _count++;
+    }
+
+    public void AddNull()
+    {
+        if (_other != null)
+        {
+            _other.AddNull();
+            return;
+        }
+        if ((uint)_count >= (uint)_length) TooMany();
+        if (_valid == null)
+        {
+            _valid = new byte[(_length + 7) / 8];
+            _valid.AsSpan().Fill(0xFF);
+        }
+        _valid[_count >> 3] &= (byte)~(1 << (_count & 7));
+        Unsafe.WriteUnaligned(
+            ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_bytes!), (nint)_count * Unsafe.SizeOf<T>()), default(T));
+        _nulls++;
+        _count++;
+    }
+
+    private void TooMany() =>
+        throw new InvalidOperationException($"(bjostat query): more values than the {_length} rows the column was made for");
+
+    public IArrowArray Build()
+    {
+        if (_other != null) return _other.Build();
+        int size = _count * Unsafe.SizeOf<T>();
+        var bytes = _count == _length ? _bytes! : _bytes.AsSpan(0, size).ToArray();
+        var bitmap = _valid == null ? ArrowBuffer.Empty : new ArrowBuffer(_valid.AsSpan(0, (_count + 7) / 8).ToArray());
+        var data = new ArrayData(Builder<T>.ArrowType(), _count, _nulls, 0, new[] { bitmap, new ArrowBuffer(bytes) });
+        return ArrowArrayFactory.BuildArray(data);
+    }
+}
+
+public static class SizedBuilderOps
+{
+    public static SizedBuilder<T> Make<T>(int length) => new(length);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static SizedBuilder<T> Add<T>(SizedBuilder<T> b, T v)
+    {
+        b.Add(v);
+        return b;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static SizedBuilder<T> AddOption<T>(SizedBuilder<T> b, BjolangRuntime.Option<T> v)
+    {
+        if (v.IsSome) b.Add(v.Value);
+        else b.AddNull();
+        return b;
+    }
+
+    public static IArrowArray Build<T>(SizedBuilder<T> b) => b.Build();
 }
 
 public static class BuilderOps

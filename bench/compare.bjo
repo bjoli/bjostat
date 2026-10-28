@@ -15,7 +15,6 @@
 (import (bjostat csv))
 (import (bjostat query))
 
-(import/extern (any-rows (: Bjostat.Columns.Length (-> AnyColumn int))))
 
 (: (-> (Result TableError %a) %a))
 (defun (ok r)
@@ -118,9 +117,41 @@
 (def/bench "filter, region" (table-row-count (kept-of (ok (table-select t ["region"])))))
 (def/bench "filter, note" (table-row-count (kept-of (ok (table-select t ["note"])))))
 
+;; The new column, as a program may write it: the loop of with-revenue first,
+;; which the others are compared with.
+(def/bench "new column" #:group "new column" (table-column-count (with-revenue)))
+
+(def/bench "new column, sized" #:group "new column"
+  (table-column-count
+    (ok (table-with t "revenue"
+          (loop (:for p* price) (:for q* qty)
+                (:acc (column-building/option/sized
+                        (table-row-count t)
+                        (match (Tuple p* q*)
+                          ((Tuple (Some p) (Some q)) (Some (* p (cast double q))))
+                          (_ None)))))))))
+
+(def/bench "new column, column-map2" #:group "new column"
+  (table-column-count
+    (ok (table-with t "revenue" (column-map2 price qty (fun (p q) (* p (cast double q))))))))
+
+(def/bench "new column, kernels" #:group "new column"
+  (def p (ok (doubles t "price")))
+  (def q (ok (longs t "qty")))
+  (table-column-count
+    (ok (table-with t "revenue" (column->any (column* p (column-cast q)))))))
+
+;; The two kernels on their own.
+(def/bench "kernel, multiply" #:group "kernels"
+  (def p (ok (doubles t "price")))
+  (column-length (column* p p)))
+
+(def/bench "kernel, cast" #:group "kernels"
+  (def q (ok (longs t "qty")))
+  (column-length (: (column-cast q) (Column double))))
+
 (def/bench "read csv" (table-row-count (ok (read-csv path))))
 (def/bench "filter, kept rows" (table-row-count (kept)))
-(def/bench "new column" (table-column-count (with-revenue)))
 (def/bench "group by string, sum" (table-row-count (by-region)))
 (def/bench "group by long, sum and count" (table-row-count (by-qty)))
 

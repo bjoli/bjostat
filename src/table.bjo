@@ -38,6 +38,9 @@
   Cells column-as cells-ref cells-get cells-valid? cells-length cells-null-count
   NotNull skip-nulls
 
+  ;; Arithmetic on whole columns
+  column+ column- column* column/ column-cast column->any
+
   ;; Aggregates
   column-sum column-mean column-min column-max column-count
 
@@ -97,6 +100,15 @@
   ;; each value, #f at a null.
   (clr-from-array (: Bjostat.Columns.FromArray (-> (Array %a) (Array bool) (Column %a))))
   (clr-from-strings (: Bjostat.Columns.FromStrings (-> (Array string) (Array bool) StringColumn)))
+
+  ;; Arithmetic on whole columns, vectorized: every value computed, and a
+  ;; null where either operand has one. See glue/Kernels.cs.
+  (column+ (: Bjostat.Kernels.Add (-> (Column %a) (Column %a) (Column %a))))
+  (column- (: Bjostat.Kernels.Subtract (-> (Column %a) (Column %a) (Column %a))))
+  (column* (: Bjostat.Kernels.Multiply (-> (Column %a) (Column %a) (Column %a))))
+  (column/ (: Bjostat.Kernels.Divide (-> (Column %a) (Column %a) (Column %a))))
+  ;; The column as numbers of another type, with the same nulls.
+  (column-cast (: Bjostat.Kernels.Cast (-> (Column %a) (Column %b))))
 
   ;; Aggregates. A column of a type that is not a number is a C# error, for
   ;; now: (Column %a) does not say that %a is a number.
