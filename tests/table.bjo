@@ -30,13 +30,6 @@
 (: (-> int int))
 (defun (int-of n) n)
 
-;; The message of what `f` raises, or "no error".
-(: (-> (-> %a) string))
-(defun (try-message f)
-  (match (try (f) #:catch (System.ArgumentException))
-    ((Ok _) "no error")
-    ((Err e) (.-Message e))))
-
 (: (-> Table string (Result TableError (Cells double))))
 (defun (double-cells t name) (column-as t name))
 
@@ -118,28 +111,6 @@
   (expect "skip-nulls" (loop (:for r (skip-nulls rating-cells)) (:acc (listing r))) (list 5 3 4))
   (expect "skip-nulls, a count" (count (skip-nulls rating-cells)) 3)
   (expect "skip-nulls without nulls" (loop (:for p (skip-nulls price-cells)) (:acc (summing p))) 49.75)
-
-  ;; Arithmetic on whole columns: a null where either operand has one
-  (def ratings (ok (ints t "rating")))
-  (def doubled (column+ ratings ratings))
-  (expect "column+" (column-ref doubled 0) (Some 10))
-  (expect "column+, a null" (column-ref doubled 1) None)
-  (expect "column+, the nulls" (column-null-count doubled) 1)
-  (expect "column-" (column-ref (column- ratings ratings) 3) (Some 0))
-  (expect "column*" (column-ref (column* price price) 0) (Some 110.25))
-  (expect "column/" (column-ref (column/ price price) 2) (Some 1.0))
-  (def qty-doubles (: (column-cast qty) (Column double)))
-  (expect "column-cast" (column-ref qty-doubles 2) (Some 4.0))
-  (expect "column-cast, the nulls kept" (column-null-count (: (column-cast ratings) (Column double))) 1)
-  (expect "revenue by kernels" (column-sum (column* price qty-doubles)) 104.5)
-  (expect "columns of other lengths"
-          (string-contains? (try-message (fun () (column+ ratings (ok (ints (table-slice t #:to 2) "rating"))))) "rows")
-          #t)
-  ;; A slice starts in the middle of a byte of the bitmap.
-  (def sliced (ok (ints (table-slice t #:from 1 #:to 4) "rating")))
-  (expect "a sliced column, its null" (column-ref (column+ sliced sliced) 0) None)
-  (expect "a sliced column, its values" (column-ref (column+ sliced sliced) 2) (Some 8))
-  (expect "a sliced column with another" (column-null-count (column+ sliced (column+ sliced sliced))) 1)
 
   ;; Aggregates: vectorized without nulls, skipping them with
   (expect "sum" (column-sum price) 49.75)

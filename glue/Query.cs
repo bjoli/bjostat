@@ -215,62 +215,114 @@ public static class Query
 /// string; it has no constraint in C#, as Cells has none, so that a Bjolang
 /// collector over it needs none.
 /// </summary>
+/// <remarks>
+/// <para>
+/// The arrays come from the shared pools, as in CsvColumn: an array that
+/// doubles is copied many times, and each copy over 85 000 bytes would be on
+/// the large object heap. Without the pools a column of a million doubles
+/// took four times as long, for the collections of generation 2.
+/// </para>
+/// <para>
+/// A column of numbers is kept as bytes, so that the array it grew in can be
+/// the buffer Arrow is given, with no copy at the end. That array is then
+/// not given back to the pool. When more than a quarter of it would be
+/// empty, the bytes are copied to an array of their size instead, so that a
+/// column does not hold much memory it does not use.
+/// </para>
+/// </remarks>
 public sealed class Builder<T>
 {
-    private T[] _values;
+    // Numbers: their bytes. Strings and bools: the values.
+    private byte[]? _bytes;
+    private T[]? _values;
     private byte[]? _valid;
+    private int _capacity;
     private int _count;
     private int _nulls;
 
-    // The values are in an array of the shared pool, as in CsvColumn: an
-    // array that doubles is copied many times, and each copy over 85 000
-    // bytes would be on the large object heap. Build gives it back. An array
-    // of strings is cleared then, so that the pool does not keep them.
+    private static bool IsNumber =>
+        typeof(T) == typeof(double) || typeof(T) == typeof(float) || typeof(T) == typeof(long)
+        || typeof(T) == typeof(int) || typeof(T) == typeof(short) || typeof(T) == typeof(byte);
+
     public Builder(int capacity)
     {
         CheckType();
-        _values = System.Buffers.ArrayPool<T>.Shared.Rent(Math.Max(capacity, 16));
+        _capacity = Math.Max(capacity, 16);
+        if (IsNumber)
+        {
+            _bytes = System.Buffers.ArrayPool<byte>.Shared.Rent(_capacity * Unsafe.SizeOf<T>());
+            _capacity = _bytes.Length / Unsafe.SizeOf<T>();
+        }
+        else
+        {
+            _values = System.Buffers.ArrayPool<T>.Shared.Rent(_capacity);
+            _capacity = _values.Length;
+        }
     }
 
     private static void CheckType()
     {
-        if (!(typeof(T) == typeof(double) || typeof(T) == typeof(float) || typeof(T) == typeof(long)
-              || typeof(T) == typeof(int) || typeof(T) == typeof(short) || typeof(T) == typeof(byte)
-              || typeof(T) == typeof(bool) || typeof(T) == typeof(Utf8String)))
+        if (!(IsNumber || typeof(T) == typeof(bool) || typeof(T) == typeof(Utf8String)))
             throw new ArgumentException($"(bjostat query): a column of {typeof(T).Name} cannot be made");
     }
 
     public int Count => _count;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Add(T v)
     {
-        if (_count == _values.Length) Grow();
-        _values[_count++] = v;
+        if (_count == _capacity) Grow();
+        if (_bytes != null)
+            Unsafe.WriteUnaligned(
+                ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_bytes), (nint)_count * Unsafe.SizeOf<T>()), v);
+        else
+            _values![_count] = v;
+        _count++;
     }
 
     public void AddNull()
     {
-        if (_count == _values.Length) Grow();
+        if (_count == _capacity) Grow();
         if (_valid == null)
         {
-            _valid = new byte[_values.Length / 8 + 1];
+            _valid = new byte[_capacity / 8 + 1];
             _valid.AsSpan().Fill(0xFF);
         }
         _valid[_count >> 3] &= (byte)~(1 << (_count & 7));
+        // The value under a null is 0, so that nothing the array held before
+        // can be read in the column.
+        if (_bytes != null)
+            Unsafe.WriteUnaligned(
+                ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_bytes), (nint)_count * Unsafe.SizeOf<T>()), default(T));
+        else
+            _values![_count] = default!;
         _nulls++;
         _count++;
     }
 
     private void Grow()
     {
-        var bigger = System.Buffers.ArrayPool<T>.Shared.Rent(_values.Length * 2);
-        _values.AsSpan(0, _count).CopyTo(bigger);
-        Release();
-        _values = bigger;
+        if (_bytes != null)
+        {
+            int used = _count * Unsafe.SizeOf<T>();
+            var bigger = System.Buffers.ArrayPool<byte>.Shared.Rent(_bytes.Length * 2);
+            _bytes.AsSpan(0, used).CopyTo(bigger);
+            System.Buffers.ArrayPool<byte>.Shared.Return(_bytes);
+            _bytes = bigger;
+            _capacity = bigger.Length / Unsafe.SizeOf<T>();
+        }
+        else
+        {
+            var bigger = System.Buffers.ArrayPool<T>.Shared.Rent(_values!.Length * 2);
+            _values.AsSpan(0, _count).CopyTo(bigger);
+            ReleaseValues();
+            _values = bigger;
+            _capacity = bigger.Length;
+        }
         if (_valid != null)
         {
             int old = _valid.Length;
-            System.Array.Resize(ref _valid, _values.Length / 8 + 1);
+            System.Array.Resize(ref _valid, _capacity / 8 + 1);
             _valid.AsSpan(old).Fill(0xFF);
         }
     }
@@ -279,10 +331,27 @@ public sealed class Builder<T>
     {
         var bitmap = _valid == null ? ArrowBuffer.Empty : new ArrowBuffer(_valid.AsSpan(0, (_count + 7) / 8).ToArray());
         ArrayData data;
-        if (typeof(T) == typeof(Utf8String))
+        if (_bytes != null)
+        {
+            int used = _count * Unsafe.SizeOf<T>();
+            ArrowBuffer buffer;
+            if (_bytes.Length - used <= used / 4)
+            {
+                // The array is the column's now, and not the pool's.
+                buffer = new ArrowBuffer(new ReadOnlyMemory<byte>(_bytes, 0, used));
+            }
+            else
+            {
+                buffer = new ArrowBuffer(_bytes.AsSpan(0, used).ToArray());
+                System.Buffers.ArrayPool<byte>.Shared.Return(_bytes);
+            }
+            _bytes = System.Array.Empty<byte>();
+            data = new ArrayData(ArrowType(), _count, _nulls, 0, new[] { bitmap, buffer });
+        }
+        else if (typeof(T) == typeof(Utf8String))
         {
             // T is Utf8String here, so the array is a Utf8String[].
-            var strings = Unsafe.As<T[], Utf8String[]>(ref _values).AsSpan(0, _count);
+            var strings = Unsafe.As<T[], Utf8String[]>(ref _values!).AsSpan(0, _count);
             var offsets = new int[_count + 1];
             int total = 0;
             for (int i = 0; i < strings.Length; i++)
@@ -294,31 +363,29 @@ public sealed class Builder<T>
             for (int i = 0; i < strings.Length; i++) strings[i].AsSpan().CopyTo(bytes.AsSpan(offsets[i]));
             data = new ArrayData(StringType.Default, _count, _nulls, 0,
                 new[] { bitmap, new ArrowBuffer(MemoryMarshal.AsBytes(offsets.AsSpan()).ToArray()), new ArrowBuffer(bytes) });
+            ReleaseValues();
         }
-        else if (typeof(T) == typeof(bool))
+        else
         {
-            var bools = Unsafe.As<T[], bool[]>(ref _values).AsSpan(0, _count);
+            var bools = Unsafe.As<T[], bool[]>(ref _values!).AsSpan(0, _count);
             var bits = new byte[(_count + 7) / 8];
             for (int i = 0; i < bools.Length; i++)
                 if (bools[i]) bits[i >> 3] |= (byte)(1 << (i & 7));
             data = new ArrayData(BooleanType.Default, _count, _nulls, 0, new[] { bitmap, new ArrowBuffer(bits) });
+            ReleaseValues();
         }
-        else
-        {
-            // A number: its bytes, as they are in the array.
-            var bytes = MemoryMarshal.CreateReadOnlySpan(
-                ref Unsafe.As<T, byte>(ref MemoryMarshal.GetArrayDataReference(_values)),
-                _count * Unsafe.SizeOf<T>()).ToArray();
-            data = new ArrayData(ArrowType(), _count, _nulls, 0, new[] { bitmap, new ArrowBuffer(bytes) });
-        }
-        Release();
-        _values = System.Array.Empty<T>();
         _count = 0;
+        _capacity = 0;
         return ArrowArrayFactory.BuildArray(data);
     }
 
-    private void Release() =>
-        System.Buffers.ArrayPool<T>.Shared.Return(_values, clearArray: typeof(T) == typeof(Utf8String));
+    // An array of strings is cleared when it goes back, so that the pool does
+    // not keep the strings.
+    private void ReleaseValues()
+    {
+        System.Buffers.ArrayPool<T>.Shared.Return(_values!, clearArray: typeof(T) == typeof(Utf8String));
+        _values = System.Array.Empty<T>();
+    }
 
     internal static IArrowType ArrowType() =>
         typeof(T) == typeof(double) ? DoubleType.Default
@@ -327,116 +394,6 @@ public sealed class Builder<T>
         : typeof(T) == typeof(int) ? Int32Type.Default
         : typeof(T) == typeof(short) ? Int16Type.Default
         : UInt8Type.Default;
-}
-
-/// <summary>
-/// A column of T whose number of rows is known before its first value, as
-/// a new column of a table's is.
-/// </summary>
-/// <remarks>
-/// <para>
-/// A column of numbers is written into the buffer Arrow is then given: one
-/// array of the exact size, not zeroed first, and no copy when it is built.
-/// The growing <see cref="Builder{T}"/> copies as it grows and once more at the
-/// end, which moved six times the column's bytes for a column of a million
-/// doubles. A column of strings or bools goes to a Builder made as large as
-/// the column, which never grows.
-/// </para>
-/// <para>
-/// Fewer values than rows are allowed, as a <c>:when</c> may skip some: the
-/// part written is then copied out. Under a null the value is written as 0, so
-/// that nothing of what the array held before can be read in the column.
-/// </para>
-/// </remarks>
-public sealed class SizedBuilder<T>
-{
-    private readonly int _length;
-    private readonly byte[]? _bytes;
-    private readonly Builder<T>? _other;
-    private byte[]? _valid;
-    private int _count;
-    private int _nulls;
-
-    private static bool IsNumber =>
-        typeof(T) == typeof(double) || typeof(T) == typeof(float) || typeof(T) == typeof(long)
-        || typeof(T) == typeof(int) || typeof(T) == typeof(short) || typeof(T) == typeof(byte);
-
-    public SizedBuilder(int length)
-    {
-        if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
-        _length = length;
-        if (IsNumber) _bytes = GC.AllocateUninitializedArray<byte>(length * Unsafe.SizeOf<T>());
-        else _other = new Builder<T>(length);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void Add(T v)
-    {
-        if (_other != null)
-        {
-            _other.Add(v);
-            return;
-        }
-        if ((uint)_count >= (uint)_length) TooMany();
-        Unsafe.WriteUnaligned(
-            ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_bytes!), (nint)_count * Unsafe.SizeOf<T>()), v);
-        _count++;
-    }
-
-    public void AddNull()
-    {
-        if (_other != null)
-        {
-            _other.AddNull();
-            return;
-        }
-        if ((uint)_count >= (uint)_length) TooMany();
-        if (_valid == null)
-        {
-            _valid = new byte[(_length + 7) / 8];
-            _valid.AsSpan().Fill(0xFF);
-        }
-        _valid[_count >> 3] &= (byte)~(1 << (_count & 7));
-        Unsafe.WriteUnaligned(
-            ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_bytes!), (nint)_count * Unsafe.SizeOf<T>()), default(T));
-        _nulls++;
-        _count++;
-    }
-
-    private void TooMany() =>
-        throw new InvalidOperationException($"(bjostat query): more values than the {_length} rows the column was made for");
-
-    public IArrowArray Build()
-    {
-        if (_other != null) return _other.Build();
-        int size = _count * Unsafe.SizeOf<T>();
-        var bytes = _count == _length ? _bytes! : _bytes.AsSpan(0, size).ToArray();
-        var bitmap = _valid == null ? ArrowBuffer.Empty : new ArrowBuffer(_valid.AsSpan(0, (_count + 7) / 8).ToArray());
-        var data = new ArrayData(Builder<T>.ArrowType(), _count, _nulls, 0, new[] { bitmap, new ArrowBuffer(bytes) });
-        return ArrowArrayFactory.BuildArray(data);
-    }
-}
-
-public static class SizedBuilderOps
-{
-    public static SizedBuilder<T> Make<T>(int length) => new(length);
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static SizedBuilder<T> Add<T>(SizedBuilder<T> b, T v)
-    {
-        b.Add(v);
-        return b;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static SizedBuilder<T> AddOption<T>(SizedBuilder<T> b, BjolangRuntime.Option<T> v)
-    {
-        if (v.IsSome) b.Add(v.Value);
-        else b.AddNull();
-        return b;
-    }
-
-    public static IArrowArray Build<T>(SizedBuilder<T> b) => b.Build();
 }
 
 public static class BuilderOps

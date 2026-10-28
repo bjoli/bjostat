@@ -172,7 +172,9 @@ The filter took 20.8 ms at first. Of that:
   are about what reading them costs: a kept row in four touches every cache
   line.
 
-The new column took 5.7 ms. Measured in paired rounds (--compare-within):
+The new column took 5.7 ms. Ways to make it faster were measured in paired
+rounds (--compare-within); of them, only the faster builder is kept, as the
+next section says:
 - The growing builder copied the column as it grew and once more at the
   end. ~column-building/sized~ writes into the buffer the column ends in:
   3.9 ms.
@@ -188,8 +190,33 @@ The new column took 5.7 ms. Measured in paired rounds (--compare-within):
 - A loop of plain values over spans with a sized builder takes 1.2–2.2 ms:
   about what code a row can do in .NET, which does not vectorize loops.
 
-Next, by what they would gain: codes for strings (group by string), CSV from
-the bytes, and loops over rows split across cores.
+** Decided: one API, the loop
+
+The kernels, ~column-map~ and the sized builders made three ways to make a
+column: one fast, one comfortable and one general. A program should have one
+way, and it is the loop. A Python library has a second API, arithmetic on
+whole columns, because a Python loop is 50 times slower than a Bjolang one.
+Bjolang's loops are compiled, as Julia's are; what they lack is vector code.
+
+So:
+1. Done: bjostat keeps the loop and its collectors, and nothing beside them
+   for the same work. The kernels, ~column-map~ and the sized builders are
+   gone. ~column-building~ keeps a column of numbers as bytes, so that the
+   array it grew in is the buffer Arrow is given, with no copy at the end:
+   4.2 ms where it took 6.5, in three pairs of runs, as fast as the sized
+   builder, without being told the size.
+2. Bjolang vectorizes simple loops: maps over ranges, arrays and spans
+   first; then loops over a library's values through a trait, ~Contiguous~,
+   with null bitmaps as masks; then counts, sums and filters. The design is
+   in Bjolang's Docs/Vectorisation-design.org. bjostat implements
+   ~Contiguous~ for the cells of a column of numbers.
+
+Arithmetic on columns, as ~(* price qty)~ of two columns, is not in the
+plan: ~*~ is ~INumber~'s, which a column cannot be, and each step would make
+a column, which a vectorized loop over all its columns does not.
+
+Next, besides: codes for strings (group by string), CSV from the bytes, and
+loops over rows split across cores.
 
 ** Next: queries, checked before they run
 
