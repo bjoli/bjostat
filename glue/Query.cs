@@ -300,12 +300,50 @@ public sealed class Builder<T>
         _count++;
     }
 
-    private void Grow()
+    /// <summary>
+    /// <paramref name="n"/> more values at the end, not null. Their values
+    /// are written next, through <see cref="Span"/>.
+    /// </summary>
+    public void Extend(int n)
+    {
+        if (n < 0) throw new ArgumentOutOfRangeException(nameof(n));
+        if (_capacity - _count < n) Grow(_count + n);
+        _count += n;
+    }
+
+    /// <summary>The values from <paramref name="start"/>, <paramref name="n"/> of them, to write.</summary>
+    public Span<T> Span(int start, int n)
+    {
+        if (start < 0 || n < 0 || start > _count - n) throw new ArgumentOutOfRangeException(nameof(start));
+        if (_bytes != null)
+            return MemoryMarshal.CreateSpan(
+                ref Unsafe.As<byte, T>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_bytes), (nint)start * Unsafe.SizeOf<T>())), n);
+        return _values.AsSpan(start, n);
+    }
+
+    /// <summary>Makes value <paramref name="i"/> null, with 0 under it, as <see cref="AddNull"/> does.</summary>
+    public void SetNull(int i)
+    {
+        if ((uint)i >= (uint)_count) throw new IndexOutOfRangeException();
+        if (_valid == null)
+        {
+            _valid = new byte[_capacity / 8 + 1];
+            _valid.AsSpan().Fill(0xFF);
+        }
+        if ((_valid[i >> 3] & (1 << (i & 7))) == 0) return;
+        _valid[i >> 3] &= (byte)~(1 << (i & 7));
+        Span(i, 1)[0] = default!;
+        _nulls++;
+    }
+
+    // Room for at least `wanted` values, and at least twice as many as now.
+    private void Grow(int wanted = 0)
     {
         if (_bytes != null)
         {
             int used = _count * Unsafe.SizeOf<T>();
-            var bigger = System.Buffers.ArrayPool<byte>.Shared.Rent(_bytes.Length * 2);
+            var bigger = System.Buffers.ArrayPool<byte>.Shared.Rent(
+                Math.Max(_bytes.Length * 2, wanted * Unsafe.SizeOf<T>()));
             _bytes.AsSpan(0, used).CopyTo(bigger);
             System.Buffers.ArrayPool<byte>.Shared.Return(_bytes);
             _bytes = bigger;
@@ -313,7 +351,7 @@ public sealed class Builder<T>
         }
         else
         {
-            var bigger = System.Buffers.ArrayPool<T>.Shared.Rent(_values!.Length * 2);
+            var bigger = System.Buffers.ArrayPool<T>.Shared.Rent(Math.Max(_values!.Length * 2, wanted));
             _values.AsSpan(0, _count).CopyTo(bigger);
             ReleaseValues();
             _values = bigger;
@@ -420,6 +458,18 @@ public static class BuilderOps
     }
 
     public static IArrowArray Build<T>(Builder<T> b) => b.Build();
+
+    public static int Count<T>(Builder<T> b) => b.Count;
+
+    public static Builder<T> Extend<T>(Builder<T> b, int n)
+    {
+        b.Extend(n);
+        return b;
+    }
+
+    public static Span<T> Span<T>(Builder<T> b, int start, int n) => b.Span(start, n);
+
+    public static void SetNull<T>(Builder<T> b, int i) => b.SetNull(i);
 }
 
 /// <summary>The numbers of the rows a loop kept, in the order it kept them.</summary>

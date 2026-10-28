@@ -122,6 +122,28 @@ public sealed unsafe class Cells<T>
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsValid(int i) => NullCount == 0 || _array.IsValid(i);
+
+    /// <summary>
+    /// Whether <see cref="Values"/> and <see cref="Valid"/> give all the
+    /// cells: the values are numbers in one buffer, and the valid bitmap,
+    /// when there is one, starts at a whole byte.
+    /// </summary>
+    public bool IsContiguous =>
+        (_bytes != null || _pointer != null) && (NullCount == 0 || _offset % 8 == 0);
+
+    /// <summary>The values, one for each cell. Under a null the value is unspecified.</summary>
+    public ReadOnlySpan<T> Values =>
+        _bytes != null
+            ? MemoryMarshal.CreateReadOnlySpan(
+                ref Unsafe.As<byte, T>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_bytes), _start)), Length)
+            : new ReadOnlySpan<T>(_pointer, Length);
+
+    /// <summary>
+    /// The valid bitmap from cell 0, or empty when no cell is null. Only for
+    /// cells that <see cref="IsContiguous"/> is true for.
+    /// </summary>
+    public ReadOnlySpan<byte> Valid =>
+        NullCount == 0 ? default : _array.Data.Buffers[0].Span.Slice(_offset >> 3);
 }
 
 public static class CellsOps
@@ -172,4 +194,10 @@ public static class CellsOps
     public static int Length<T>(Cells<T> c) => c.Length;
 
     public static int NullCount<T>(Cells<T> c) => c.NullCount;
+
+    public static bool IsContiguous<T>(Cells<T> c) => c.IsContiguous;
+
+    public static ReadOnlySpan<T> Values<T>(Cells<T> c) => c.Values;
+
+    public static ReadOnlySpan<byte> Valid<T>(Cells<T> c) => c.Valid;
 }

@@ -92,6 +92,9 @@
   (clr-cells-valid? (: Bjostat.CellsOps.IsValid (-> (ClrCells %a) int bool)))
   (clr-cells-length (: Bjostat.CellsOps.Length (-> (ClrCells %a) int)))
   (clr-cells-null-count (: Bjostat.CellsOps.NullCount (-> (ClrCells %a) int)))
+  (clr-cells-contiguous? (: Bjostat.CellsOps.IsContiguous (-> (ClrCells %a) bool)))
+  (clr-cells-values (: Bjostat.CellsOps.Values (-> (ClrCells %a) (RoSpan %a))))
+  (clr-cells-valid (: Bjostat.CellsOps.Valid (-> (ClrCells %a) (RoSpan byte))))
 
   ;; Building. The flags are empty for a column with no nulls, or one for
   ;; each value, #f at a null.
@@ -266,6 +269,14 @@
   (defun (iterable-current c i) (cells-get c i))
   (defun (iterable-next c i) (+ i 1))
   (defun (count c) (cells-length c)))
+
+;; The cells of a column of numbers are an Arrow buffer and a valid bitmap,
+;; so a loop over them can use vector instructions.
+(impl (Contiguous (Cells %a))
+  (type %value %a)
+  (defun (contiguous? c) (clr-cells-contiguous? (record-ref c clr)))
+  (defun (contiguous-values c) (clr-cells-values (record-ref c clr)))
+  (defun (contiguous-valid c) (clr-cells-valid (record-ref c clr))))
 
 ;; The values of cells that are not null, as Julia's skipmissing: for a loop
 ;; over one column. Next to another column it would not stay on its row.

@@ -1,0 +1,128 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/vectors.bjo — loops that Bjolang compiles to vector
+;; instructions, because Cells are Contiguous and the column-building
+;; collectors are BlockCollectors. The answers must be those of the scalar
+;; loop: with nulls, with sizes that are not a whole number of vectors, and
+;; with slices, whose bitmaps can start inside a byte.
+;;
+;;     bjo run tests/vectors.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjostat table))
+(import (bjostat query))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+;; A table of n rows: price, null when i % 5 = 3; qty, null when i % 7 = 2;
+;; and two columns of int and float with no nulls.
+(: (-> int Table))
+(defun (sample n)
+  (def price (make-array n #:fill 0.0))
+  (def price-ok (make-array n #:fill #t))
+  (def qty (make-array n #:fill 0L))
+  (def qty-ok (make-array n #:fill #t))
+  (def a (make-array n #:fill 0))
+  (def b (make-array n #:fill (cast float 0)))
+  (loop (:for i (range 0 n))
+        (:do (array-set! price i (+ (cast double i) 0.5))
+             (array-set! price-ok i (not (= (% i 5) 3)))
+             (array-set! qty i (cast long (* 3 i)))
+             (array-set! qty-ok i (not (= (% i 7) 2)))
+             (array-set! a i (* i i))
+             (array-set! b i (cast float i))))
+  (ok (make-table
+        [(named "price" (array->column price #:valid price-ok))
+         (named "qty" (array->column qty #:valid qty-ok))
+         (named "a" (array->column a))
+         (named "b" (array->column b))])))
+
+(: (-> (Cells double) (Cells long) AnyColumn))
+(defun (revenue price qty)
+  (loop (:for p* price) (:for q* qty)
+        (:acc (column-building/option
+                (match (Tuple p* q*)
+                  ((Tuple (Some p) (Some q)) (Some (* p (cast double q))))
+                  (_ None))))))
+
+(: (-> (Cells double) AnyColumn))
+(defun (doubled price)
+  (loop (:for p* price)
+        (:acc (column-building/option
+                (match p* ((Some p) (Some (* 2.0 p))) (None None))))))
+
+(: (-> (Cells int) AnyColumn))
+(defun (plus-one a)
+  (loop (:for x* a)
+        (:acc (column-building/option
+                (match x* ((Some x) (Some (+ x 1))) (None None))))))
+
+(: (-> (Cells int) (Cells float) AnyColumn))
+(defun (mixed a b)
+  (loop (:for x* a) (:for y* b)
+        (:acc (column-building/option
+                (match (Tuple x* y*)
+                  ((Tuple (Some x) (Some y)) (Some (+ (cast float x) y)))
+                  (_ None))))))
+
+;; The column as one table column, read back through cells.
+(: (-> AnyColumn (Cells %a)))
+(defun (cells-of c)
+  (ok (column-as (ok (make-table [(named-any "c" c)])) "c")))
+
+;; The number of rows where `got` and `want` differ.
+(: (-> (Cells %a) (-> int (Option %a)) int) (where (Eq %a)))
+(defun (wrong got want)
+  (loop (:for i (range 0 (cells-length got)))
+        (:when (not (= (cells-get got i) (want i))))
+        (:acc (counting i))))
+
+(defun (main)
+  (loop
+    (:for n [0 1 3 4 5 7 8 9 15 16 17 31 33 1000 1003])
+    (:do
+     (def t (sample n))
+     (loop
+       (:for from [0 3 8 13])
+       (:do
+        (def u (table-slice t #:from (min from n)))
+        (def m (table-row-count u))
+        (def base (min from n))
+        (def price (ok (column-as u "price")))
+        (def qty (ok (column-as u "qty")))
+        (def where (str (displayed n) " rows from " (displayed base)))
+        (def r (cells-of (revenue price qty)))
+        (expect (str "revenue, " where) (cells-length r) m)
+        (expect (str "revenue values, " where)
+                (wrong r (fun (i)
+                           (def k (+ base i))
+                           (if (or (= (% k 5) 3) (= (% k 7) 2))
+                               None
+                               (Some (* (+ (cast double k) 0.5) (cast double (* 3 k)))))))
+                0)
+        (def d (cells-of (doubled price)))
+        (expect (str "doubled values, " where)
+                (wrong d (fun (i)
+                           (def k (+ base i))
+                           (if (= (% k 5) 3) None (Some (* 2.0 (+ (cast double k) 0.5))))))
+                0)
+        (def a (ok (column-as u "a")))
+        (def b (ok (column-as u "b")))
+        (def p (cells-of (plus-one a)))
+        (expect (str "ints, " where)
+                (wrong p (fun (i) (def k (+ base i)) (Some (+ (* k k) 1))))
+                0)
+        (def x (cells-of (mixed a b)))
+        (expect (str "floats, " where)
+                (wrong x (fun (i) (def k (+ base i)) (Some (+ (cast float (* k k)) (cast float k)))))
+                0)))))
+  0)

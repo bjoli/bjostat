@@ -56,6 +56,10 @@
   (builder-add (: Bjostat.BuilderOps.Add (-> (Builder %a) %a (Builder %a))))
   (builder-add-option (: Bjostat.BuilderOps.AddOption (-> (Builder %a) (Option %a) (Builder %a))))
   (builder-build (: Bjostat.BuilderOps.Build (-> (Builder %a) AnyColumn)))
+  (builder-count (: Bjostat.BuilderOps.Count (-> (Builder %a) int)))
+  (builder-extend (: Bjostat.BuilderOps.Extend (-> (Builder %a) int (Builder %a))))
+  (builder-span (: Bjostat.BuilderOps.Span (-> (Builder %a) int int (Span %a))))
+  (builder-set-null! (: Bjostat.BuilderOps.SetNull (-> (Builder %a) int void)))
 
   (selection-make (: Bjostat.Selection.Make (-> Selection)))
   (selection-add (: Bjostat.Selection.Add (-> Selection int Selection)))
@@ -227,6 +231,24 @@
   (defun (collector-init c) (builder-make 1024))
   (defun (collector-step c acc x) (builder-add-option acc x))
   (defun (collector-finish c acc) (builder-build acc)))
+
+;; A builder takes a block of values at a time, so that a loop that makes a
+;; column can use vector instructions.
+(impl (BlockCollector (ColumnBuilding %a))
+  (type %value %a)
+  (type %acc (Builder %a))
+  (defun (block-count c acc) (builder-count acc))
+  (defun (block-grow c acc n) (builder-extend acc n))
+  (defun (block-span c acc start n) (builder-span acc start n))
+  (defun (block-none! c acc i) (builder-set-null! acc i)))
+
+(impl (BlockCollector (ColumnBuildingOption %a))
+  (type %value %a)
+  (type %acc (Builder %a))
+  (defun (block-count c acc) (builder-count acc))
+  (defun (block-grow c acc n) (builder-extend acc n))
+  (defun (block-span c acc start n) (builder-span acc start n))
+  (defun (block-none! c acc i) (builder-set-null! acc i)))
 
 ;; For each key, what the inner collector makes of the values with that key:
 ;;
