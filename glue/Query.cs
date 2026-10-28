@@ -487,19 +487,27 @@ public sealed class Selection
         return s;
     }
 
-    /// <summary>
-    /// The row, kept only when <paramref name="keep"/> is true, with no branch
-    /// on it: the row is written at the end either way, and the count grows by
-    /// one or by none. A test that keeps rows at random costs no mispredicted
-    /// jump, as a <c>:when</c> before <c>Add</c> does.
-    /// </summary>
-    public static Selection AddIf(Selection s, int row, bool keep)
+    public static int Count(Selection s) => s._count;
+
+    /// <summary><paramref name="n"/> more rows at the end, written next through <see cref="Span"/>.</summary>
+    public static Selection Grow(Selection s, int n)
     {
-        if (s._count == s._rows.Length) System.Array.Resize(ref s._rows, s._rows.Length * 2);
-        s._rows[s._count] = row;
-        s._count += Unsafe.As<bool, byte>(ref keep);
+        if (n < 0) throw new ArgumentOutOfRangeException(nameof(n));
+        if (s._rows.Length - s._count < n)
+            System.Array.Resize(ref s._rows, Math.Max(s._rows.Length * 2, s._count + n));
+        s._count += n;
         return s;
     }
+
+    public static Span<int> Span(Selection s, int start, int n)
+    {
+        if (start < 0 || n < 0 || start > s._count - n) throw new ArgumentOutOfRangeException(nameof(start));
+        return s._rows.AsSpan(start, n);
+    }
+
+    /// <summary>A row number is never None, so a vector loop never calls this.</summary>
+    public static void NoNone(Selection s, int i) =>
+        throw new InvalidOperationException("a selected row cannot be None");
 
     /// <summary>The table of those rows of <paramref name="t"/>.</summary>
     public static RecordBatch Take(Selection s, RecordBatch t) => Query.Take(t, s._rows, s._count);

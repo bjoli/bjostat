@@ -26,7 +26,7 @@
   where-rows count-rows create-column
 
   ;; Collectors, for a loop over cells
-  Selecting selecting SelectingIf selecting-if
+  Selecting selecting
   ColumnBuilding ColumnBuildingOption
   Grouping grouping Pairing pairing
   map->table table-with
@@ -63,8 +63,11 @@
 
   (selection-make (: Bjostat.Selection.Make (-> Selection)))
   (selection-add (: Bjostat.Selection.Add (-> Selection int Selection)))
-  (selection-add-if (: Bjostat.Selection.AddIf (-> Selection int bool Selection)))
-  (selection-take (: Bjostat.Selection.Take (-> Selection Table Table))))
+  (selection-take (: Bjostat.Selection.Take (-> Selection Table Table)))
+  (selection-count (: Bjostat.Selection.Count (-> Selection int)))
+  (selection-grow (: Bjostat.Selection.Grow (-> Selection int Selection)))
+  (selection-span (: Bjostat.Selection.Span (-> Selection int int (Span int))))
+  (selection-no-none! (: Bjostat.Selection.NoNone (-> Selection int void))))
 
 ;; ===========================================================================
 ;; Row specs
@@ -187,27 +190,14 @@
   (defun (collector-step c acc row) (selection-add acc row))
   (defun (collector-finish c acc) (selection-take acc (record-ref c table))))
 
-;; The same, given each row and whether to keep it:
-;;
-;;     (:acc (selecting-if t (Tuple row (and (> p 250.0) (> q 20L)))))
-;;
-;; in place of a :when and `selecting`. The row is written either way and
-;; counted only when kept, so a test that keeps rows at random costs no
-;; mispredicted jump.
-(type (: SelectingIf #:opaque (Struct (: table Table))))
-
-(: (-> Table SelectingIf))
-(defun (selecting-if t) (SelectingIf (table t)))
-
-(impl (Collector SelectingIf)
-  (type %elem (Tuple int bool))
+;; The rows a vector loop keeps go to the selection a block at a time.
+(impl (BlockCollector Selecting)
+  (type %value int)
   (type %acc Selection)
-  (type %out Table)
-  (defun (collector-init c) (selection-make))
-  (defun (collector-step c acc rk)
-    (def (row keep) rk)
-    (selection-add-if acc row keep))
-  (defun (collector-finish c acc) (selection-take acc (record-ref c table))))
+  (defun (block-count c acc) (selection-count acc))
+  (defun (block-grow c acc n) (selection-grow acc n))
+  (defun (block-span c acc start n) (selection-span acc start n))
+  (defun (block-none! c acc i) (selection-no-none! acc i)))
 
 ;; A column of the values it is given. The type of the column is theirs: a
 ;; number, bool or string.

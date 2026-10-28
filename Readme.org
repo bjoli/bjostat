@@ -216,7 +216,7 @@ The columns are found first, where a misspelt name is an ~Err~:
 
 | Collector or function | What it makes |
 |------------------------+---------------|
-| ~(selecting t row)~, ~(selecting-if t (Tuple row keep?))~ | The table of the rows kept; ~-if~ has no jump a row |
+| ~(selecting t row)~ | The table of the rows kept |
 | ~(column-building x)~, ~(column-building/option o)~ | A column, a null at each ~None~ |
 | ~(group-of! groups key)~ and ~summing-by~, ~counting-by~, ~min-by~, ~max-by~, ~mean-by~ | Aggregates by group, ~groups->table~ the table of them |
 | ~(grouping c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |

@@ -105,12 +105,6 @@
         (:when-let (Some p) p*) (:when-let (Some q) q*)
         (:when (and (> p -1.0) (> q -1L)))
         (:acc (counting p))))
-(def/bench "filter, kept rows, selecting-if"
-  (table-row-count
-    (loop (:for row (range 0 (table-row-count t)))
-          (:for p* price) (:for q* qty)
-          (:when-let (Some p) p*) (:when-let (Some q) q*)
-          (:acc (selecting-if t (Tuple row (and (> p 250.0) (> q 20L))))))))
 
 (def/bench "filter, no columns" (table-row-count (kept-of (ok (table-select t [])))))
 (def/bench "filter, numbers" (table-row-count (kept-of (ok (table-select t ["id" "price" "qty"])))))

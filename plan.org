@@ -163,8 +163,10 @@ The filter took 20.8 ms at first. Of that:
   test that is always true. ~(and a b)~ was a jump on ~a~, mispredicted half
   the time. Bjolang now writes ~and~ and ~or~ of cheap comparisons as C#'s
   ~&~ and ~|~, both sides evaluated, no jump (Simplify.fs): 3.5 ms.
-- The ~:when~ is a jump too. ~(selecting-if t (Tuple row keep?))~ writes
-  every row and counts the kept ones, with no jump: 1.2 ms less.
+- The ~:when~ is a jump too. A ~selecting-if~ collector wrote every row
+  and counted the kept ones, with no jump: 1.2 ms less. It was removed when
+  Bjolang's vector loops made ~:when~ and ~selecting~ faster than it: the
+  loop alone takes 1.37 ms, and one API is enough.
 - The copy of the kept rows: validity was read through ~IsValid~, an
   interface call a row, and every array was zeroed before it was written.
   The bitmap is read directly now, and the arrays are not zeroed: the column
