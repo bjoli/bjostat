@@ -102,6 +102,19 @@
   (expect "selecting nothing"
           (table-row-count (loop (:for row (range 0 rows)) (:when #f) (:acc (selecting sales row))))
           0)
+  ;; Strings of each length from 0 to 40, and nulls: a kept string of at most
+  ;; 16 bytes is copied as 16 bytes, unless those would end after the bytes
+  ;; of the column, as they do for the last rows.
+  (def words {vecing (string-join {vecing "x" (:for _ (range 0 (% i 41)))} "") (:for i (range 0 200))})
+  (def word-table
+    (ok (make-table [(named-strings "w" (array->string-column (vec->array words)
+                                                               #:valid {arraying (not (= (% i 9) 4)) (:for i (range 0 200))}))])))
+  (def every-third
+    (loop (:for row (range 0 200)) (:when (or (= (% row 3) 0) (> row 195))) (:acc (selecting word-table row))))
+  (expect "selecting strings of each length"
+          (texts every-third "w")
+          {vecing (if (= (% i 9) 4) "null" (vec-ref words i))
+                  (:for i (range 0 200)) (:when (or (= (% i 3) 0) (> i 195)))})
 
   (def revenue
     (loop (:for p* price) (:for q* qty)

@@ -26,13 +26,23 @@ public static class Query
     /// </summary>
     public static RecordBatch Take(RecordBatch t, int[] rows, int count)
     {
-        var picked = rows.AsSpan(0, count);
-        CheckRows(picked, t.Length);
+        CheckRows(rows.AsSpan(0, count), t.Length);
         var columns = new IArrowArray[t.ColumnCount];
-        for (int c = 0; c < columns.Length; c++)
-            columns[c] = TakeColumn(t.Column(c), picked);
+        // The columns are copied on several threads when there is enough to
+        // copy. Most of the time of a copy is spent to get new memory: the
+        // operating system gives each page of a new array when it is first
+        // written. The threads get their pages at the same time.
+        if (columns.Length > 1 && (long)count * columns.Length >= ParallelRows)
+            Parallel.For(0, columns.Length, c => columns[c] = TakeColumn(t.Column(c), rows.AsSpan(0, count)));
+        else
+            for (int c = 0; c < columns.Length; c++)
+                columns[c] = TakeColumn(t.Column(c), rows.AsSpan(0, count));
         return new RecordBatch(t.Schema, columns, count);
     }
+
+    // Below this many cells, a copy on one thread is faster than the start of
+    // the others.
+    private const long ParallelRows = 65536;
 
     // Every row is checked once, here, so that the loops below read through
     // refs with no test of their own. With the lengths of the buffers checked
@@ -75,28 +85,41 @@ public static class Query
         var valid = data.Buffers[0].Span;
         int offset = data.Offset;
         CheckBuffer(valid, ((long)offset + data.Length + 7) / 8);
-        var bits = new byte[(rows.Length + 7) / 8];
-        ref byte from = ref MemoryMarshal.GetReference(valid);
-        for (int i = 0; i < rows.Length; i++)
-        {
-            int j = offset + rows[i];
-            if ((Unsafe.Add(ref from, j >> 3) & (1 << (j & 7))) != 0) bits[i >> 3] |= (byte)(1 << (i & 7));
-            else nulls++;
-        }
+        var bits = TakeBitsOf(valid, offset, rows, out int set);
+        nulls = rows.Length - set;
         return nulls == 0 ? ArrowBuffer.Empty : new ArrowBuffer(bits);
     }
 
     private static ArrowBuffer TakeBits(ReadOnlySpan<byte> values, int offset, int length, ReadOnlySpan<int> rows)
     {
         CheckBuffer(values, ((long)offset + length + 7) / 8);
-        var bits = new byte[(rows.Length + 7) / 8];
-        ref byte from = ref MemoryMarshal.GetReference(values);
+        return new ArrowBuffer(TakeBitsOf(values, offset, rows, out _));
+    }
+
+    // The bits at the rows, and how many of them are set. Each bit is added
+    // to a byte with no jump that depends on it, so a bitmap that is set at
+    // random costs no mispredicted jumps. Each byte is written once, when it
+    // is full, so the array need not be zeroed first.
+    private static byte[] TakeBitsOf(ReadOnlySpan<byte> bitmap, int offset, ReadOnlySpan<int> rows, out int set)
+    {
+        var bits = GC.AllocateUninitializedArray<byte>((rows.Length + 7) / 8);
+        ref byte from = ref MemoryMarshal.GetReference(bitmap);
+        int bytes = 0, count = 0;
         for (int i = 0; i < rows.Length; i++)
         {
             int j = offset + rows[i];
-            if ((Unsafe.Add(ref from, j >> 3) & (1 << (j & 7))) != 0) bits[i >> 3] |= (byte)(1 << (i & 7));
+            int b = (Unsafe.Add(ref from, j >> 3) >> (j & 7)) & 1;
+            bytes |= b << (i & 7);
+            count += b;
+            if ((i & 7) == 7)
+            {
+                bits[i >> 3] = (byte)bytes;
+                bytes = 0;
+            }
         }
-        return new ArrowBuffer(bits);
+        if ((rows.Length & 7) != 0) bits[rows.Length >> 3] = (byte)bytes;
+        set = count;
+        return bits;
     }
 
     private static ArrowBuffer TakeFixed(ReadOnlySpan<byte> values, int offset, int length, int width, ReadOnlySpan<int> rows)
@@ -148,20 +171,28 @@ public static class Query
             Unsafe.Add(ref newOffsets, i + 1) = total;
         }
 
-        var newBytes = GC.AllocateUninitializedArray<byte>(total);
+        // A string of at most 16 bytes is copied as 16 bytes, with one load
+        // and one store: the bytes after it are written over by the next
+        // string, or are in the 16 bytes after the end, which the buffer
+        // leaves out. A string whose 16 bytes would end after the bytes of
+        // the column is copied by its length.
+        var newBytes = GC.AllocateUninitializedArray<byte>(total + 16);
         ref byte from = ref MemoryMarshal.GetReference(bytes);
         ref byte to = ref MemoryMarshal.GetArrayDataReference(newBytes);
+        int lastWhole = bytes.Length - 16;
         for (int i = 0; i < rows.Length; i++)
         {
             int r = rows[i];
             int start = Unsafe.Add(ref offsets, r);
-            Unsafe.CopyBlockUnaligned(
-                ref Unsafe.Add(ref to, Unsafe.Add(ref newOffsets, i)),
-                ref Unsafe.Add(ref from, start),
-                (uint)(Unsafe.Add(ref offsets, r + 1) - start));
+            int length = Unsafe.Add(ref offsets, r + 1) - start;
+            ref byte at = ref Unsafe.Add(ref to, Unsafe.Add(ref newOffsets, i));
+            if (length <= 16 && start <= lastWhole)
+                Unsafe.WriteUnaligned(ref at, Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector128<byte>>(ref Unsafe.Add(ref from, start)));
+            else
+                Unsafe.CopyBlockUnaligned(ref at, ref Unsafe.Add(ref from, start), (uint)length);
         }
         return new ArrayData(data.DataType, rows.Length, nulls, 0,
-            new[] { bitmap, new ArrowBuffer(newOffsetBytes), new ArrowBuffer(newBytes) });
+            new[] { bitmap, new ArrowBuffer(newOffsetBytes), new ArrowBuffer(new ReadOnlyMemory<byte>(newBytes, 0, total)) });
     }
 
     // Any other type: each run of rows that follow one another is a slice,
