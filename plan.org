@@ -144,6 +144,38 @@ Found in the Bjolang compiler:
   declarations: a Bjolang struct holding a ~Cells<T>~ with ~where T : struct~
   is refused by C#. The glue's ~Cells<T>~ has no constraint for that reason.
 
+** Measured against Polars
+
+The same file of 1 000 000 rows (bench/compare/make_data.py), the same
+operations and the same results, in bench/compare.bjo and
+bench/compare/polars_bench.py. Polars 2.1.0, eager, the median of 20 runs.
+
+| Operation                    | bjostat, 1 core | Polars, 1 thread | Polars, 24 threads |
+|------------------------------+-----------------+------------------+--------------------|
+| read CSV (26 MB)             | 182 ms          | 72.9 ms          | 19.0 ms            |
+| filter, kept rows            | 11.7 ms         | 4.03 ms          | 2.61 ms            |
+| new column                   | 6.15 ms         | 0.62 ms          | 0.72 ms            |
+| group by string, sum         | 29.9 ms         | 8.31 ms          | 2.51 ms            |
+| group by long, sum and count | 6.14 ms         | 7.27 ms          | 1.68 ms            |
+
+The filter took 20.8 ms at first. Of that:
+- The test of random prices: the loop alone took 5.9 ms, and 1.7 ms with a
+  test that is always true. ~(and a b)~ was a jump on ~a~, mispredicted half
+  the time. Bjolang now writes ~and~ and ~or~ of cheap comparisons as C#'s
+  ~&~ and ~|~, both sides evaluated, no jump (Simplify.fs): 3.5 ms.
+- The ~:when~ is a jump too. ~(selecting-if t (Tuple row keep?))~ writes
+  every row and counts the kept ones, with no jump: 1.2 ms less.
+- The copy of the kept rows: validity was read through ~IsValid~, an
+  interface call a row, and every array was zeroed before it was written.
+  The bitmap is read directly now, and the arrays are not zeroed: the column
+  of notes took 7.7 ms and takes 2.8. The number columns, 3.4 ms for three,
+  are about what reading them costs: a kept row in four touches every cache
+  line.
+
+Next, by what they would gain: a path for columns without nulls through
+spans (new column, 10×), codes for strings (group by string), CSV from the
+bytes, and loops over rows split across cores.
+
 ** Next: queries, checked before they run
 
 A query is a value, a plan, not a series of calls:

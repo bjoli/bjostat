@@ -99,6 +99,13 @@
           (:acc (selecting sales row))))
   (expect "selecting: the rows kept" (texts kept "region") ["north" "east" "null"])
   (expect "selecting: every column" (table-names kept) ["region" "price" "qty" "day"])
+  (expect "selecting-if: the same rows"
+          (texts (loop (:for row (range 0 rows))
+                       (:for p* price) (:for q* qty)
+                       (:when-let (Some p) p*) (:when-let (Some q) q*)
+                       (:acc (selecting-if sales (Tuple row (and (> p 10.0) (> q 1L))))))
+                 "region")
+          ["north" "east" "null"])
   (expect "selecting nothing"
           (table-row-count (loop (:for row (range 0 rows)) (:when #f) (:acc (selecting sales row))))
           0)

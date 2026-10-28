@@ -27,55 +27,83 @@ public static class Query
     public static RecordBatch Take(RecordBatch t, int[] rows, int count)
     {
         var picked = rows.AsSpan(0, count);
+        CheckRows(picked, t.Length);
         var columns = new IArrowArray[t.ColumnCount];
         for (int c = 0; c < columns.Length; c++)
             columns[c] = TakeColumn(t.Column(c), picked);
         return new RecordBatch(t.Schema, columns, count);
     }
 
+    // Every row is checked once, here, so that the loops below read through
+    // refs with no test of their own. With the lengths of the buffers checked
+    // against the column's length where each is read, no read is outside.
+    private static void CheckRows(ReadOnlySpan<int> rows, int length)
+    {
+        for (int i = 0; i < rows.Length; i++)
+            if ((uint)rows[i] >= (uint)length)
+                throw new ArgumentOutOfRangeException(nameof(rows), $"(bjostat query): row {rows[i]} of a table of {length}");
+    }
+
+    private static void CheckBuffer(ReadOnlySpan<byte> buffer, long needed)
+    {
+        if (buffer.Length < needed)
+            throw new InvalidDataException("(bjostat query): a column's buffer is shorter than its length says");
+    }
+
     private static IArrowArray TakeColumn(IArrowArray a, ReadOnlySpan<int> rows)
     {
         var data = a.Data;
-        var bitmap = TakeValidity(a, rows, out int nulls);
+        var bitmap = TakeValidity(data, rows, out int nulls);
         ArrayData taken = data.DataType switch
         {
             BooleanType => new ArrayData(data.DataType, rows.Length, nulls, 0,
-                new[] { bitmap, TakeBits(data.Buffers[1].Span, data.Offset, rows) }),
+                new[] { bitmap, TakeBits(data.Buffers[1].Span, data.Offset, data.Length, rows) }),
             StringType or BinaryType => TakeBinary(data, rows, nulls, bitmap),
             FixedWidthType fw when fw.BitWidth % 8 == 0 => new ArrayData(data.DataType, rows.Length, nulls, 0,
-                new[] { bitmap, TakeFixed(data.Buffers[1].Span, data.Offset, fw.BitWidth / 8, rows) }),
+                new[] { bitmap, TakeFixed(data.Buffers[1].Span, data.Offset, data.Length, fw.BitWidth / 8, rows) }),
             _ => TakeBySlices(a, rows).Data,
         };
         return ArrowArrayFactory.BuildArray(taken);
     }
 
-    private static ArrowBuffer TakeValidity(IArrowArray a, ReadOnlySpan<int> rows, out int nulls)
+    // The validity bits of the rows, read from the bitmap itself rather than
+    // through IsValid, which is an interface call for each row.
+    private static ArrowBuffer TakeValidity(ArrayData data, ReadOnlySpan<int> rows, out int nulls)
     {
         nulls = 0;
-        if (a.NullCount == 0) return ArrowBuffer.Empty;
+        if (data.NullCount == 0 || data.Buffers[0].IsEmpty) return ArrowBuffer.Empty;
+        var valid = data.Buffers[0].Span;
+        int offset = data.Offset;
+        CheckBuffer(valid, ((long)offset + data.Length + 7) / 8);
         var bits = new byte[(rows.Length + 7) / 8];
+        ref byte from = ref MemoryMarshal.GetReference(valid);
         for (int i = 0; i < rows.Length; i++)
         {
-            if (a.IsValid(rows[i])) bits[i >> 3] |= (byte)(1 << (i & 7));
+            int j = offset + rows[i];
+            if ((Unsafe.Add(ref from, j >> 3) & (1 << (j & 7))) != 0) bits[i >> 3] |= (byte)(1 << (i & 7));
             else nulls++;
         }
         return nulls == 0 ? ArrowBuffer.Empty : new ArrowBuffer(bits);
     }
 
-    private static ArrowBuffer TakeBits(ReadOnlySpan<byte> values, int offset, ReadOnlySpan<int> rows)
+    private static ArrowBuffer TakeBits(ReadOnlySpan<byte> values, int offset, int length, ReadOnlySpan<int> rows)
     {
+        CheckBuffer(values, ((long)offset + length + 7) / 8);
         var bits = new byte[(rows.Length + 7) / 8];
+        ref byte from = ref MemoryMarshal.GetReference(values);
         for (int i = 0; i < rows.Length; i++)
         {
             int j = offset + rows[i];
-            if ((values[j >> 3] & (1 << (j & 7))) != 0) bits[i >> 3] |= (byte)(1 << (i & 7));
+            if ((Unsafe.Add(ref from, j >> 3) & (1 << (j & 7))) != 0) bits[i >> 3] |= (byte)(1 << (i & 7));
         }
         return new ArrowBuffer(bits);
     }
 
-    private static ArrowBuffer TakeFixed(ReadOnlySpan<byte> values, int offset, int width, ReadOnlySpan<int> rows)
+    private static ArrowBuffer TakeFixed(ReadOnlySpan<byte> values, int offset, int length, int width, ReadOnlySpan<int> rows)
     {
-        var bytes = new byte[rows.Length * width];
+        CheckBuffer(values, ((long)offset + length) * width);
+        // Every byte is written below, so the array need not be zeroed first.
+        var bytes = GC.AllocateUninitializedArray<byte>(rows.Length * width);
         switch (width)
         {
             case 8: Gather<long>(values, offset, rows, bytes); break;
@@ -93,30 +121,47 @@ public static class Query
     private static void Gather<T>(ReadOnlySpan<byte> values, int offset, ReadOnlySpan<int> rows, byte[] into)
         where T : struct
     {
-        var from = MemoryMarshal.Cast<byte, T>(values).Slice(offset);
-        var to = MemoryMarshal.Cast<byte, T>(into.AsSpan());
-        for (int i = 0; i < rows.Length; i++) to[i] = from[rows[i]];
+        ref T from = ref Unsafe.Add(ref Unsafe.As<byte, T>(ref MemoryMarshal.GetReference(values)), offset);
+        ref T to = ref Unsafe.As<byte, T>(ref MemoryMarshal.GetArrayDataReference(into));
+        for (int i = 0; i < rows.Length; i++)
+            Unsafe.Add(ref to, i) = Unsafe.ReadUnaligned<T>(ref Unsafe.As<T, byte>(ref Unsafe.Add(ref from, rows[i])));
     }
 
+    // The new offsets first, which give the size of the bytes, and then each
+    // string's bytes, copied with no span made for it.
     private static ArrayData TakeBinary(ArrayData data, ReadOnlySpan<int> rows, int nulls, ArrowBuffer bitmap)
     {
-        var offsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span).Slice(data.Offset);
+        var offsetBytes = data.Buffers[1].Span;
+        CheckBuffer(offsetBytes, ((long)data.Offset + data.Length + 1) * sizeof(int));
+        ref int offsets = ref Unsafe.Add(ref Unsafe.As<byte, int>(ref MemoryMarshal.GetReference(offsetBytes)), data.Offset);
         var bytes = data.Buffers[2].Span;
-        var newOffsets = new int[rows.Length + 1];
+        CheckBuffer(bytes, Unsafe.Add(ref offsets, data.Length));
+
+        var newOffsetBytes = GC.AllocateUninitializedArray<byte>((rows.Length + 1) * sizeof(int));
+        ref int newOffsets = ref Unsafe.As<byte, int>(ref MemoryMarshal.GetArrayDataReference(newOffsetBytes));
         int total = 0;
+        newOffsets = 0;
         for (int i = 0; i < rows.Length; i++)
         {
-            total += offsets[rows[i] + 1] - offsets[rows[i]];
-            newOffsets[i + 1] = total;
+            int r = rows[i];
+            total += Unsafe.Add(ref offsets, r + 1) - Unsafe.Add(ref offsets, r);
+            Unsafe.Add(ref newOffsets, i + 1) = total;
         }
-        var newBytes = new byte[total];
+
+        var newBytes = GC.AllocateUninitializedArray<byte>(total);
+        ref byte from = ref MemoryMarshal.GetReference(bytes);
+        ref byte to = ref MemoryMarshal.GetArrayDataReference(newBytes);
         for (int i = 0; i < rows.Length; i++)
         {
-            int from = offsets[rows[i]];
-            bytes.Slice(from, offsets[rows[i] + 1] - from).CopyTo(newBytes.AsSpan(newOffsets[i]));
+            int r = rows[i];
+            int start = Unsafe.Add(ref offsets, r);
+            Unsafe.CopyBlockUnaligned(
+                ref Unsafe.Add(ref to, Unsafe.Add(ref newOffsets, i)),
+                ref Unsafe.Add(ref from, start),
+                (uint)(Unsafe.Add(ref offsets, r + 1) - start));
         }
         return new ArrayData(data.DataType, rows.Length, nulls, 0,
-            new[] { bitmap, new ArrowBuffer(MemoryMarshal.AsBytes(newOffsets.AsSpan()).ToArray()), new ArrowBuffer(newBytes) });
+            new[] { bitmap, new ArrowBuffer(newOffsetBytes), new ArrowBuffer(newBytes) });
     }
 
     // Any other type: each run of rows that follow one another is a slice,
@@ -322,6 +367,20 @@ public sealed class Selection
     {
         if (s._count == s._rows.Length) System.Array.Resize(ref s._rows, s._rows.Length * 2);
         s._rows[s._count++] = row;
+        return s;
+    }
+
+    /// <summary>
+    /// The row, kept only when <paramref name="keep"/> is true, with no branch
+    /// on it: the row is written at the end either way, and the count grows by
+    /// one or by none. A test that keeps rows at random costs no mispredicted
+    /// jump, as a <c>:when</c> before <c>Add</c> does.
+    /// </summary>
+    public static Selection AddIf(Selection s, int row, bool keep)
+    {
+        if (s._count == s._rows.Length) System.Array.Resize(ref s._rows, s._rows.Length * 2);
+        s._rows[s._count] = row;
+        s._count += Unsafe.As<bool, byte>(ref keep);
         return s;
     }
 

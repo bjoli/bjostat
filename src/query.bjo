@@ -26,7 +26,7 @@
   where-rows count-rows create-column
 
   ;; Collectors, for a loop over cells
-  Selecting selecting
+  Selecting selecting SelectingIf selecting-if
   ColumnBuilding ColumnBuildingOption
   Grouping grouping Pairing pairing
   map->table table-with
@@ -59,6 +59,7 @@
 
   (selection-make (: Bjostat.Selection.Make (-> Selection)))
   (selection-add (: Bjostat.Selection.Add (-> Selection int Selection)))
+  (selection-add-if (: Bjostat.Selection.AddIf (-> Selection int bool Selection)))
   (selection-take (: Bjostat.Selection.Take (-> Selection Table Table))))
 
 ;; ===========================================================================
@@ -180,6 +181,28 @@
   (type %out Table)
   (defun (collector-init c) (selection-make))
   (defun (collector-step c acc row) (selection-add acc row))
+  (defun (collector-finish c acc) (selection-take acc (record-ref c table))))
+
+;; The same, given each row and whether to keep it:
+;;
+;;     (:acc (selecting-if t (Tuple row (and (> p 250.0) (> q 20L)))))
+;;
+;; in place of a :when and `selecting`. The row is written either way and
+;; counted only when kept, so a test that keeps rows at random costs no
+;; mispredicted jump.
+(type (: SelectingIf #:opaque (Struct (: table Table))))
+
+(: (-> Table SelectingIf))
+(defun (selecting-if t) (SelectingIf (table t)))
+
+(impl (Collector SelectingIf)
+  (type %elem (Tuple int bool))
+  (type %acc Selection)
+  (type %out Table)
+  (defun (collector-init c) (selection-make))
+  (defun (collector-step c acc rk)
+    (def (row keep) rk)
+    (selection-add-if acc row keep))
   (defun (collector-finish c acc) (selection-take acc (record-ref c table))))
 
 ;; A column of the values it is given. The type of the column is theirs: a

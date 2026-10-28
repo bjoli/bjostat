@@ -1,0 +1,127 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/compare.bjo — the operations of
+;; bench/compare/polars_bench.py, on the same file, as loops a program would
+;; write. The results are printed first, to compare with Polars's.
+;;
+;;     python3 bench/compare/make_data.py scratch/compare.csv
+;;     bjo bench bench/compare.bjo --all
+
+(import (std prelude))
+(import (std bench))
+(import (bjostat table))
+(import (bjostat csv))
+(import (bjostat query))
+
+(import/extern (any-rows (: Bjostat.Columns.Length (-> AnyColumn int))))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: string)
+(def path "scratch/compare.csv")
+
+(: Table)
+(def t (ok (read-csv path)))
+
+(: (Cells string))
+(def region (ok (column-as t "region")))
+
+(: (Cells double))
+(def price (ok (column-as t "price")))
+
+(: (Cells long))
+(def qty (ok (column-as t "qty")))
+
+(: (-> Table))
+(defun (kept)
+  (loop (:for row (range 0 (table-row-count t)))
+        (:for p* price) (:for q* qty)
+        (:when-let (Some p) p*) (:when-let (Some q) q*)
+        (:when (and (> p 250.0) (> q 20L)))
+        (:acc (selecting t row))))
+
+(: (-> Table))
+(defun (with-revenue)
+  (ok (table-with t "revenue"
+        (loop (:for p* price) (:for q* qty)
+              (:acc (column-building/option
+                      (match (Tuple p* q*)
+                        ((Tuple (Some p) (Some q)) (Some (* p (cast double q))))
+                        (_ None))))))))
+
+(: (-> Table))
+(defun (by-region)
+  (def groups (group-index))
+  (ok (loop (:for r* region) (:for p* price)
+            (:when-let (Some r) r*) (:when-let (Some p) p*)
+            (:let g (group-of! groups r))
+            (:acc sums (summing-by groups (Tuple g p)))
+            => (groups->table groups "region" [(Tuple "price" sums)]))))
+
+(: (-> Table))
+(defun (by-qty)
+  (def groups (group-index))
+  (ok (loop (:for q* qty) (:for p* price)
+            (:when-let (Some q) q*) (:when-let (Some p) p*)
+            (:let g (group-of! groups q))
+            (:acc sums (summing-by groups (Tuple g p)))
+            (:acc counts (counting-by groups (Tuple g p)))
+            => (groups->table groups "qty" [(Tuple "price" sums) (Tuple "len" counts)]))))
+
+;; The results, printed when the module starts, before the runs.
+(: (-> int))
+(defun (print-results)
+  (println (str "kept rows: " (int->string (table-row-count (kept)))))
+  (println (str "columns with revenue: " (int->string (table-column-count (with-revenue)))))
+  (println (table->string (by-region) #:digits 2))
+  (println (str "groups by qty: " (int->string (table-row-count (by-qty)))))
+  0)
+
+(: int)
+(def _printed (print-results))
+
+;; Where the filter's time goes: the loop alone, and the copy of each kind of
+;; column on its own.
+(: (-> Table Table))
+(defun (kept-of u)
+  (loop (:for row (range 0 (table-row-count t)))
+        (:for p* price) (:for q* qty)
+        (:when-let (Some p) p*) (:when-let (Some q) q*)
+        (:when (and (> p 250.0) (> q 20L)))
+        (:acc (selecting u row))))
+
+(def/bench "filter, count only"
+  (loop (:for p* price) (:for q* qty)
+        (:when-let (Some p) p*) (:when-let (Some q) q*)
+        (:when (and (> p 250.0) (> q 20L)))
+        (:acc (counting p))))
+(def/bench "filter, count only, always true"
+  (loop (:for p* price) (:for q* qty)
+        (:when-let (Some p) p*) (:when-let (Some q) q*)
+        (:when (and (> p -1.0) (> q -1L)))
+        (:acc (counting p))))
+(def/bench "filter, kept rows, selecting-if"
+  (table-row-count
+    (loop (:for row (range 0 (table-row-count t)))
+          (:for p* price) (:for q* qty)
+          (:when-let (Some p) p*) (:when-let (Some q) q*)
+          (:acc (selecting-if t (Tuple row (and (> p 250.0) (> q 20L))))))))
+
+(def/bench "filter, no columns" (table-row-count (kept-of (ok (table-select t [])))))
+(def/bench "filter, numbers" (table-row-count (kept-of (ok (table-select t ["id" "price" "qty"])))))
+(def/bench "filter, region" (table-row-count (kept-of (ok (table-select t ["region"])))))
+(def/bench "filter, note" (table-row-count (kept-of (ok (table-select t ["note"])))))
+
+(def/bench "read csv" (table-row-count (ok (read-csv path))))
+(def/bench "filter, kept rows" (table-row-count (kept)))
+(def/bench "new column" (table-column-count (with-revenue)))
+(def/bench "group by string, sum" (table-row-count (by-region)))
+(def/bench "group by long, sum and count" (table-row-count (by-qty)))
+
+(run-benches)
