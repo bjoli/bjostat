@@ -33,7 +33,18 @@ public static class Query
         // operating system gives each page of a new array when it is first
         // written. The threads get their pages at the same time.
         if (columns.Length > 1 && (long)count * columns.Length >= ParallelRows)
-            Parallel.For(0, columns.Length, c => columns[c] = TakeColumn(t.Column(c), rows.AsSpan(0, count)));
+        {
+            try
+            {
+                Parallel.For(0, columns.Length, c => columns[c] = TakeColumn(t.Column(c), rows.AsSpan(0, count)));
+            }
+            catch (AggregateException e) when (e.InnerExceptions.Count > 0)
+            {
+                // The exception of a column, as one thread would throw it,
+                // not wrapped in the AggregateException of the threads.
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(e.InnerExceptions[0]).Throw();
+            }
+        }
         else
             for (int c = 0; c < columns.Length; c++)
                 columns[c] = TakeColumn(t.Column(c), rows.AsSpan(0, count));
