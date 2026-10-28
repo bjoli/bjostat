@@ -39,3 +39,6 @@ bench("group by string, sum",
       lambda: df.group_by("region").agg(pl.col("price").sum()).sort("region")["price"].round(2).to_list())
 bench("group by long, sum and count",
       lambda: df.group_by("qty").agg(pl.col("price").sum(), pl.len()).height)
+bench("sort by a number", lambda: df.sort("price", maintain_order=True).height)
+bench("sort by a string, then a number",
+      lambda: df.sort(["region", "price"], descending=[False, True], maintain_order=True).height)

@@ -118,5 +118,8 @@
 (def/bench "filter, kept rows" (table-row-count (kept)))
 (def/bench "group by string, sum" (table-row-count (by-region)))
 (def/bench "group by long, sum and count" (table-row-count (by-qty)))
+(def/bench "sort by a number" (table-row-count (ok (table-sort t [(ascending "price")]))))
+(def/bench "sort by a string, then a number"
+  (table-row-count (ok (table-sort t [(ascending "region") (descending "price")]))))
 
 (run-benches)

@@ -51,6 +51,21 @@
         (loop (+ i 1) (+ acc (* (ro-span-ref p i) (cast double (ro-span-ref q i)))))
         acc)))
 
+;; A column's cells, as Options, in order.
+(: (-> Table string (Vec (Option double))))
+(defun (prices-of t name)
+  {vecing x (:for x (ok (double-cells t name)))})
+
+(: (-> Table string (Vec (Option string))))
+(defun (strings-of t name)
+  (def c (ok (strings t name)))
+  {vecing (string-column-ref c i) (:for i (range 0 (string-column-length c)))})
+
+(: (-> Table string (Vec (Option long))))
+(defun (longs-of t name)
+  (def c (ok (longs t name)))
+  {vecing (column-ref c i) (:for i (range 0 (column-length c)))})
+
 (defun (main)
   (def t (sales))
 
@@ -155,6 +170,52 @@
   (expect "read back: nulls" (column-null-count (ok (ints back "rating"))) 1)
   (expect "a file that is not there"
           (string-starts-with? (error-of (read-arrow "/nonexistent/x.arrow")) "/nonexistent/x.arrow: ")
+          #t)
+
+
+  ;; Sorted
+  (def nan (/ 0.0 0.0))
+  (def u (ok (make-table
+               [(named-strings "name" (array->string-column (vec->array ["b" "a" "c" "a" "b" "é" "ab"])
+                                                             #:valid (vec->array [#t #t #f #t #t #t #t])))
+                (named "x" (array->column (vec->array [2.0 nan 1.0 2.0 0.5 2.0 1.0])
+                                          #:valid (vec->array [#t #t #t #f #t #t #t])))
+                (named "n" (array->column (vec->array [1L 2L 3L 4L 5L 6L 7L])))])))
+  (expect "sorted by a number: a NaN, then a null, last; equal ones keep their order"
+          (longs-of (ok (table-sort u [(ascending "x")])) "n")
+          [(Some 5L) (Some 3L) (Some 7L) (Some 1L) (Some 6L) (Some 2L) (Some 4L)])
+  (expect "sorted down: the NaN and the null still last"
+          (longs-of (ok (table-sort u [(descending "x")])) "n")
+          [(Some 1L) (Some 6L) (Some 3L) (Some 7L) (Some 5L) (Some 2L) (Some 4L)])
+  (expect "sorted by strings, by their code points, a null last"
+          (strings-of (ok (table-sort u [(ascending "name")])) "name")
+          [(Some "a") (Some "a") (Some "ab") (Some "b") (Some "b") (Some "é") None])
+  (expect "sorted by two keys"
+          (longs-of (ok (table-sort u [(ascending "name") (descending "n")])) "n")
+          [(Some 4L) (Some 2L) (Some 7L) (Some 5L) (Some 1L) (Some 6L) (Some 3L)])
+  (expect "every column comes along"
+          (prices-of (ok (table-sort u [(descending "n")])) "x")
+          [(Some 1.0) (Some 2.0) (Some 0.5) None (Some 1.0) (Some nan) (Some 2.0)])
+  (expect "sorted by a number with no nulls, fast, down, stable"
+          (longs-of (ok (table-sort t [(descending "qty")])) "qty")
+          [(Some 4L) (Some 3L) (Some 2L) (Some 1L)])
+  (def inf (/ 1.0 0.0))
+  (def w (ok (make-table
+               [(named "x" (array->column (vec->array [0.0 -5.5 inf -0.0 (- 0.0 inf) 3.0 -5.5])))
+                (named "l" (array->column (vec->array [-5L 9223372036854775807L 0L -9223372036854775808L -5L 7L 1L])))
+                (named "n" (array->column (vec->array [1L 2L 3L 4L 5L 6L 7L])))])))
+  (expect "sorted by doubles: infinities, and -0.0 equal to 0.0"
+          (longs-of (ok (table-sort w [(ascending "x")])) "n")
+          [(Some 5L) (Some 2L) (Some 7L) (Some 1L) (Some 4L) (Some 6L) (Some 3L)])
+  (expect "sorted down by doubles: equal ones keep their order"
+          (longs-of (ok (table-sort w [(descending "x")])) "n")
+          [(Some 3L) (Some 6L) (Some 1L) (Some 4L) (Some 2L) (Some 7L) (Some 5L)])
+  (expect "sorted by longs, the least and the greatest"
+          (longs-of (ok (table-sort w [(ascending "l")])) "l")
+          [(Some -9223372036854775808L) (Some -5L) (Some -5L) (Some 0L) (Some 1L) (Some 7L) (Some 9223372036854775807L)])
+  (expect "sorted by no key" (longs-of (ok (table-sort u [])) "n") (longs-of u "n"))
+  (expect "sorted by a column that is not there"
+          (string-starts-with? (error-of (table-sort u [(ascending "y")])) "the table has no column 'y'")
           #t)
 
   ;; Printed

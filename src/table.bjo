@@ -44,6 +44,7 @@
   ;; Making tables
   array->column array->string-column named named-strings named-any make-table
   table-select table-slice
+  SortKey table-sort
 
   ;; Files
   read-arrow write-arrow
@@ -116,6 +117,8 @@
   (clr-column (: Bjostat.Tables.Column (-> Table int AnyColumn)))
   (clr-index-of (: Bjostat.Tables.IndexOf (-> Table string int)))
   (clr-slice (: Bjostat.Tables.Slice (-> Table int int Table)))
+  (clr-unsortable (: Bjostat.Sorting.Unsortable (-> AnyColumn string)))
+  (clr-sort-by (: Bjostat.Sorting.SortBy (-> Table (Array int) (Array bool) Table)))
 
   ;; Files. Arrow reports a file it cannot read with exceptions of several
   ;; types, so every exception is an Err.
@@ -371,6 +374,48 @@
 (: (-> Table (#:from int) (#:to int) Table))
 (defun (table-slice t #:from 0 #:to (table-row-count t))
   (clr-slice t from to))
+
+;; A column to sort by, and the direction.
+(type (: SortKey (Union (: ascending string) (: descending string))))
+
+(: (-> SortKey string))
+(defun (sort-key-name k)
+  (match k
+    ((ascending name) name)
+    ((descending name) name)))
+
+;; The table with its rows in the order of the keys, as R's `order` gives
+;; them: by the first key, then by the next among the rows that the first
+;; does not tell apart, and so on. Rows that no key tells apart keep their
+;; order. A null comes after every value in both directions, and a NaN after
+;; every number. Strings are in the order of their code points.
+;;
+;;     (table-sort t [(descending "price") (ascending "region")])
+;;
+;; An Err for a column the table does not have, or one of a type that cannot
+;; be sorted by.
+(: (-> SortKey (Result TableError AnyColumn) (Option TableError)))
+(defun (sort-problem k found)
+  (match found
+    ((Err e) (Some e))
+    ((Ok c)
+     (def kind (clr-unsortable c))
+     (if (= kind "")
+         None
+         (Some (TableError (message (str "'" (sort-key-name k) "' is a column of " kind
+                                         ", which cannot be sorted by."))))))))
+
+(: (-> Table (Vec SortKey) (Result TableError Table)))
+(defun (table-sort t keys)
+  (def problems
+    (loop (:for k keys)
+          (:when-let (Some e) (sort-problem k (find-column t (sort-key-name k))))
+          (:acc (vecing e))))
+  (if (> (vec-length problems) 0)
+      (Err (vec-ref problems 0))
+      (Ok (clr-sort-by t
+                       {arraying (clr-index-of t (sort-key-name k)) (:for k keys)}
+                       {arraying (match k ((descending _) #t) (_ #f)) (:for k keys)}))))
 
 ;; ===========================================================================
 ;; Files

@@ -220,7 +220,53 @@ a column, which a vectorized loop over all its columns does not.
 Next, besides: codes for strings (group by string), CSV from the bytes, and
 loops over rows split across cores.
 
-** Next: queries, checked before they run
+** Next: what R has that an analysis needs
+
+The tables, the CSV, the loops and the collectors are the representation.
+What R adds for work on data is a set of operations on tables, column types
+and statistics. In the order that lets an analysis be done from start to
+end:
+
+1. *Table operations that are not loops:* sort (done: ~table-sort~), joins
+   (inner, left and anti, by one or more keys, on the hash index of
+   ~group-index~), distinct rows, tables appended by rows, and pivots
+   (longer and wider).
+2. *Column types:* dates and timestamps (Arrow ~Date32~ and ~Timestamp~,
+   read from CSV), categorical columns (Arrow dictionaries: a group-by on
+   them is a group-by on small ints), and booleans.
+3. *Statistics as collectors:* variance and standard deviation (Welford),
+   covariance and correlation, quantiles and the median (exact from a sort,
+   or a t-digest in one pass), counts by one or two keys (R's ~table~), and
+   a ~summary~ of a table.
+4. *Models:* ~lm~ as a collector of a QR decomposition, with coefficients,
+   standard errors, R² and p-values; then ~glm~. A formula macro later.
+5. *Distributions and random numbers:* density, distribution, quantile and
+   samples of the normal, t, χ², F, binomial and Poisson distributions, and
+   a generator with a seed.
+6. *Plots* as Vega-Lite or SVG, and *Parquet*.
+
+Not from R: the recycling of short vectors, silent conversions between
+types, NA that spreads through a sum unless the collector says so, and
+operations on whole vectors as a second API.
+
+Sorting is measured against Polars (1M rows; Polars 2.1.0 on 1 and 24
+threads; measured):
+
+| Sort                            | bjostat | Polars, 1 | Polars, 24 |
+|---------------------------------+---------+-----------+------------|
+| by a number                     | 49.6 ms | 53.5 ms   | 25.4 ms    |
+| by a string, then a number down | 104 ms  | 334 ms    | 48.7 ms    |
+
+Each key is one stable pass, from the last key to the first: a radix sort
+of 64-bit keys whose unsigned order is the order of the values, and a
+string key is first the rank of each string among the distinct ones.
+
+** Before: queries, checked before they run
+
+This was the plan before the decision for one API, the loop. A query macro
+is not part of it now; the checks of the schema before rows are read may
+come back as checks of a loop's columns.
+
 
 A query is a value, a plan, not a series of calls:
 
