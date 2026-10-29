@@ -14,6 +14,7 @@
 (import (bjostat table))
 (import (bjostat csv))
 (import (bjostat query))
+(import/class (InvalidOperationException (: System.InvalidOperationException)))
 
 (: (-> (Result TableError %a) %a))
 (defun (ok r)
@@ -239,4 +240,21 @@
           (row-names (: (both (col "price") (both (col "qty") (col "day")))
                         (Row (Tuple double (Tuple long string)))))
           ["price" "qty" "day"])
+
+  ;; Work on several cores: computing is an event, waited for here by a
+  ;; parked thread, and its parts are Tasks of .NET's pool.
+  (expect "computing: the value"
+          (match (sync/blocking (computing (fun () (* 6 7)))) ((Ok v) v) ((Err _) -1))
+          42)
+  (expect "computing: an exception is an Err"
+          (match (sync/blocking (computing (fun () (: (raise (cast Exception (InvalidOperationException. "no"))) int)))) ((Ok _) "no Err") ((Err _) "Err"))
+          "Err")
+  (expect "computing: parts in parallel, summed in their order"
+          (with-scope
+            (def parts {vecing (bjo (sync (computing (fun () (loop (:for i (range (* k 1000) (* (+ k 1) 1000)))
+                                                                    (:acc (summing i)))))))
+                               (:for k (range 0 8))})
+            (loop (:for p parts)
+                  (:acc (summing (match (promise-join/sync p) ((Ok v) v) ((Err _) -1))))))
+          (loop (:for i (range 0 8000)) (:acc (summing i))))
   0)

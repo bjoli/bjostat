@@ -271,6 +271,7 @@ The columns are found first, where a misspelt name is an ~Err~:
 | ~(category-groups t name)~ | The groups of a category's levels, so that a row's code is its group, with no hash |
 | ~(grouping c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |
 | ~(table-with t name c)~ | The table with a column more, or one replaced |
+| ~(computing thunk)~ | An event of the value of work that uses a core, run on .NET's pool: for the parts of a loop on several cores, so that a fiber waits for them suspended |
 
 The loop is the one way to make a column, a filter or a group. Bjolang is to
 make vector code of simple loops (Docs/Vectorisation-design.org in Bjolang),

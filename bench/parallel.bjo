@@ -15,7 +15,7 @@
 ;;   the fibers queued behind it wait.
 ;; - B, spawn/thread: a thread of its own for each part, which costs more to
 ;;   make than a part of a millisecond takes.
-;; - C, blocking: a Task of .NET's pool, as an event. A fiber for each part
+;; - C, computing: a Task of .NET's pool, as an event. A fiber for each part
 ;;   waits for its event, suspended, so no pump is held. This is the way.
 ;;
 ;; Do not start the parts from a module-level def: they read the module's
@@ -24,6 +24,7 @@
 (import (std prelude))
 (import (std bench))
 (import (bjostat table))
+(import (bjostat query))
 
 
 (: int) (def rows 1000000)
@@ -71,21 +72,21 @@
     (def ps {vecing (bjo (sync (spawn/thread (fun () (revenue (part parts k)))))) (:for k (range 0 parts))})
     (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
 
-;; C: each part a Task of .NET's pool, by blocking, which is an event; a
+;; C: each part a Task of .NET's pool, by computing, which is an event; a
 ;; fiber for each waits for it, suspended. No pump is held.
 (: (-> int double))
 (defun (on-pool parts)
   (with-scope
-    (def ps {vecing (bjo (sync (blocking (fun () (revenue (part parts k))))))
+    (def ps {vecing (bjo (sync (computing (fun () (revenue (part parts k))))))
                     (:for k (range 0 parts))})
     (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
 
 (def/bench "1 thread" (revenue t))
 (def/bench "fibers, 8 parts" (on-fibers 8))
 (def/bench "spawn/thread, 8 parts" (on-threads 8))
-(def/bench "blocking, 8 parts" (on-pool 8))
+(def/bench "computing, 8 parts" (on-pool 8))
 (def/bench "fibers, 12 parts" (on-fibers 12))
 (def/bench "spawn/thread, 12 parts" (on-threads 12))
-(def/bench "blocking, 12 parts" (on-pool 12))
+(def/bench "computing, 12 parts" (on-pool 12))
 
 (run-benches)

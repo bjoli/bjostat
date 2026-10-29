@@ -455,11 +455,15 @@ loops before anything else, as they change the Collector trait:
    makes a thread for each part, which takes longer than the part. So the
    parts go to .NET's pool, as events. In an earlier run with fibers, 2
    parts took 1.43 ms, 4 took 0.76, 24 took 0.54: from 8 parts on, memory
-   is the limit. Still to do: the name ~blocking~ says a call that parks,
-   not one that computes, so (bjostat) needs a function of its own for it;
-   a pool of threads of its own would keep the parts off the threads that
-   carry the pumps, which a test should measure: the latency of a fiber
-   with a timer while a parallel loop runs. A Task from the glue cannot be
+   is the limit. ~computing~ in (bjostat query) is ~blocking~ under a name
+   that says what it is for here; it measures the same. It would differ
+   from ~blocking~ only by one of two changes, each made only if a
+   measure asks for it: at most one part for each core, the others in a
+   queue, as more threads than cores only take turns, where a parked call
+   wants the pool to grow; and a part not started when its scope was
+   cancelled while it waited, so that a deadline stops a query after the
+   parts that run. The test first: the latency of a fiber with a timer
+   while a parallel loop runs. A Task from the glue cannot be
    made an event yet (see the findings below).
 
    What is to decide:

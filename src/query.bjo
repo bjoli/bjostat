@@ -34,6 +34,9 @@
 
   ;; Groups by number
   GroupIndex group-index group-of! group-count group-keys category-groups
+
+  ;; Work on several cores
+  computing
   SummingBy summing-by CountingBy counting-by MinBy min-by MaxBy max-by
   MeanBy mean-by groups->table)
 
@@ -564,3 +567,27 @@
       (Ok (clr-with-column t name c))
       (Err (TableError (message (str "the column '" name "' has " (int->string (any-length c))
                                      " rows, and the table has " (int->string (table-row-count t)) "."))))))
+
+;; ===========================================================================
+;; Work on several cores
+;; ===========================================================================
+
+;; An event that runs `thunk`, work that uses a core, on a thread of .NET's
+;; pool, and whose value is (Ok v), or (Err e) when the thunk raised e:
+;;
+;;     (sync (computing (fun () (revenue part))))           ; in a bjoroutine
+;;     (sync/blocking (computing (fun () (revenue part))))  ; in ordinary code
+;;
+;; It is for the parts of a parallel loop, each a few milliseconds of work.
+;; A fiber must not do such work itself: fibers run on Bjolang's run queues,
+;; one pump for each core, and a fiber that computes holds its pump while
+;; the fibers behind it wait. A fiber that syncs on this event is suspended
+;; instead, and holds nothing. spawn/thread makes a thread for each call,
+;; which takes longer than a short part (bench/parallel.bjo).
+;;
+;; It is the prelude's `blocking`, which runs a call that parks a thread the
+;; same way, under a name that says what it is for here. The thunk sees the
+;; caller's dynamic environment. It cannot be stopped once it runs: a
+;; cancelled scope stops the wait, and the thunk goes on to its end.
+(: (-> (-> %a) (Event (Result Exception %a))))
+(defun (computing thunk) (blocking thunk))
