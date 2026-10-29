@@ -126,6 +126,35 @@
   (expect "skip-nulls" (loop (:for r (skip-nulls rating-cells)) (:acc (listing r))) (list 5 3 4))
   (expect "skip-nulls, a count" (count (skip-nulls rating-cells)) 3)
   (expect "skip-nulls without nulls" (loop (:for p (skip-nulls price-cells)) (:acc (summing p))) 49.75)
+  (expect "complete-rows: the rule by hand, in one clause"
+          (loop (:for (Tuple p r) (complete-rows (Tuple price-cells rating-cells)))
+                (:acc (summing (* p (cast double (: r int))))))
+          122.25)
+  (expect "complete-rows: a null in any column leaves its row out, and the others stay on their rows"
+          (let ((t3 (ok (make-table [(named "a" (array->column (vec->array [1L 2L 3L 4L 5L])
+                                                               #:valid (vec->array [#t #f #t #t #t])))
+                                     (named-strings "b" (array->string-column (vec->array ["v" "w" "x" "y" "z"])
+                                                                              #:valid (vec->array [#t #t #f #t #t])))
+                                     (named "c" (array->column (vec->array [0.5 1.5 2.5 3.5 4.5])
+                                                               #:valid (vec->array [#t #t #t #f #t])))
+                                     (named "d" (array->column (vec->array [10 20 30 40 50])))]))))
+            (def a (: (ok (column-as t3 "a")) (Cells long)))
+            (def b (: (ok (column-as t3 "b")) (Cells string)))
+            (def c (: (ok (column-as t3 "c")) (Cells double)))
+            (def d (: (ok (column-as t3 "d")) (Cells int)))
+            (Tuple (loop (:for (Tuple x y) (complete-rows (Tuple a b))) (:acc (listing (str (displayed x) y))))
+                   (loop (:for (Tuple x y z) (complete-rows (Tuple a b c))) (:acc (listing (str (displayed x) y (displayed z)))))
+                   (loop (:for (Tuple _x _y _z w) (complete-rows (Tuple a b c d))) (:acc (listing w)))
+                   (loop (:for (Tuple _z w) (complete-rows (Tuple c d))) (:acc (listing w)))))
+          (Tuple (list "1v" "4y" "5z") (list "1v0.5" "5z4.5") (list 10 50) (list 10 20 30 50)))
+  (expect "complete-rows: no complete row"
+          (loop (:for (Tuple p _r) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2 3 4]) #:valid (vec->array [#f #f #f #f])))])) "n")) (Cells int)))))
+                (:acc (counting p)))
+          0)
+  (expect "complete-rows: columns of two lengths give the rows of the shorter"
+          (loop (:for (Tuple _p r) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2])))])) "n")) (Cells int)))))
+                (:acc (listing r)))
+          (list 1 2))
 
   ;; Aggregates: vectorized without nulls, skipping them with
   (expect "sum" (column-sum price) 49.75)

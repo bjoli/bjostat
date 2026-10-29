@@ -1,0 +1,104 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/nulls.bjo — loops that leave out nulls: skip-nulls and
+;; complete-rows against the same loops with :when-let, in pairs.
+;;
+;;     bjo bench bench/nulls.bjo --all
+;;
+;; 1 000 000 rows of a double, a long and an int, once without nulls and once
+;; with about one null in ten in each column, at other rows in each.
+
+(import (std prelude))
+(import (std bench))
+(import (bjostat table))
+
+(: int)
+(def rows 1000000)
+
+(: (-> bool Table))
+(defun (columns nulls?)
+  (: (-> int int (Array bool)))
+  (defun (valid step offset) {arraying (or (not nulls?) (not (= (% (+ i offset) step) 0))) (:for i (range 0 rows))})
+  (match (make-table
+           [(named "price" (array->column {arraying (cast double (% (* i 7919) 500)) (:for i (range 0 rows))}
+                                          #:valid (valid 10 0)))
+            (named "qty" (array->column {arraying (cast long (% (* i 31) 40)) (:for i (range 0 rows))}
+                                        #:valid (valid 11 3)))
+            (named "rank" (array->column {arraying (% i 9) (:for i (range 0 rows))}
+                                         #:valid (valid 9 5)))])
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> Table string (Cells double)))
+(defun (doubles-of t name) (match (column-as t name) ((Ok c) c) ((Err e) (panic! (displayed e)))))
+(: (-> Table string (Cells long)))
+(defun (longs-of t name) (match (column-as t name) ((Ok c) c) ((Err e) (panic! (displayed e)))))
+(: (-> Table string (Cells int)))
+(defun (ints-of t name) (match (column-as t name) ((Ok c) c) ((Err e) (panic! (displayed e)))))
+
+(: Table) (def dense (columns #f))
+(: Table) (def sparse (columns #t))
+
+(: (Cells double)) (def price (doubles-of dense "price"))
+(: (Cells long)) (def qty (longs-of dense "qty"))
+(: (Cells int)) (def rank (ints-of dense "rank"))
+(: (Cells double)) (def price* (doubles-of sparse "price"))
+(: (Cells long)) (def qty* (longs-of sparse "qty"))
+(: (Cells int)) (def rank* (ints-of sparse "rank"))
+
+;; One column
+(: (-> (Cells double) double))
+(defun (sum-when-let p)
+  (loop (:for x* p) (:when-let (Some x) x*) (:acc (summing x))))
+(: (-> (Cells double) double))
+(defun (sum-skip-nulls p)
+  (loop (:for x (skip-nulls p)) (:acc (summing x))))
+
+(def/bench "1 column, no nulls, :when-let" (sum-when-let price))
+(def/bench "1 column, no nulls, skip-nulls" (sum-skip-nulls price))
+(def/bench "1 column, nulls, :when-let" (sum-when-let price*))
+(def/bench "1 column, nulls, skip-nulls" (sum-skip-nulls price*))
+
+;; Two columns
+(: (-> (Cells double) (Cells long) double))
+(defun (two-when-let p q)
+  (loop (:for p* p) (:for q* q) (:when-let (Some x) p*) (:when-let (Some y) q*)
+        (:acc (summing (* x (cast double y))))))
+(: (-> (Cells double) (Cells long) double))
+(defun (two-complete p q)
+  (loop (:for (Tuple x y) (complete-rows (Tuple p q)))
+        (:acc (summing (* x (cast double y))))))
+
+(def/bench "2 columns, no nulls, :when-let" (two-when-let price qty))
+(def/bench "2 columns, no nulls, complete-rows" (two-complete price qty))
+(def/bench "2 columns, nulls, :when-let" (two-when-let price* qty*))
+(def/bench "2 columns, nulls, complete-rows" (two-complete price* qty*))
+
+;; Three columns
+(: (-> (Cells double) (Cells long) (Cells int) double))
+(defun (three-when-let p q r)
+  (loop (:for p* p) (:for q* q) (:for r* r)
+        (:when-let (Some x) p*) (:when-let (Some y) q*) (:when-let (Some z) r*)
+        (:acc (summing (* x (cast double (+ y (cast long z))))))))
+(: (-> (Cells double) (Cells long) (Cells int) double))
+(defun (three-complete p q r)
+  (loop (:for (Tuple x y z) (complete-rows (Tuple p q r)))
+        (:acc (summing (* x (cast double (+ y (cast long z))))))))
+
+(def/bench "3 columns, no nulls, :when-let" (three-when-let price qty rank))
+(def/bench "3 columns, no nulls, complete-rows" (three-complete price qty rank))
+(def/bench "3 columns, nulls, :when-let" (three-when-let price* qty* rank*))
+(def/bench "3 columns, nulls, complete-rows" (three-complete price* qty* rank*))
+
+;; The pairs give the same sums.
+(: int)
+(def _checked
+  (if (and (= (sum-when-let price*) (sum-skip-nulls price*))
+           (= (two-when-let price* qty*) (two-complete price* qty*))
+           (= (three-when-let price* qty* rank*) (three-complete price* qty* rank*)))
+      0
+      (panic! "a pair of loops gave two sums")))
+
+(run-benches)

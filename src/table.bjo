@@ -37,7 +37,7 @@
   ;; Cells: a column at the type its use gives
   Cells column-as cells-ref cells-get cells-valid? cells-length cells-null-count
   DateCells DateTimeCells InstantCells date-cells datetime-cells instant-cells
-  NotNull skip-nulls
+  NotNull skip-nulls CompleteRows RowColumns complete-rows
 
   ;; Aggregates
   column-sum column-mean column-min column-max column-count
@@ -436,6 +436,100 @@
   (defun (iterable-current s i) (cells-ref (record-ref s cells) i))
   (defun (iterable-next s i) (next-valid (record-ref s cells) (+ i 1)))
   (defun (count s) (- (cells-length (record-ref s cells)) (cells-null-count (record-ref s cells)))))
+
+;; The rows of several columns where no column is null, as R's
+;; complete.cases and na.omit: each row is a Tuple of the values, so that a
+;; loop gets the values without Options and stays on one row of all the
+;; columns.
+;;
+;;     (loop (:for (Tuple f m) (complete-rows (Tuple flipper mass)))
+;;           (:acc (correlation (Tuple (cast double f) (cast double m)))))
+;;
+;; It takes a Tuple of 2, 3 or 4 columns of cells. Columns of different
+;; lengths give the rows of the shortest. With nulls it is as fast as the
+;; same loop with :when-let; without them it is slower, as :when-let then
+;; reads the cells as spans (bench/nulls.bjo).
+(type (: (CompleteRows %t) #:opaque (Record (: columns %t) (: length int) (: nulls? bool))))
+
+;; The columns of a CompleteRows: a Tuple of Cells.
+(def/trait (RowColumns %t)
+  (type %row)
+  ;; The length of the shortest column.
+  (: row-columns-length (-> %t int))
+  ;; Whether a column has a null.
+  (: row-columns-nulls? (-> %t bool))
+  ;; Whether no column is null at the row.
+  (: row-complete? (-> %t int bool))
+  ;; The values of the row, which is complete.
+  (: row-values (-> %t int %row)))
+
+(impl (RowColumns (Tuple (Cells %a) (Cells %b)))
+  (type %row (Tuple %a %b))
+  (defun (row-columns-length t)
+    (def (a b) t)
+    (min (cells-length a) (cells-length b)))
+  (defun (row-columns-nulls? t)
+    (def (a b) t)
+    (or (> (cells-null-count a) 0) (> (cells-null-count b) 0)))
+  (defun (row-complete? t i)
+    (def (a b) t)
+    (and (cells-valid? a i) (cells-valid? b i)))
+  (defun (row-values t i)
+    (def (a b) t)
+    (Tuple (cells-ref a i) (cells-ref b i))))
+
+(impl (RowColumns (Tuple (Cells %a) (Cells %b) (Cells %c)))
+  (type %row (Tuple %a %b %c))
+  (defun (row-columns-length t)
+    (def (a b c) t)
+    (min (cells-length a) (min (cells-length b) (cells-length c))))
+  (defun (row-columns-nulls? t)
+    (def (a b c) t)
+    (or (> (cells-null-count a) 0) (> (cells-null-count b) 0) (> (cells-null-count c) 0)))
+  (defun (row-complete? t i)
+    (def (a b c) t)
+    (and (cells-valid? a i) (cells-valid? b i) (cells-valid? c i)))
+  (defun (row-values t i)
+    (def (a b c) t)
+    (Tuple (cells-ref a i) (cells-ref b i) (cells-ref c i))))
+
+(impl (RowColumns (Tuple (Cells %a) (Cells %b) (Cells %c) (Cells %d)))
+  (type %row (Tuple %a %b %c %d))
+  (defun (row-columns-length t)
+    (def (a b c d) t)
+    (min (min (cells-length a) (cells-length b)) (min (cells-length c) (cells-length d))))
+  (defun (row-columns-nulls? t)
+    (def (a b c d) t)
+    (or (> (cells-null-count a) 0) (> (cells-null-count b) 0)
+        (> (cells-null-count c) 0) (> (cells-null-count d) 0)))
+  (defun (row-complete? t i)
+    (def (a b c d) t)
+    (and (cells-valid? a i) (cells-valid? b i) (cells-valid? c i) (cells-valid? d i)))
+  (defun (row-values t i)
+    (def (a b c d) t)
+    (Tuple (cells-ref a i) (cells-ref b i) (cells-ref c i) (cells-ref d i))))
+
+(: (-> %t (CompleteRows %t)) (where (RowColumns %t)))
+(defun (complete-rows columns)
+  (CompleteRows (columns columns) (length (row-columns-length columns)) (nulls? (row-columns-nulls? columns))))
+
+;; The first complete row from `i` on, or the length. Without nulls, `i`.
+(: (-> (CompleteRows %t) int int) (where (RowColumns %t)))
+(defun (next-complete r i)
+  (cond
+    ((not (record-ref r nulls?)) i)
+    ((>= i (record-ref r length)) i)
+    ((row-complete? (record-ref r columns) i) i)
+    (else (next-complete r (+ i 1)))))
+
+(impl (Iterable (CompleteRows %t))
+  (where (RowColumns %t))
+  (type %elem (assoc RowColumns row %t))
+  (type %cursor int)
+  (defun (iterable-start r) (next-complete r 0))
+  (defun (iterable-done? r i) (>= i (record-ref r length)))
+  (defun (iterable-current r i) (row-values (record-ref r columns) i))
+  (defun (iterable-next r i) (next-complete r (+ i 1))))
 
 ;; How many values are not null.
 (: (-> (Column %a) int))

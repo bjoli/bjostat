@@ -275,6 +275,27 @@ The loop is the one way to make a column, a filter or a group. Bjolang is to
 make vector code of simple loops (Docs/Vectorisation-design.org in Bjolang),
 so that the same loop becomes faster, with no second API for speed.
 
+*Nulls.* A loop over cells gets an ~Option~ for each row, so that columns
+side by side stay on one row. Two iterators give the values without the
+nulls:
+
+#+BEGIN_SRC scheme
+;; The values of one column that are not null, as Julia's skipmissing
+(loop (:for p (skip-nulls price)) (:acc (summing p)))
+;; The rows where no column is null, as R's complete.cases: 2, 3 or 4 columns
+(loop (:for (Tuple p q) (complete-rows (Tuple price qty)))
+      (:acc (summing (* p (cast double q)))))
+#+END_SRC
+
+Do not put two ~skip-nulls~ side by side: each leaves out its own nulls, so
+the columns would not stay on one row. ~complete-rows~ is for that. Columns
+of two lengths give the rows of the shorter.
+
+They are as fast as ~:when-let~ where there are nulls. Where there are none,
+~:when-let~ is faster, as the loop then reads the columns as arrays: of a
+million rows, measured (~bench/nulls.bjo~), about 2.5 ms against 4.3 ms, of
+one column and of two.
+
 ** The module (bjostat stats)
 
 Statistics are collectors of doubles, so they are loops too. A null is left
