@@ -492,7 +492,12 @@ The benchmarks:
 bjo bench bench/csv.bjo --all
 bjo bench bench/query.bjo --all
 bjo bench bench/nulls.bjo --all
-python3 bench/compare/make_data.py scratch/compare.csv   # the file of the next two
+python3 bench/compare/make_data.py scratch/compare.csv   # the file of the next four
 bjo bench bench/compare.bjo --all
 POLARS_MAX_THREADS=1 python3 bench/compare/polars_bench.py scratch/compare.csv
+python3 bench/compare/pandas_bench.py scratch/compare.csv
+Rscript bench/compare/r_bench.R scratch/compare.csv      # data.table, dplyr, tidyr
 #+END_SRC
+
+The results, against Polars, pandas, data.table and dplyr, are in
+[[file:plan.org][plan.org]].
