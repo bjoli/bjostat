@@ -17,6 +17,7 @@
 // and Bjolang writes none on a type; Of<T> answers None for any T no column
 // holds.
 
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
@@ -92,8 +93,20 @@ public sealed unsafe class Cells<T>
             }
             else if (_values.Length >= (_offset + Length) * Unsafe.SizeOf<T>())
             {
-                _pin = _values.Pin();
-                _pointer = (byte*)_pin.Pointer + _offset * Unsafe.SizeOf<T>();
+                // Arrow's native memory does not move, so it needs no pin:
+                // a pin that is never released makes Arrow's finalizer throw
+                // ("cannot free native memory while it is pinned") when the
+                // buffer is collected. _array keeps the memory alive as long
+                // as the cells. Memory of any other manager is pinned.
+                if (MemoryMarshal.TryGetMemoryManager(_values, out MemoryManager<byte>? manager)
+                    && manager.GetType().FullName == "Apache.Arrow.Memory.NativeMemoryManager")
+                    _pointer = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(_values.Span))
+                               + _offset * Unsafe.SizeOf<T>();
+                else
+                {
+                    _pin = _values.Pin();
+                    _pointer = (byte*)_pin.Pointer + _offset * Unsafe.SizeOf<T>();
+                }
             }
         }
     }
