@@ -456,15 +456,55 @@ loops before anything else, as they change the Collector trait:
    parts go to .NET's pool, as events. In an earlier run with fibers, 2
    parts took 1.43 ms, 4 took 0.76, 24 took 0.54: from 8 parts on, memory
    is the limit. ~computing~ in (bjostat query) is ~blocking~ under a name
-   that says what it is for here; it measures the same. It would differ
-   from ~blocking~ only by one of two changes, each made only if a
-   measure asks for it: at most one part for each core, the others in a
-   queue, as more threads than cores only take turns, where a parked call
-   wants the pool to grow; and a part not started when its scope was
-   cancelled while it waited, so that a deadline stops a query after the
-   parts that run. The test first: the latency of a fiber with a timer
-   while a parallel loop runs. A Task from the glue cannot be
-   made an event yet (see the findings below).
+   that says what it is for here; it measures the same.
+
+   How late a fiber wakes while a parallel loop runs (bench/latency.bjo):
+   a fiber sleeps 1 ms, 500 times, while the main thread runs a loop over
+   4M rows in 24 parts again and again. Measured on 12 cores of 2 threads
+   each, 24 logical; lateness in µs, the ranges of three runs:
+
+   | The loop's parts                 | loops   | median  | p90       | max         |
+   |----------------------------------+---------+---------+-----------+-------------|
+   | none                             | –       | 105–114 | 134–155   | 1.5–2.9 ms  |
+   | the sum of the columns, 24 parts |         |         |           |             |
+   | fibers that compute              | 419–426 | 311–332 | 740–772   | 6.0–7.3 ms  |
+   | ~computing~                      | 346–359 | 126–128 | 324–479   | 7.6–9.9 ms  |
+   | ~spawn/thread~                   | 164–167 | 87–88   | 263–313   | 2.2–2.6 ms  |
+   | ~computing~, 12 parts            | 340–376 | 110–122 | 155–177   | 1.2–2.0 ms  |
+   | square roots, no memory, 24 parts |        |         |           |             |
+   | fibers that compute              | 343–356 | 1388–1492 | 2065–2110 | 4.6–5.3 ms |
+   | ~computing~                      | 258–271 | 246–339 | 1896–1996 | 7.5–11.7 ms |
+   | ~spawn/thread~                   | 116–118 | 89–91   | 148–214   | 1.9–3.8 ms  |
+   | workers of bjostat's own, 24     | 213–221 | 117–120 | 1810–1877 | 15–17 ms    |
+   | workers, 22                      | 199     | 114     | 1367      | 16 ms       |
+   | workers, 18                      | 164     | 101     | 138       | 16 ms       |
+   | workers, 12                      | 136     | 104     | 126       | 15 ms       |
+
+   What it says:
+   - A fiber that computes holds its pump: the worst latency, 3 to 14
+     times the median of no load.
+   - ~computing~ keeps the median, but the tail grows to the length of a
+     part (about 2 ms) when the parts take every core: they run on .NET's
+     pool, whose threads carry the pumps too.
+   - ~spawn/thread~ keeps the latency because it makes a thread for each
+     part, which halves what the loop gets done.
+   - Workers of bjostat's own (glue/Workers.cs, threads made once) keep
+     the latency of no load when they are fewer than the logical cores: 18
+     of 24, with 77 % of what 24 get done in the square roots. A loop
+     limited by memory loses nothing with 12: 349 loops against 329. The
+     max of about 15 ms in each run of the workers is most likely their
+     start, once.
+   - A lower priority of the workers changes nothing on Linux.
+
+   So the parts go to workers of bjostat's own, fewer than the cores. What
+   is to decide is how many: for a script that has no other fibers all the
+   cores are best; for a server, about three in four of them. A setting
+   with a default, and a keyword of the parallel loop, would let a program
+   say. The workers are reached through ~task->event~ of a method that
+   returns a plain ~Task~, and the part keeps its value itself: a generic
+   ~Task<T>~ cannot be imported yet (see the findings). ~computing~ is to
+   become that, and to skip a part whose scope was cancelled while it
+   waited, which the workers already do.
 
    What is to decide:
    - *Combining.* A part gives the accumulator of its collectors, and two
@@ -492,8 +532,8 @@ loops before anything else, as they change the Collector trait:
      collectors combined, needs no change in Bjolang; a ~:parallel~
      clause of the loop would be shorter and needs the compiler. Try the
      function first.
-   - *What runs it.* Tasks of .NET's pool as events, as the prototype, or
-     threads of bjostat's own. The copy of the kept columns of a filter
+   - *What runs it.* Workers of bjostat's own, fewer than the cores, as
+     above. The copy of the kept columns of a filter
      runs on .NET's ~Parallel.For~ (glue/Query.cs); it should go through
      the same parts.
 2. *Ids instead of hashes for strings and integers.* bjostat is the
@@ -582,8 +622,9 @@ Still open, checked again on the vectorise branch:
   be imported ~#:async~: "no overload of it returns a Task or a
   ValueTask", though it does. The example of Docs/Syntax.org,
   ~Task.Run (-> (-> %a) %a) #:async~, fails too: only the overloads of
-  ~Run~ that are not generic are candidates. So a pool of threads in the
-  glue cannot hand its parts to ~task->event~.
+  ~Run~ that are not generic are candidates. A method that is not generic
+  and returns a plain ~Task~ works, so glue/Workers.cs gives a ~Task~ of
+  the end of a part, and the part keeps its value itself.
 - A module-level ~def~ that starts fibers which read the module's other
   values hangs: the fibers wait for the module to be set up (its static
   constructor in .NET), and the module waits for the fibers. Found with

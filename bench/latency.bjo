@@ -1,0 +1,142 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/latency.bjo — how late a fiber wakes while a loop runs on
+;; all the cores. A fiber sleeps 1 ms, 500 times, and keeps how late each
+;; wake was; the main thread runs the sum of price × qty of 4 000 000 rows
+;; in parts, again and again, until the fiber is done. The parts run as:
+;;
+;; - nothing: no loop, the latency of the timer itself;
+;; - fibers that compute, which hold the pumps of Bjolang's run queues;
+;; - computing, Tasks of .NET's pool as events;
+;; - spawn/thread, a thread of its own for each part;
+;; - workers, threads of bjostat's own made once (glue/Workers.cs), as many
+;;   as BJOSTAT_WORKERS says, the logical cores by default.
+;;
+;;     bjo run bench/latency.bjo [parts] [cpu]
+;;
+;; The parts are 24 by default, as many as the cores of the machine it was
+;; written on (12, each of two threads). With `cpu`, each part computes and
+;; reads no memory: a sum of square roots over the numbers of its rows, so
+;; that more cores make it faster, where the sum of the columns is limited
+;; by memory from 8 parts on.
+
+(import (std prelude))
+(import (bjostat table))
+(import (bjostat query))
+(import (bjostat stats))
+
+(import/extern (worker-run (: Bjostat.Workers.Run (-> (-> Unit) void) #:async)))
+
+(: int) (def rows 4000000)
+
+(: Table)
+(def t
+  (match (make-table
+           [(named "price" (array->column {arraying (cast double (% (* i 7919) 500)) (:for i (range 0 rows))}))
+            (named "qty" (array->column {arraying (cast long (% (* i 31) 40)) (:for i (range 0 rows))}))])
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> Table double))
+(defun (revenue u)
+  (def price (: (match (column-as u "price") ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells double)))
+  (def qty (: (match (column-as u "qty") ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells long)))
+  (loop (:for p* price) (:for q* qty) (:when-let (Some p) p*) (:when-let (Some q) q*)
+        (:acc (summing (* p (cast double q))))))
+
+;; Work with no memory: as long as the sum of 2.5 rows' columns, about.
+(: (-> Table double))
+(defun (roots u)
+  (loop (:for i (range 0 (* 4 (table-row-count u)))) (:acc (summing (sqrt (cast double i))))))
+
+(: (-> int int Table))
+(defun (part parts k)
+  (def size (/ (+ rows (- parts 1)) parts))
+  (table-slice t #:from (* k size) #:to (min rows (* (+ k 1) size))))
+
+(: (-> (Result Exception double) double))
+(defun (ok-sum r) (match r ((Ok v) v) ((Err e) (raise e))))
+
+;; The value of a promise: parked for in ordinary code, suspended for in a
+;; fiber.
+(: (-> (Promise %a) %a))
+(defun (joined p)
+  (by-colour (#:sync (promise-join/sync p))
+             (#:bjo (match (sync (promise-join p)) ((Ok v) v) ((Err e) (raise e))))))
+
+(: (-> (-> Table double) int double))
+(defun (on-fibers work parts)
+  (with-scope
+    (def ps {vecing (spawn-thunk (fun () (work (part parts k)))) (:for k (range 0 parts))})
+    (loop (:for p ps) (:acc (summing (joined p))))))
+
+(: (-> (-> Table double) int double))
+(defun (on-computing work parts)
+  (with-scope
+    (def ps {vecing (bjo (sync (computing (fun () (work (part parts k)))))) (:for k (range 0 parts))})
+    (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
+
+(: (-> (-> Table double) int double))
+(defun (on-threads work parts)
+  (with-scope
+    (def ps {vecing (bjo (sync (spawn/thread (fun () (work (part parts k)))))) (:for k (range 0 parts))})
+    (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
+
+;; Each part on a thread of bjostat's own workers, made once; the part keeps
+;; its value in an array, and its end is an event.
+(: (-> (-> Table double) int double))
+(defun (on-workers work parts)
+  (def sums {arraying 0.0 (:for _ (range 0 parts))})
+  (with-scope
+    (def ps {vecing (bjo (sync (task->event (worker-run (fun () (array-set! sums k (work (part parts k))) unit)))))
+                    (:for k (range 0 parts))})
+    (loop (:for p ps) (:do (match (joined p) ((Ok _) unit) ((Err e) (raise e))))))
+  (loop (:for x sums) (:acc (summing x))))
+
+;; How late each of `n` wakes after 1 ms was, in microseconds.
+(: ticker (-bjo-> int (Vec double)))
+(defbjo (ticker n)
+  (let more ((i 0) (late []))
+    (if (= i n)
+        late
+        (let ((start (monotonic-ns)))
+          (sync (timeout (milliseconds 1)))
+          (more (+ i 1) (vec-add late (- (/ (cast double (- (monotonic-ns) start)) 1000.0) 1000.0)))))))
+
+;; With no load, the main thread only waits, so that it does not keep a core
+;; busy asking whether the fiber is done.
+(: (-> string (Option (-> double)) void))
+(defun (scenario name load)
+  (with-scope
+    (def p (bjo (ticker 500)))
+    (def loops (match load
+                 (None 0)
+                 ((Some f) (let go ((k 0)) (if (promise-done? p) k (begin (ignore (f)) (go (+ k 1))))))))
+    (def late (joined p))
+    (def q (match (loop (:for x late) (:acc (quantiles [0.5 0.9 0.99] x))) ((Some q) q) (None [0.0 0.0 0.0])))
+    (def worst (loop (:for x late) (:acc m (folding 0.0 (max m x)))))
+    (println (str (string-pad-right name 26) (string-pad-left (int->string loops) 6) " loops"
+                  "   late, µs: median " (string-pad-left (double->string (round1 (vec-ref q 0))) 8)
+                  "  p90 " (string-pad-left (double->string (round1 (vec-ref q 1))) 8)
+                  "  p99 " (string-pad-left (double->string (round1 (vec-ref q 2))) 8)
+                  "  max " (string-pad-left (double->string (round1 worst)) 8)))))
+
+(: (-> double double))
+(defun (round1 x) (/ (cast double (cast long (* x 10.0))) 10.0))
+
+(defun (main args)
+  (def parts (if (> (vec-length args) 0) (string->int (vec-ref args 0)) 24))
+  (def cpu? (and (> (vec-length args) 1) (= (vec-ref args 1) "cpu")))
+  (def work (if cpu? roots revenue))
+  (println (str (int->string rows) " rows in " (int->string parts) " parts, "
+                (if cpu? "square roots" "the sum of the columns") "; on one thread: "
+                (double->string (work t))))
+  (scenario "nothing" None)
+  (scenario "fibers that compute" (Some (fun () (on-fibers work parts))))
+  (scenario "computing" (Some (fun () (on-computing work parts))))
+  (scenario "spawn/thread" (Some (fun () (on-threads work parts))))
+  (scenario "workers" (Some (fun () (on-workers work parts))))
+  (scenario "nothing, again" None)
+  0)
