@@ -10,6 +10,13 @@
 ;; wrong; if it is as slow as the random ones, it is the loop itself.
 ;;
 ;;     bjo bench bench/null-cost.bjo --all
+;;
+;; Run the cases with nulls on their own too: .NET makes the code of a
+;; function from a profile of its first calls, so a function first run on
+;; cells without nulls is slower afterwards on cells with nulls (the
+;; correlation with nulls in both: 4.36 ms after the case without, 3.66
+;; alone). And with DOTNET_TieredPGO=0 the correlation takes 10 ms, nulls or
+;; not: only the profile makes .NET inline co-moments-add into the loop.
 
 (import (std prelude))
 (import (std bench))
@@ -48,6 +55,14 @@
 (defun (cor a b)
   (loop (:for x* a) (:for y* b) (:when-let (Some x) x*) (:when-let (Some y) y*)
         (:acc (correlation (Tuple x y)))))
+;; Both valid, with no statistic: the tests alone.
+(: (-> (Cells double) (Cells double) long))
+(defun (both-valid a b)
+  (loop (:for x* a) (:for y* b) (:when-let (Some x) x*) (:when-let (Some y) y*) (:acc (counting x))))
+(: (-> (Cells double) (Cells double) double))
+(defun (sum-products a b)
+  (loop (:for x* a) (:for y* b) (:when-let (Some x) x*) (:when-let (Some y) y*) (:acc (summing (* x y)))))
+
 (: (-> (Cells double) double))
 (defun (sum-skip c) (loop (:for x (skip-nulls c)) (:acc (summing x))))
 (: (-> (Cells double) (Cells double) (Option double)))
@@ -66,6 +81,12 @@
 (def/bench "cor, no nulls" (cor none none2))
 (def/bench "cor, 5% random" (cor random random2))
 (def/bench "cor, 5% in a run" (cor run run2))
+(def/bench "cor, 5% random in x only" (cor random none2))
+(def/bench "cor, 5% random, the same rows in both" (cor random random))
+(def/bench "both valid, no nulls" (both-valid none none2))
+(def/bench "both valid, 5% random" (both-valid random random2))
+(def/bench "sum of products, no nulls" (sum-products none none2))
+(def/bench "sum of products, 5% random" (sum-products random random2))
 (def/bench "cor, complete-rows, 5% random" (cor-complete random random2))
 
 (run-benches)

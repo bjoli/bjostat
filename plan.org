@@ -689,9 +689,29 @@ loops before anything else, as they change the Collector trait:
    13.1 to 2.51 ms, the correlation 40.6 to 4.77, a group by a long 48.8 to
    9.28, the median 28.2 to 10.8, a new column 4.83 to 1.66.
 
-   Left: a correlation with nulls in two columns is 1.7 times one without
-   (4.36 against 2.58 ms), and ~skip-nulls~ and ~complete-rows~ cost more
-   than ~:when-let~. And the statistics without nulls are 5 times Polars's
+   The correlation with nulls in two columns, looked into: measured alone
+   it takes 3.66 ms against 2.58 without nulls; after a run without nulls
+   in the same process, 4.36. The tests themselves cost little (a loop
+   that only counts the rows where both are valid: 0.62 ms), nulls at the
+   same rows in both cost the same as at other rows, and each column with
+   nulls adds about 0.5 ms. Three changes to Cells were measured in pairs
+   and left out: one bitmap array for all kinds of memory, an Option made
+   with no jump, and one bound check instead of two; none was faster.
+   What the C# and .NET's machine code showed:
+   - The loop is fast only because .NET's dynamic profile makes it inline
+     ~co-moments-add~, whose struct of 64 bytes is in another assembly.
+     With ~DOTNET_TieredPGO=0~ it is a call for each row, and the
+     correlation takes 10 ms, nulls or not.
+   - .NET makes the code of a function from its first calls, so a
+     function first run on cells without nulls is laid out for them.
+   - ~#:inline~ on ~co-moments-add~ changed nothing: Bjolang copies the
+     collector's step into the loop, but not the ~#:inline~ function the
+     step calls from its module (in Bjolang's Todo).
+   What would end the rest of the cost of nulls is in the loop, and is
+   for a decision: the valid bits of all the loop's columns taken 64 at a
+   time, as one word, and a word whose rows are all valid run with no test
+   of a row, as Polars's kernels do. ~skip-nulls~ and ~complete-rows~
+   cost more than ~:when-let~ still. And the statistics without nulls are 5 times Polars's
    (a standard deviation 2.49 ms against 0.49), as their sums are not
    vector sums; that is item 6 of what the comparison taught, a decision.
 5. *Statistics:* a t-digest for quantiles in one pass with little memory.
