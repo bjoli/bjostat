@@ -500,5 +500,14 @@ python3 bench/compare/pandas_bench.py scratch/compare.csv
 Rscript bench/compare/r_bench.R scratch/compare.csv      # data.table, dplyr, tidyr
 #+END_SRC
 
+The same on a file of another shape, with 20 000 regions, nulls and more
+columns:
+
+#+BEGIN_SRC sh
+python3 bench/compare/make_data.py scratch/compare-wide.csv wide
+COMPARE_CSV=scratch/compare-wide.csv bjo bench bench/compare.bjo --all
+python3 bench/compare/polars_bench.py scratch/compare-wide.csv   # and the others
+#+END_SRC
+
 The results, against Polars, pandas, data.table and dplyr, are in
 [[file:plan.org][plan.org]].

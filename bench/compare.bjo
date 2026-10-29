@@ -8,6 +8,11 @@
 ;;
 ;;     python3 bench/compare/make_data.py scratch/compare.csv
 ;;     bjo bench bench/compare.bjo --all
+;;
+;; COMPARE_CSV names another file, as the wide one:
+;;
+;;     python3 bench/compare/make_data.py scratch/compare-wide.csv wide
+;;     COMPARE_CSV=scratch/compare-wide.csv bjo bench bench/compare.bjo --all
 
 (import (std prelude))
 (import (std bench))
@@ -16,6 +21,7 @@
 (import (bjostat query))
 (import (bjostat stats))
 (import (bjostat models))
+(import (only (std maths) round))
 
 
 (: (-> (Result TableError %a) %a))
@@ -25,7 +31,7 @@
     ((Err e) (panic! (displayed e)))))
 
 (: string)
-(def path "scratch/compare.csv")
+(def path (match (getenv "COMPARE_CSV") ((Some p) p) (None "scratch/compare.csv")))
 
 (: Table)
 (def t (ok (read-csv path)))
@@ -75,17 +81,6 @@
             (:acc counts (counting-by groups (Tuple g p)))
             => (groups->table groups "qty" [(Tuple "price" sums) (Tuple "len" counts)]))))
 
-;; The results, printed when the module starts, before the runs.
-(: (-> int))
-(defun (print-results)
-  (println (str "kept rows: " (int->string (table-row-count (kept)))))
-  (println (str "columns with revenue: " (int->string (table-column-count (with-revenue)))))
-  (println (table->string (by-region) #:digits 2))
-  (println (str "groups by qty: " (int->string (table-row-count (by-qty)))))
-  0)
-
-(: int)
-(def _printed (print-results))
 
 ;; Where the filter's time goes: the loop alone, and the copy of each kind of
 ;; column on its own.
@@ -120,17 +115,19 @@
 (def/bench "filter, kept rows" (table-row-count (kept)))
 (def/bench "group by string, sum" (table-row-count (by-region)))
 (def/bench "group by long, sum and count" (table-row-count (by-qty)))
-;; A table of the four regions, and one of each id with a number.
+;; A table of each region, in order, with a rate, and one of each id with a
+;; number.
 (: Table)
 (def region-rates
-  (ok (make-table [(named-strings "region" (array->string-column (vec->array ["north" "south" "east" "west"])))
-                   (named "rate" (array->column (vec->array [1.0 1.5 2.0 2.5])))])))
+  (let* ((names (ok (table-select (ok (table-count t ["region"])) ["region"])))
+         (n (table-row-count names)))
+    (ok (table-with names "rate" {column-building (+ 1.0 (* 0.5 (cast double (% i 4)))) (:for i (range 0 n))}))))
 (: Table)
 (def id-scores
   (ok (make-table [(named "id" (array->column {arraying (cast long i) (:for i (range 0 (table-row-count t)))}))
                    (named "score" (array->column {arraying (cast double (% i 7)) (:for i (range 0 (table-row-count t)))}))])))
 
-(def/bench "join by a string to 4 rows" (table-row-count (ok (inner-join t region-rates ["region"]))))
+(def/bench "join by a string to the keys" (table-row-count (ok (inner-join t region-rates ["region"]))))
 (def/bench "join by a long, one to one" (table-row-count (ok (inner-join t id-scores ["id"]))))
 
 (def/bench "standard deviation"
@@ -178,7 +175,7 @@
 (def/bench "group by category, sum" (table-row-count (by-category)))
 (def/bench "sort by a category, then a number"
   (table-row-count (ok (table-sort by-codes [(ascending "region") (descending "price")]))))
-(def/bench "join by a category to 4 rows"
+(def/bench "join by a category to the keys"
   (table-row-count (ok (inner-join by-codes region-rates-codes ["region"]))))
 
 (def/bench "count by a string and a long" (table-row-count (ok (table-count t ["region" "qty"]))))
@@ -197,5 +194,39 @@
                (:acc (linear-model ["qty" "qty2" "id"] (Tuple p [x (* x x) (cast double i)]))))
     ((Ok m) (record-ref m r-squared))
     ((Err _) 0.0)))
+
+
+;; The results, to compare with the other libraries', printed before the
+;; runs.
+(: (-> double string))
+(defun (rounded x) (double->string (/ (round (* x 100.0)) 100.0)))
+
+(: (-> (Option double) string))
+(defun (some-text o) (match o ((Some x) (double->string x)) (None "None")))
+
+(: (-> int))
+(defun (print-results)
+  (def regions (by-region))
+  (println (str "kept rows: " (int->string (table-row-count (kept)))))
+  (println (str "groups by string: " (int->string (table-row-count regions))
+                ", total " (rounded (column-sum (ok (doubles regions "price"))))))
+  (println (str "groups by long: " (int->string (table-row-count (by-qty)))))
+  (println (str "join by a string to the keys: " (int->string (table-row-count (ok (inner-join t region-rates ["region"]))))))
+  (println (str "join by a long: " (int->string (table-row-count (ok (inner-join t id-scores ["id"]))))))
+  (println (str "standard deviation: "
+                (some-text (loop (:for p* price) (:when-let (Some p) p*) (:acc (standard-deviation p))))))
+  (println (str "median: " (some-text (loop (:for p* price) (:when-let (Some p) p*) (:acc (median p))))))
+  (println (str "correlation: "
+                (some-text (loop (:for (Tuple p q) (complete-rows (Tuple price qty)))
+                                 (:acc (correlation (Tuple p (cast double q))))))))
+  (println (str "distinct by a string and a long: "
+                (int->string (table-row-count (ok (table-distinct t #:by ["region" "qty"]))))))
+  (println (str "pivot wider: " (int->string (table-row-count (ok (pivot-wider prices-long))))))
+  (println (str "count by a string and a long: " (int->string (table-row-count (ok (table-count t ["region" "qty"]))))))
+  (println (str "crosstab rows: " (int->string (table-row-count (ok (table-crosstab t "region" "qty"))))))
+  0)
+
+(: int)
+(def _printed (print-results))
 
 (run-benches)

@@ -361,64 +361,123 @@ and statistics. Done so far:
   agree with R's. The port added ~#:nulls~ to the CSV reader and kept the
   digits of small p-values in ~table->string~.
 
-Measured against Polars, pandas and R: the same file of 1 000 000 rows
-(bench/compare/make_data.py), the same operations and the same results, in
-bench/compare.bjo, polars_bench.py, pandas_bench.py and r_bench.R, one
+Measured against Polars, pandas and R: the same operations and the same
+results, in bench/compare.bjo, polars_bench.py, pandas_bench.py and
+r_bench.R, on two files of 1 000 000 rows (bench/compare/make_data.py), one
 after another in one session on a Ryzen 9 5900X. Each library computes on
 one thread: Polars with ~POLARS_MAX_THREADS=1~, pandas with pyarrow's
 pools at 1, data.table with ~setDTthreads(1)~; bjostat's loops are on one
 thread. Polars on 24 threads is the last column. The median of 20 runs,
 in ms. Polars 2.1.0, pandas 3.1.0, R 4.5.3 with data.table 1.18.6.1,
-dplyr 1.2.1 and tidyr 1.3.2.
+dplyr 1.2.1 and tidyr 1.3.2. A join is to a table of each region with a
+rate, made from the file.
 
-| Operation                         | bjostat | Polars, 1 | pandas | data.table | dplyr | Polars, 24 |
-|-----------------------------------+---------+-----------+--------+------------+-------+------------|
-| read CSV (26 MB)                  |     189 |      73.4 |   30.3 |        141 |     – |       18.6 |
-| filter, kept rows                 |    3.63 |      3.95 |   9.72 |       16.0 |  16.6 |       3.03 |
-| new column                        |    1.57 |      1.01 |   1.28 |       44.6 |  4.81 |       1.20 |
-| group by a string, sum            |    29.4 |      8.77 |   20.2 |       17.2 |  14.3 |       3.18 |
-| group by a long, sum and count    |    6.85 |      7.45 |   8.74 |       11.8 |  9.70 |       1.88 |
-| sort by a number                  |    42.1 |      60.3 |    171 |        108 |  65.6 |       28.5 |
-| sort by a string, then a number   |    74.4 |       387 |    215 |        149 |  70.4 |       55.2 |
-| join by a string, to 4 rows       |    82.5 |      44.3 |   85.2 |       49.9 |  43.9 |       12.9 |
-| join by a long, one to one        |     136 |       113 |   2.02 |       64.7 |  67.3 |       28.5 |
-| standard deviation                |    2.50 |      0.48 |   2.76 |       5.56 |     – |       0.48 |
-| median                            |    14.2 |      11.7 |   11.4 |       27.1 |     – |       4.01 |
-| correlation                       |    2.94 |      1.21 |   6.82 |       13.6 |     – |       2.03 |
-| summary of the table              |    79.1 |      48.5 |    196 |       70.2 |  67.2 |       31.2 |
-| categorize a string column        |    13.3 |      13.7 |   17.4 |       17.4 |  17.3 |       2.66 |
-| group by a category, sum          |    2.45 |      6.23 |   9.29 |       14.1 |  8.41 |       1.62 |
-| sort by a category, then a number |    55.0 |       343 |    133 |        111 |  59.5 |       43.2 |
-| count by a category               |    1.89 |      6.43 |   6.84 |       10.0 |  5.05 |       1.57 |
-| join by a category, to 4 rows     |    12.0 |      27.4 |   7.03 |       35.8 |  35.8 |       10.2 |
-| distinct by a string and a long   |    15.2 |      28.6 |   29.6 |       10.4 |  9.93 |       19.2 |
-| distinct rows (all distinct)      |    7.09 |       160 |    134 |       53.9 |  43.4 |       89.6 |
-| append of two tables              |    16.3 |      13.8 |   4.81 |       32.9 |  47.1 |       10.7 |
-| pivot longer, two columns         |    35.9 |      6.19 |   25.0 |       15.9 |  29.8 |       7.35 |
-| pivot wider, two columns          |    72.8 |       252 |    331 |        244 |   158 |        108 |
-| count by a string and a long      |    15.7 |      9.23 |   29.2 |       18.5 |  16.0 |       3.14 |
-| crosstab of a string and a long   |    16.1 |      9.70 |   56.0 |       42.1 |     – |       4.11 |
+The narrow file: an id in order, a region of 4, a price, a quantity of 1
+to 40, a note; no nulls in the numbers.
 
-Of the one-thread columns, bjostat is the fastest at 9 of 25 and the
-slowest at 4: the CSV, a group by a string, a join by a long, and a pivot
-to longer rows. What the numbers do not say:
+| Operation | bjostat | Polars, 1 | pandas | data.table | dplyr | Polars, 24 |
+|-----+-----+-----+-----+-----+-----+-----|
+| read csv | 186 | 71.6 | 31.4 | 121 | – | 16.9 |
+| filter, kept rows | 3.57 | 4.04 | 8.00 | 15.1 | 16.0 | 2.54 |
+| new column | 2.61 | 0.61 | 0.74 | 31.9 | 1.44 | 0.77 |
+| group by string, sum | 31.4 | 8.28 | 19.0 | 21.1 | 17.6 | 2.38 |
+| group by long, sum and count | 6.38 | 7.06 | 7.43 | 16.3 | 13.7 | 1.66 |
+| sort by a number | 52.6 | 54.5 | 131 | 94.7 | 64.5 | 26.9 |
+| sort by a string, then a number | 75.3 | 343 | 145 | 116 | 69.8 | 49.5 |
+| join by a string to the keys | 67.1 | 44.2 | 78.9 | 36.6 | 43.6 | 10.7 |
+| join by a long, one to one | 133 | 102 | 1.83 | 59.5 | 65.2 | 22.5 |
+| standard deviation | 2.50 | 0.49 | 1.90 | 5.98 | – | 0.49 |
+| median | 16.3 | 11.2 | 9.94 | 21.4 | – | 3.11 |
+| correlation | 2.91 | 1.08 | 6.64 | 14.0 | – | 1.36 |
+| summary of the table | 90.9 | 46.8 | 136 | 67.2 | 67.7 | 25.3 |
+| categorize a string column | 12.7 | 13.5 | 15.6 | 16.6 | 18.0 | 2.32 |
+| group by category, sum | 2.35 | 6.03 | 8.64 | 13.6 | 12.0 | 1.46 |
+| sort by a category, then a number | 65.3 | 271 | 121 | 106 | 54.5 | 38.6 |
+| count by a category | 1.95 | 5.73 | 6.66 | 9.91 | 5.01 | 1.50 |
+| join by a category to the keys | 15.2 | 26.9 | 6.31 | 31.3 | 34.8 | 9.05 |
+| distinct by a string and a long | 14.5 | 25.0 | 28.4 | 11.9 | 9.87 | 15.9 |
+| distinct rows | 6.18 | 124 | 124 | 53.3 | 39.7 | 81.4 |
+| append, two tables | 30.1 | 11.3 | 3.93 | 38.1 | 40.9 | 9.41 |
+| pivot longer, two columns | 32.8 | 4.74 | 23.3 | 15.2 | 18.8 | 4.42 |
+| pivot wider, two columns | 80.9 | 213 | 324 | 246 | 144 | 99.3 |
+| count by a string and a long | 15.0 | 8.56 | 27.3 | 18.5 | 16.0 | 3.04 |
+| crosstab of a string and a long | 15.9 | 8.43 | 53.2 | 44.6 | – | 3.56 |
+
+The wide file: the same and six more numbers; the id in no order, a region
+of 20 000 (a few common, most rare), a quantity of 1 to 100, one price and
+one quantity in twenty empty, one of the six in fifty.
+
+| Operation | bjostat | Polars, 1 | pandas | data.table | dplyr | Polars, 24 |
+|-----+-----+-----+-----+-----+-----+-----|
+| read csv | 485 | 215 | 60.2 | 404 | – | 34.8 |
+| filter, kept rows | 7.17 | 9.27 | 13.9 | 21.6 | 23.0 | 6.40 |
+| new column | 4.83 | 0.92 | 0.48 | 107 | 1.73 | 0.86 |
+| group by string, sum | 85.0 | 47.8 | 29.4 | 31.8 | 111 | 21.2 |
+| group by long, sum and count | 47.1 | 8.93 | 10.5 | 13.1 | 15.2 | 2.54 |
+| sort by a number | 71.0 | 101 | 152 | 124 | 104 | 42.3 |
+| sort by a string, then a number | 140 | 416 | 185 | 159 | 121 | 65.8 |
+| join by a string to the keys | 92.7 | 110 | 103 | 86.5 | 88.1 | 18.0 |
+| join by a long, one to one | 250 | 164 | 54.1 | 112 | 147 | 35.6 |
+| standard deviation | 11.4 | 0.82 | 4.03 | 6.01 | – | 0.82 |
+| median | 28.3 | 11.9 | 10.0 | 15.6 | – | 4.59 |
+| correlation | 41.8 | 3.51 | 9.34 | 13.2 | – | 3.94 |
+| summary of the table | 411 | 164 | 312 | 309 | 298 | 95.1 |
+| categorize a string column | 43.5 | 26.6 | 25.5 | 71.9 | 72.0 | 2.87 |
+| group by category, sum | 22.5 | 27.8 | 10.8 | 18.3 | 89.8 | 15.0 |
+| sort by a category, then a number | 83.7 | 380 | 139 | 113 | 77.7 | 59.0 |
+| count by a category | 2.30 | 27.0 | 7.52 | 14.2 | 147 | 14.6 |
+| join by a category to the keys | 17.9 | 85.4 | 11.5 | 48.6 | 53.2 | 13.1 |
+| distinct by a string and a long | 97.5 | 145 | 70.2 | 61.8 | 49.1 | 63.7 |
+| distinct rows | 5.77 | 169 | 388 | 404 | 65.4 | 105 |
+| append, two tables | 54.5 | 23.6 | 18.9 | 59.5 | 76.8 | 18.1 |
+| pivot longer, two columns | 30.4 | 4.57 | 17.3 | 2.88 | 17.7 | 4.66 |
+| pivot wider, two columns | 76.4 | 212 | 450 | 401 | 139 | 108 |
+| count by a string and a long | 164 | 343 | 80.7 | 62.3 | 3714 | 101 |
+| crosstab of a string and a long | 83.2 | 323 | 2093 | 102 | – | 103 |
+
+Of the one-thread columns, bjostat is the fastest at 8 of 25 and the
+slowest at 4 on the narrow file, and the fastest at 6 and the slowest at 8
+on the wide one. All give the same results on both, but one: a group by
+the quantity of the wide file has 101 groups in Polars and R, which keep
+the rows of a null key as a group, and 100 in bjostat and pandas, which
+leave them out. What the wide file shows:
+- *Nulls make bjostat's loops slow.* From the narrow file to the wide: the
+  standard deviation 2.50 to 11.4 ms, the correlation 2.91 to 41.8, a
+  group by the quantity 6.38 to 47.1. Polars's go 0.49 to 0.82, 1.08 to
+  3.51, 7.06 to 8.93. Not yet looked into: most likely the loop over
+  cells with nulls is not a vector loop, and its test of each null is a
+  jump that the random nulls make the processor guess wrong.
+- *Many keys of strings cost more.* A group by the region took 85.0 ms
+  against 29.4 to 47.8 for Polars, pandas and data.table (dplyr 111); a
+  count by the region and the quantity 164 against 62.3 to 80.7 (Polars
+  343, dplyr 3 714).
+- *Categories keep their lead.* A count by a category 2.30 ms, the others
+  7.52 to 147; a sort by a category and a number 83.7, second to dplyr's
+  77.7.
+- The CSV, 77 MB: 485 ms, Polars 215, data.table 404, pandas 60.2 (on more
+  than one core, see below).
+- The distinct of all rows is still fast because ~id~ makes each row
+  distinct. A distinct by the region and the quantity, which it does not
+  help, is 97.5 ms against 49.1 to 145.
+- pandas's crosstab of 20 000 regions took 2 093 ms, and dplyr's count by
+  two keys 3 714 ms: each library has shapes it is slow at.
+
+What the numbers do not say:
 - dplyr has no row of its own where it uses base R (the statistics, the
   crosstab) or fread (the CSV).
-- pandas reads the CSV in 30 ms with pyarrow at one thread, and in 86 ms
-  when the process is pinned to one core: the read uses more than one core.
+- pandas reads the CSV on more than one core, even with pyarrow at one
+  thread: 30 ms, and 86 ms when the process is pinned to one core.
   Pinning the others is not fair either: .NET compiles and collects on
-  threads of its own, and pinned bjostat read the CSV in 567 ms.
-- pandas joins by ~id~ in 2 ms because both keys are sorted and unique,
-  which it checks first; bjostat and Polars hash them.
-- A distinct of rows that are all distinct is fast in bjostat because the
-  ~id~ column alone makes each row a group, and then the other columns are
-  not read.
+  threads of its own, and pinned bjostat read the narrow CSV in 567 ms.
+- pandas joins the narrow file by ~id~ in 2 ms because both keys are
+  sorted and unique, which it checks first; in the wide file the ids are
+  in no order, and it takes 54.1 ms.
 - The summaries are not the same: R's has quartiles, pandas's the counts of
   strings, Polars's and bjostat's nulls and the min and max of strings.
 - data.table's ~new column~ is a new table, ~c(.SD, ...)~, as the others
   make; its ~:=~ would change the table in place.
 - R's medians are above its fastest runs by up to a factor of 4 where its
-  garbage collector runs (new column: 44.6 ms, fastest 11.4).
+  garbage collector runs.
 
 The hash of a string key is made from its bytes for each row: a join by
 strings is 82.5 ms, and one by a category of the same strings 12.0 ms. A
@@ -537,22 +596,24 @@ loops before anything else, as they change the Collector trait:
      runs on .NET's ~Parallel.For~ (glue/Query.cs); it should go through
      the same parts.
 2. *Ids instead of hashes for strings and integers.* bjostat is the
-   slowest of five at a group by a string (29.4 ms) and at a join by a
-   long (136 ms, 137 MB), and slow at a join by a string (82.5 ms). Its
-   counts and categories already give each key an id without a hash of
-   each row: a count by a string takes 15.7 ms and a group by a category
-   2.45 ms. Use the ids for ~group-of!~ of strings and for joins by
+   slowest of five at a group by a string (31.4 ms; 85.0 with 20 000
+   regions) and at a join by a long (133 ms, 137 MB; 250 with the ids in
+   no order), and slow at a join by a string (67.1 ms). Its counts and
+   categories already give each key an id without a hash of each row: a
+   count by a string takes 15.0 ms and a group by a category 2.35 ms. Use the ids for ~group-of!~ of strings and for joins by
    strings, and for an integer key the distance from the least as an
    index, as the counts do, when the keys are dense enough. Check also
    whether both keys of a join are sorted and unique, as pandas does: its
    join by ~id~ takes 2 ms.
-3. *CSV fields as spans.* bjostat reads the file in 189 ms, Polars in 73
-   and data.table in 141: ~(text csv)~ makes a string of each field and an
+3. *CSV fields as spans.* bjostat reads the narrow file in 186 ms,
+   Polars in 71.6 and data.table in 121; the wide one in 485, 215 and 404: ~(text csv)~ makes a string of each field and an
    array of each row.
-4. *A second file for the comparison,* of another shape: keys of many
-   values, nulls in the numbers, more columns. One file says little:
-   bjostat's distinct of rows is fast only because ~id~ makes each row
-   distinct.
+4. *Loops over cells with nulls.* On the wide file the standard
+   deviation, the correlation and a group by a long are 4.6, 14 and 7
+   times slower than without nulls, where Polars's are at most 3 times.
+   Find out first where the time goes: the vector loop, the jump of each
+   null. Then a loop that reads the valid bitmap as a mask, as Polars's
+   kernels do, without a jump for each row.
 5. *Statistics:* a t-digest for quantiles in one pass with little memory.
 6. *Parquet*.
 7. *Nulls of dates and times.* ~skip-nulls~ and ~complete-rows~ take
