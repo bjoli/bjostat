@@ -598,6 +598,15 @@ loops before anything else, as they change the Collector trait:
      are not most of the time: a sort of the price alone takes 28.6 ms, of
      which the keys are made on one thread, and the copy of the rows of the
      other columns about 7.
+   - ~read-csv~ of a file of 4 MB or more with a header, in chunks of
+     whole rows on the workers (glue/CsvChunks.cs cuts them at line feeds
+     outside quotes, each with the header): the first chunk guesses the
+     types as before, the others are read with them, and the chunks are
+     appended. A chunk that does not fit, as a decimal after the guess in a
+     column of longs, or a file with a problem, is read again on one
+     thread, which widens the column or gives the error with its line.
+     186 to 68.0 ms (narrow), 516 to 178 (wide); Polars on one thread 71.6
+     and 215, data.table 121 and 404, Polars on 24 threads 16.9 and 34.8.
    - Tried and left out: the ids of a count's, a crosstab's and a
      distinct's other keys on the workers while the first is numbered. No
      change (count by a string and a long 15.2 ms before and after): the
@@ -646,10 +655,10 @@ loops before anything else, as they change the Collector trait:
    counts do, when the keys are dense enough. Check also whether both keys
    of a join are sorted and unique, as pandas does: its join by ~id~ takes
    2 ms.
-3. *CSV fields as spans.* bjostat reads the narrow file in 186 ms,
-   Polars in 71.6 and data.table in 121; the wide one in 485, 215 and
-   404: ~(text csv)~ makes a string of each field and an array of each
-   row.
+3. *CSV fields as spans.* bjostat reads the narrow file in 68.0 ms in
+   chunks on the workers (186 on one thread), Polars in 71.6 on one thread
+   and in 16.9 on 24; the wide one in 178, 215 and 34.8. ~(text csv)~ makes
+   a string of each field and an array of each row, on each worker.
 4. *Loops over cells with nulls.* On the wide file the standard
    deviation, the correlation and a group by a long are 4.6, 14 and 7
    times slower than without nulls, where Polars's are at most 3 times.

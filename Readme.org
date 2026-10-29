@@ -123,7 +123,11 @@ as the decimal point.
 *Speed.* The rows are read by ~(text csv)~, one at a time. A field becomes a
 number from its UTF-8 bytes, and a string is kept as its bytes. A file of
 1 000 000 rows and five columns, 26 MB, reads in about 175 ms, against
-95 ms for ~(text csv)~ reading the rows alone (~bench/csv.bjo~).
+95 ms for ~(text csv)~ reading the rows alone (~bench/csv.bjo~). A file of 4 MB or more with a header is read in chunks of whole rows
+on bjostat's workers, the first one guessing the types as above; a chunk
+that does not fit them sends the file back to one thread, which widens the
+column or says what is wrong, with its line. The file of the comparison,
+26 MB, reads in 68 ms this way, against 186 on one thread.
 
 ** An example: some questions to 167 countries
 

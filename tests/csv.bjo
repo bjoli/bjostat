@@ -125,4 +125,45 @@
   (expect "a file that is not there"
           (string-starts-with? (error-of (read-csv "/nonexistent/x.csv")) "/nonexistent/x.csv: ")
           #t)
+
+  ;; A file of 4 MB or more is read in chunks on the workers. It has to give
+  ;; the table that one thread gives: quoted fields with commas, quotes and
+  ;; line feeds, where a chunk must not be cut, nulls, and a category.
+  (: (-> int string))
+  (defun (big-row i)
+    (str (int->string i) ","
+         (if (= (% i 3) 0) "\"a, \"\"b\"\"\nc\"" (str "w" (int->string (% i 50)))) ","
+         (if (= (% i 7) 0) "" (double->string (/ (cast double i) 4.0))) "\n"))
+  (def big-text (str "n,s,x\n" (string-join {vecing (big-row i) (:for i (range 0 200000))} "")))
+  (def big-path (path-combine (temp-dir) "bjostat-test-big.csv"))
+  (file-write-text big-path big-text)
+  (def in-chunks (ok (read-csv big-path #:types [(Tuple "s" Category)])))
+  (def on-one (ok (csv->table big-text #:types [(Tuple "s" Category)])))
+  (expect "chunks: the size of the file" (> (string-length big-text) 4000000) #t)
+  (expect "chunks: the types" (types-of in-chunks) (types-of on-one))
+  (expect "chunks: the rows" (table-row-count in-chunks) 200000)
+  (expect "chunks: the numbers"
+          (Tuple (column-sum (ok (longs in-chunks "n"))) (column-sum (ok (doubles in-chunks "x")))
+                 (column-null-count (ok (doubles in-chunks "x"))))
+          (Tuple (column-sum (ok (longs on-one "n"))) (column-sum (ok (doubles on-one "x")))
+                 (column-null-count (ok (doubles on-one "x")))))
+  (expect "chunks: the category, its levels and its quoted text"
+          (Tuple (ok (category-levels in-chunks "s"))
+                 {vecing (cells-ref (: (ok (column-as in-chunks "s")) (Cells string)) r) (:for r [0 1 99999 199998 199999])})
+          (Tuple (ok (category-levels on-one "s"))
+                 {vecing (cells-ref (: (ok (column-as on-one "s")) (Cells string)) r) (:for r [0 1 99999 199998 199999])}))
+  (expect "chunks: the rows in order"
+          (loop (:for (Tuple a b) (complete-rows (Tuple (: (ok (column-as in-chunks "n")) (Cells long))
+                                                       (: (ok (column-as on-one "n")) (Cells long)))))
+                (:acc same (folding #t (and same (= a b)))))
+          #t)
+  ;; A decimal late in a column guessed as long: a later chunk does not
+  ;; read with the guessed types, and the file is read on one thread, which
+  ;; makes the column one of doubles.
+  (def late-path (path-combine (temp-dir) "bjostat-test-late.csv"))
+  (file-write-text late-path (str "n,note\n" (string-join {vecing (str (if (= i 190000) "2.5" (int->string i)) ",some text here\n")
+                                                                  (:for i (range 0 200000))} "")))
+  (def late (ok (read-csv late-path)))
+  (expect "chunks: a decimal after the guess makes the column double" (types-of late) ["n:double" "note:string"])
+  (expect "chunks: its value" (cells-ref (: (ok (column-as late "n")) (Cells double)) 190000) 2.5)
   0)
