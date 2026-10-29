@@ -1,0 +1,233 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/types.bjo — columns of bools and categories: read from CSV,
+;; read and made by loops, and kept by the operations on tables.
+;;
+;;     bjo run tests/types.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjostat table))
+(import (bjostat csv))
+(import (bjostat query))
+(import (bjostat stats))
+
+(import/extern (temp-dir (: System.IO.Path.GetTempPath (-> string))))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result TableError %a) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+(: (-> string Table))
+(defun (csv text) (ok (csv->table text)))
+
+(: (-> Table string (Vec (Option bool))))
+(defun (bools-of t name)
+  {vecing b (:for b (: (ok (column-as t name)) (Cells bool)))})
+
+(: (-> Table string (Vec (Option string))))
+(defun (strings-of t name)
+  {vecing x (:for x (: (ok (column-as t name)) (Cells string)))})
+
+(: (-> Table string (Vec (Option int))))
+(defun (codes-of t name)
+  {vecing x (:for x (ok (category-codes t name)))})
+
+(: (-> Table string))
+(defun (shown t) (table->string t #:rows 100))
+
+(: (-> (Vec string) string))
+(defun (lines ls) (string-join ls "\n"))
+
+(: (-> Table string (Vec (Option long))))
+(defun (longs-of t name)
+  {vecing x (:for x (: (ok (column-as t name)) (Cells long)))})
+
+(defun (main)
+  ;; Read
+  (def t (csv "id,paid\n1,true\n2,FALSE\n3,\n4,True\n5,false\n"))
+  (expect "a column of true and false is one of bools" (column-type t "paid") (Some Bool))
+  (expect "its cells" (bools-of t "paid") [(Some #t) (Some #f) None (Some #t) (Some #f)])
+  (expect "printed"
+          (table->string t #:rows 2)
+          (str "id    paid\n"
+               "long  bool\n"
+               "1     #t  \n"
+               "2     #f  \n"
+               "… 3 more rows\n"))
+  (expect "bools and numbers together are strings"
+          (column-type (csv "x\ntrue\n1\n") "x") (Some String))
+  (expect "a bool given by #:types"
+          (column-type (ok (csv->table "x\n\n" #:types [(Tuple "x" Bool)])) "x") (Some Bool))
+  (expect "a field that is not a bool, in a column given as one"
+          (error-of (csv->table "x\ntrue\nyes\n" #:types [(Tuple "x" Bool)]))
+          "line 3: 'yes' in column 'x' is not a bool.")
+
+  ;; Loops
+  (expect "a count of trues"
+          (loop (:for b* (: (ok (column-as t "paid")) (Cells bool)))
+                (:when-let (Some b) b*) (:when b) (:acc (counting b)))
+          2)
+  (def ids (: (ok (column-as t "id")) (Cells long)))
+  (def big (ok (table-with t "big" (loop (:for i* ids)
+                                         (:acc (column-building/option
+                                                 (match i* ((Some i) (Some (> (: i long) 2L))) (None None))))))))
+  (expect "a column of bools made by a loop" (column-type big "big") (Some Bool))
+  (expect "its cells" (bools-of big "big") [(Some #f) (Some #f) (Some #t) (Some #t) (Some #t)])
+  (def paid (: (ok (column-as t "paid")) (Cells bool)))
+  (def kept (loop (:for row (range 0 (table-row-count t))) (:for b* paid)
+                  (:when-let (Some b) b*) (:when b) (:acc (selecting t row))))
+  (expect "rows kept by a bool" (longs-of kept "id") [(Some 1L) (Some 4L)])
+
+  ;; Tables
+  (expect "sorted by a bool: false, then true, then null"
+          (longs-of (ok (table-sort t [(ascending "paid")])) "id")
+          [(Some 2L) (Some 5L) (Some 1L) (Some 4L) (Some 3L)])
+  (expect "distinct by a bool"
+          (longs-of (ok (table-distinct t #:by ["paid"])) "id") [(Some 1L) (Some 2L) (Some 3L)])
+  (expect "joined by a bool"
+          (table-row-count (ok (inner-join t (csv "paid,word\ntrue,yes\n") ["paid"]))) 2)
+  (expect "appended, with a slice"
+          (bools-of (ok (table-append [(table-slice t #:from 3) t])) "paid")
+          [(Some #t) (Some #f) (Some #t) (Some #f) None (Some #t) (Some #f)])
+  (expect "the summary: a bool is 0 or 1, and the mean is the share of trues"
+          (table->string (ok (table-select (table-summary t) ["column" "type" "count" "min" "mean" "max"]))
+                         #:digits 2)
+          (str "column  type    count  min     mean    max   \n"
+               "string  string  long   double  double  double\n"
+               "id      long    5      1       3       5     \n"
+               "paid    bool    4      0       0.5     1     \n"))
+  (def path (str (temp-dir) "bjostat-bools.arrow"))
+  (ok (write-arrow t path))
+  (expect "written and read back" (bools-of (ok (read-arrow path)) "paid") (bools-of t "paid"))
+
+  ;; Categories
+  (def sizes (csv "id,size,price\n1,medium,2.0\n2,small,1.0\n3,,5.0\n4,large,3.0\n5,small,1.5\n6,medium,4.0\n"))
+  (def by-name (ok (table-categorize sizes "size")))
+  (expect "a category" (column-type by-name "size") (Some Category))
+  (expect "its levels, in the order of the code points" (ok (category-levels by-name "size"))
+          ["large" "medium" "small"])
+  (expect "its codes" (codes-of by-name "size") [(Some 1) (Some 2) None (Some 0) (Some 2) (Some 1)])
+  (expect "its cells as strings"
+          (strings-of by-name "size")
+          [(Some "medium") (Some "small") None (Some "large") (Some "small") (Some "medium")])
+  (def ordered (ok (table-categorize sizes "size" #:levels ["small" "medium" "large"])))
+  (expect "levels given" (ok (category-levels ordered "size")) ["small" "medium" "large"])
+  (expect "printed as strings"
+          (table->string (table-slice ordered #:to 3))
+          (lines ["id    size      price "
+                  "long  category  double"
+                  "1     medium    2     "
+                  "2     small     1     "
+                  "3     null      5     "
+                  ""]))
+  (expect "sorted in the order of the levels, a null last"
+          (longs-of (ok (table-sort ordered [(ascending "size")])) "id")
+          [(Some 2L) (Some 5L) (Some 1L) (Some 6L) (Some 4L) (Some 3L)])
+  (expect "sorted down"
+          (longs-of (ok (table-sort ordered [(descending "size")])) "id")
+          [(Some 4L) (Some 1L) (Some 6L) (Some 2L) (Some 5L) (Some 3L)])
+  (expect "a string not in the levels"
+          (error-of (table-categorize sizes "size" #:levels ["small" "large"]))
+          "'medium' in row 0 of 'size' is not one of the levels.")
+  (expect "a level twice"
+          (error-of (table-categorize sizes "size" #:levels ["small" "small"]))
+          "a level is given twice.")
+  (expect "a category of numbers"
+          (error-of (table-categorize sizes "price"))
+          "'price' is a column of double; a category is made of strings.")
+  (expect "the levels of a column that is not a category"
+          (error-of (category-levels sizes "size"))
+          "'size' is a column of string, not a category.")
+  (expect "new levels for a category"
+          (codes-of (ok (table-categorize by-name "size" #:levels ["small" "medium" "large"])) "size")
+          (codes-of ordered "size"))
+  (def groups (ok (category-groups ordered "size")))
+  (def codes (ok (category-codes ordered "size")))
+  (def prices (: (ok (column-as ordered "price")) (Cells double)))
+  (expect "grouped by code, each level a group"
+          (shown (ok (loop (:for c* codes) (:for p* prices)
+                           (:when-let (Some c) c*) (:when-let (Some p) p*)
+                           (:acc total (summing-by groups (Tuple c p)))
+                           (:acc n (counting-by groups (Tuple c p)))
+                           => (groups->table groups "size" [(Tuple "total" total) (Tuple "n" n)]))))
+          (lines ["size    total   n  "
+                  "string  double  int"
+                  "small   2.5     2  "
+                  "medium  6       2  "
+                  "large   3       1  "
+                  ""]))
+  (expect "rows kept keep the category"
+          (shown (loop (:for row (range 0 (table-row-count ordered))) (:for p* prices)
+                       (:when-let (Some p) p*) (:when (> p 1.8)) (:acc (selecting ordered row))))
+          (lines ["id    size      price "
+                  "long  category  double"
+                  "1     medium    2     "
+                  "3     null      5     "
+                  "4     large     3     "
+                  "6     medium    4     "
+                  ""]))
+  (expect "distinct by a category"
+          (longs-of (ok (table-distinct ordered #:by ["size"])) "id") [(Some 1L) (Some 2L) (Some 3L) (Some 4L)])
+  (def names (ok (table-categorize (csv "size,word\nsmall,S\nlarge,L\n,none\n") "size")))
+  (expect "joined to a category of other levels"
+          (strings-of (ok (inner-join ordered names ["size"])) "word")
+          [(Some "S") (Some "none") (Some "L") (Some "S")])
+  (expect "left-joined by a category: medium has no match"
+          (strings-of (ok (left-join ordered names ["size"])) "word")
+          [None (Some "S") (Some "none") (Some "L") (Some "S") None])
+  (expect "semi-joined by a category"
+          (longs-of (ok (semi-join ordered names ["size"])) "id") [(Some 2L) (Some 3L) (Some 4L) (Some 5L)])
+  (expect "anti-joined by a category"
+          (longs-of (ok (anti-join ordered names ["size"])) "id") [(Some 1L) (Some 6L)])
+  (expect "joined by a category and a number, through the hashes"
+          (longs-of (ok (inner-join ordered (ok (table-categorize (csv "size,id\nsmall,5\nlarge,1\n") "size"))
+                                    ["size" "id"])) "id")
+          [(Some 5L)])
+  (expect "a category joined to strings"
+          (error-of (inner-join ordered sizes ["size"]))
+          "'size' is a column of category in the left table and of string in the right.")
+  (def appended (ok (table-append [ordered names (table-slice ordered #:to 0)])))
+  (expect "appended to a category of other levels: the levels of both"
+          (ok (category-levels appended "size")) ["small" "medium" "large"])
+  (expect "appended: the strings"
+          (strings-of appended "size")
+          [(Some "medium") (Some "small") None (Some "large") (Some "small") (Some "medium")
+           (Some "small") (Some "large") None])
+  (expect "appended to strings"
+          (error-of (table-append [ordered sizes]))
+          "'size' is a column of category in one table and of string in another.")
+  (expect "appended to a table without the column"
+          (strings-of (ok (table-append [(ok (table-select ordered ["id"])) ordered])) "size")
+          [None None None None None None
+           (Some "medium") (Some "small") None (Some "large") (Some "small") (Some "medium")])
+  (expect "appended, levels in the order they come"
+          (ok (category-levels (ok (table-append [names ordered])) "size")) ["large" "small" "medium"])
+  (def wide (ok (pivot-wider (ok (table-select (table-slice ordered #:from 3) ["id" "size" "price"]))
+                             #:names-from "size" #:values-from "price")))
+  (expect "pivot-wider: names from a category"
+          (table-names wide) ["id" "large" "small" "medium"])
+  (expect "pivot-longer of categories"
+          (strings-of (ok (pivot-longer (ok (table-select ordered ["size"])) ["size"])) "value")
+          (strings-of ordered "size"))
+  (expect "a category given by #:types"
+          (column-type (ok (csv->table "size\nsmall\nlarge\n" #:types [(Tuple "size" Category)])) "size")
+          (Some Category))
+  (def cpath (str (temp-dir) "bjostat-categories.arrow"))
+  (ok (write-arrow ordered cpath))
+  (def back (ok (read-arrow cpath)))
+  (expect "a category written and read back" (strings-of back "size") (strings-of ordered "size"))
+  (expect "its levels too" (ok (category-levels back "size")) ["small" "medium" "large"])
+  0)

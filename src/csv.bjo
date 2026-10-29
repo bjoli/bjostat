@@ -54,11 +54,12 @@
 (: int) (def kind-date 5)
 (: int) (def kind-datetime 6)
 (: int) (def kind-instant 7)
+(: int) (def kind-bool 8)
 
 (: (-> int string))
 (defun (kind-name k)
   (match k (0 "long") (1 "double") (2 "string") (3 "int") (4 "float")
-           (5 "date") (6 "datetime") (_ "instant")))
+           (5 "date") (6 "datetime") (7 "instant") (_ "bool")))
 
 (: (-> ColumnType (Option int)))
 (defun (kind-of-type t)
@@ -71,6 +72,9 @@
     (Dates (Some kind-date))
     (DateTimes (Some kind-datetime))
     (Instants (Some kind-instant))
+    (Bool (Some kind-bool))
+    ;; Read as strings, then made a category.
+    (Category (Some kind-string))
     ((Other _) None)))
 
 (: (-> string (Result TableError %a)))
@@ -138,8 +142,23 @@
      (def cols (vec->array (vec-map make-column kinds)))
      (def (Ok _) (add-held! cols guessed shape rows) :propagate)
      (def (Ok _) (if more? (add-rest! rd cols guessed shape) (Ok unit)) :propagate)
-     (make-table {vecing (named-any (array-ref names i) (build-column (array-ref cols i)))
-                         (:for i (range 0 (array-length names)))}))))
+     (def (Ok read) (make-table {vecing (named-any (array-ref names i) (build-column (array-ref cols i)))
+                                        (:for i (range 0 (array-length names)))})
+       :propagate)
+     (categorized read types))))
+
+;; The table with each column that `#:types` gives as Category made one.
+(: (-> Table (Vec (Tuple string ColumnType)) (Result TableError Table)))
+(defun (categorized t types)
+  (let loop ((i 0) (t t))
+    (if (= i (vec-length types))
+        (Ok t)
+        (match (vec-ref types i)
+          ((Tuple name Category)
+           (match (table-categorize t name)
+             ((Ok t2) (loop (+ i 1) t2))
+             ((Err e) (Err e))))
+          (_ (loop (+ i 1) t))))))
 
 ;; The kind `#:types` gives each column, or None. A name that is not a
 ;; column, and a type a CSV column cannot be, are errors.
@@ -153,7 +172,7 @@
                   (string-join (array->vec names) ", ") ".")))
     ((Tuple _ (Some p))
      (refuse (str "#:types gives '" (fst p) "' the type " (displayed (snd p))
-                  ", and a CSV column can be int, long, float, double, string, date, datetime or instant.")))
+                  ", and a CSV column can be int, long, float, double, string, bool, category, date, datetime or instant.")))
     (_ (Ok {vecing (match (find (fun (p) (= (fst p) name)) types)
                      ((Some p) (kind-of-type (snd p)))
                      (None None))

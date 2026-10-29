@@ -1,0 +1,181 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/reshape.bjo — distinct rows, tables appended, and the two
+;; pivots, against what dplyr and tidyr give.
+;;
+;;     bjo run tests/reshape.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjostat table))
+(import (bjostat csv))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result TableError %a) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+(: (-> string Table))
+(defun (csv text) (ok (csv->table text)))
+
+;; The table as text, all its rows.
+(: (-> Table string))
+(defun (shown t) (table->string t #:rows 100))
+
+(: (-> (Vec string) string))
+(defun (lines ls) (string-join ls "\n"))
+
+(defun (main)
+  ;; Distinct
+  (def visits (csv "who,day,n\nann,1,10\nbob,1,20\nann,1,10\nann,2,30\n,1,40\n,1,40\nbob,1,50\n"))
+  (expect "distinct: the rows with no copy, in order"
+          (shown (ok (table-distinct visits)))
+          (lines ["who     day   n   "
+                  "string  long  long"
+                  "ann     1     10  "
+                  "bob     1     20  "
+                  "ann     2     30  "
+                  "null    1     40  "
+                  "bob     1     50  "
+                  ""]))
+  (expect "distinct by keys: the first row of each, all its columns"
+          (shown (ok (table-distinct visits #:by ["who" "day"])))
+          (lines ["who     day   n   "
+                  "string  long  long"
+                  "ann     1     10  "
+                  "bob     1     20  "
+                  "ann     2     30  "
+                  "null    1     40  "
+                  ""]))
+  (expect "distinct of a table with no row twice is the table"
+          (table-row-count (ok (table-distinct (table-slice visits #:to 2)))) 2)
+  (expect "distinct of no rows"
+          (table-row-count (ok (table-distinct (table-slice visits #:to 0)))) 0)
+  (expect "distinct of a slice"
+          (shown (ok (table-distinct (table-slice visits #:from 2 #:to 6) #:by ["who"])))
+          (lines ["who     day   n   "
+                  "string  long  long"
+                  "ann     1     10  "
+                  "null    1     40  "
+                  ""]))
+  (expect "distinct: NaNs are equal, and so are 0 and -0"
+          (table-row-count (ok (table-distinct (csv "x\nNaN\n0.0\nNaN\n-0.0\n1.5\n")))) 3)
+  (expect "distinct: a key that is not there"
+          (error-of (table-distinct visits #:by ["day" "when"]))
+          "the table has no column 'when'. Its columns are: who, day, n.")
+  (expect "distinct: a key named twice"
+          (error-of (table-distinct visits #:by ["day" "day"]))
+          "a key is named twice.")
+
+  ;; Append
+  (def first (csv "id,price\n1,2.5\n2,3.5\n"))
+  (def second (csv "price,id,note\n4.5,3,new\n"))
+  (expect "append: by name, new columns after, nulls where a table has none"
+          (shown (ok (table-append [first second first])))
+          (lines ["id    price   note  "
+                  "long  double  string"
+                  "1     2.5     null  "
+                  "2     3.5     null  "
+                  "3     4.5     new   "
+                  "1     2.5     null  "
+                  "2     3.5     null  "
+                  ""]))
+  (expect "append: slices"
+          (shown (ok (table-append [(table-slice first #:from 1) (table-slice first #:to 1)])))
+          (lines ["id    price "
+                  "long  double"
+                  "2     3.5   "
+                  "1     2.5   "
+                  ""]))
+  (expect "append: empty tables"
+          (table-row-count (ok (table-append [(table-slice first #:to 0) second (table-slice second #:to 0)]))) 1)
+  (def holes (csv "day,n,name\n2025-01-02,1,a\n,,\n2025-03-04,3,ccc\n2025-05-06,,dd\n"))
+  (expect "append: slices with nulls, dates and strings"
+          (shown (ok (table-append [(table-slice holes #:from 1) holes (table-slice holes #:from 3)])))
+          (lines ["day         n     name  "
+                  "date        long  string"
+                  "null        null  null  "
+                  "2025-03-04  3     ccc   "
+                  "2025-05-06  null  dd    "
+                  "2025-01-02  1     a     "
+                  "null        null  null  "
+                  "2025-03-04  3     ccc   "
+                  "2025-05-06  null  dd    "
+                  "2025-05-06  null  dd    "
+                  ""]))
+  (expect "append: one table" (shown (ok (table-append [second]))) (shown second))
+  (expect "append: no table" (table-column-count (ok (table-append []))) 0)
+  (expect "append: a column of two types"
+          (error-of (table-append [first (csv "id,price\nx,1.0\n")]))
+          "'id' is a column of long in one table and of string in another.")
+
+  ;; Pivot longer
+  (def wide (csv "country,2024,2025\nNorway,10,12\nSpain,7,\n"))
+  (def long-table (ok (pivot-longer wide ["2024" "2025"] #:names-to "year" #:values-to "sales")))
+  (expect "pivot-longer: a row for each row and column, nulls kept"
+          (shown long-table)
+          (lines ["country  year    sales"
+                  "string   string  long "
+                  "Norway   2024    10   "
+                  "Norway   2025    12   "
+                  "Spain    2024    7    "
+                  "Spain    2025    null "
+                  ""]))
+  (expect "pivot-longer: the names it gives by default"
+          (table-names (ok (pivot-longer wide ["2025"])))
+          ["country" "2024" "name" "value"])
+  (expect "pivot-longer: columns of two types"
+          (error-of (pivot-longer (csv "a,b\n1,x\n") ["a" "b"]))
+          "'a' is a column of long and 'b' of string: the values of one column have to be of one type.")
+  (expect "pivot-longer: a name that is there"
+          (error-of (pivot-longer wide ["2024"] #:names-to "country"))
+          "the table has a column 'country' already.")
+  (expect "pivot-longer: no columns"
+          (error-of (pivot-longer wide []))
+          "pivot-longer needs at least one column.")
+
+  ;; Pivot wider
+  (expect "pivot-wider undoes pivot-longer"
+          (shown (ok (pivot-wider long-table #:names-from "year" #:values-from "sales")))
+          (shown wide))
+  (def scores (csv "who,test,score\nann,math,5\nbob,art,3\nann,art,4\ncid,math,1\n"))
+  (expect "pivot-wider: columns in the order the names come, nulls for cells no row gives"
+          (shown (ok (pivot-wider scores #:names-from "test" #:values-from "score")))
+          (lines ["who     math  art "
+                  "string  long  long"
+                  "ann     5     4   "
+                  "bob     null  3   "
+                  "cid     1     null"
+                  ""]))
+  (expect "pivot-wider: no other columns, one row"
+          (shown (ok (pivot-wider (ok (table-select (table-slice scores #:to 2) ["test" "score"]))
+                                  #:names-from "test" #:values-from "score")))
+          (lines ["math  art "
+                  "long  long"
+                  "5     3   "
+                  ""]))
+  (expect "pivot-wider: two values for one cell"
+          (error-of (pivot-wider (csv "who,test,score\nann,math,5\nann,math,6\n")
+                                 #:names-from "test" #:values-from "score"))
+          "rows 0 and 1 have the same values in the other columns, and both 'math' in 'test': a cell holds one value.")
+  (expect "pivot-wider: names that are not strings"
+          (error-of (pivot-wider scores #:names-from "score" #:values-from "who"))
+          "'score' is a column of long; the names of columns have to be strings.")
+  (expect "pivot-wider: a null name"
+          (error-of (pivot-wider (csv "who,test,score\nann,,5\n") #:names-from "test" #:values-from "score"))
+          "'test' has a null in row 0, and a column needs a name.")
+  (expect "pivot-wider: a new column of a name that is there"
+          (error-of (pivot-wider (csv "who,test,score\nann,who,5\n") #:names-from "test" #:values-from "score"))
+          "the table has a column 'who' already.")
+  0)

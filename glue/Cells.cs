@@ -51,6 +51,11 @@ public sealed unsafe class Cells<T>
     private readonly Utf8String _text;
     private readonly int _textBase;
 
+    // A category: its levels, whose text is _text, and the code of each row.
+    // A cell is the slice of its level.
+    private readonly StringArray? _levels;
+    private readonly Int32Array? _codes;
+
     public readonly int Length;
     public readonly int NullCount;
 
@@ -67,6 +72,14 @@ public sealed unsafe class Cells<T>
             var offsets = strings.ValueOffsets;
             _textBase = offsets[0];
             _text = Utf8String.FromUtf8(strings.ValueBuffer.Span.Slice(_textBase, offsets[Length] - _textBase));
+        }
+        else if (array is DictionaryArray { Dictionary: StringArray levels, Indices: Int32Array codes })
+        {
+            _levels = levels;
+            _codes = codes;
+            var offsets = levels.ValueOffsets;
+            _textBase = offsets[0];
+            _text = Utf8String.FromUtf8(levels.ValueBuffer.Span.Slice(_textBase, offsets[levels.Length] - _textBase));
         }
         else if (array is not BooleanArray)
         {
@@ -92,9 +105,24 @@ public sealed unsafe class Cells<T>
     {
         if (typeof(T) == typeof(Utf8String))
         {
-            var offsets = ((StringArray)_array).ValueOffsets;
-            int from = offsets[i];
-            var s = _text.SliceBytes(from - _textBase, offsets[i + 1] - from);
+            int k = i;
+            StringArray strings;
+            if (_codes != null)
+            {
+                // The code under a null can be any; one outside the levels
+                // is the empty string.
+                k = _codes.Values[i];
+                strings = _levels!;
+                if ((uint)k >= (uint)strings.Length)
+                {
+                    var empty = Utf8String.Empty;
+                    return Unsafe.As<Utf8String, T>(ref empty);
+                }
+            }
+            else strings = (StringArray)_array;
+            var offsets = strings.ValueOffsets;
+            int from = offsets[k];
+            var s = _text.SliceBytes(from - _textBase, offsets[k + 1] - from);
             return Unsafe.As<Utf8String, T>(ref s);
         }
         if (typeof(T) == typeof(bool))
@@ -163,7 +191,7 @@ public static class CellsOps
         : typeof(T) == typeof(short) ? a is Int16Array
         : typeof(T) == typeof(byte) ? a is UInt8Array
         : typeof(T) == typeof(bool) ? a is BooleanArray
-        : typeof(T) == typeof(Utf8String) && a is StringArray;
+        : typeof(T) == typeof(Utf8String) && (a is StringArray || Categories.Is(a));
 
     /// <summary>
     /// Bjolang's name for T, for the error when a column is not of it. The

@@ -251,7 +251,14 @@
           [None None None None None])
   (expect "a key of other types"
           (error-of (inner-join orders (ok (make-table [(named "region" (array->column (vec->array [1L])))])) ["region"]))
-          "'region' is a column of utf8 in the left table and of int64 in the right.")
+          "'region' is a column of string in the left table and of long in the right.")
+  (def joined (ok (left-join orders regions ["region"])))
+  (expect "a join on a column of nulls that a left join made: a null matches a null, whatever is under it"
+          (table-row-count (ok (inner-join (ok (table-select joined ["rate"]))
+                                           (ok (make-table [(named "rate" (array->column (vec->array [0.0])
+                                                                                         #:valid (vec->array [#f])))]))
+                                           ["rate"])))
+          1)
   (expect "a key that is not there"
           (error-of (inner-join orders regions ["day"]))
           "the left table has no column 'day'.")

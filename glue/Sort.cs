@@ -35,6 +35,7 @@ public static class Sorting
     public static string Unsortable(IArrowArray a) =>
         a is DoubleArray or FloatArray or Int64Array or Int32Array or Int16Array or UInt8Array
             or StringArray or BooleanArray or Date32Array or TimestampArray
+        || Categories.Is(a)
             ? ""
             : a.Data.DataType.Name;
 
@@ -69,6 +70,8 @@ public static class Sorting
             case TimestampArray ts: PassNumbers(order, ts, descending); break;
             case StringArray s: PassStrings(order, s, descending); break;
             case BooleanArray b: PassBools(order, b, descending); break;
+            // A category is in the order of its levels: that of its codes.
+            case DictionaryArray d when Categories.Is(d): PassNumbers(order, (Int32Array)d.Indices, descending); break;
             default:
                 throw new ArgumentException($"(bjostat table): a column of {a.Data.DataType.Name} cannot be sorted by");
         }
@@ -107,22 +110,8 @@ public static class Sorting
     // order and is a number to sort by.
     private static void PassStrings(int[] order, StringArray a, bool descending)
     {
-        int n = a.Length;
-        var ids = new int[n];
-        var firsts = new List<int>();
-        var distinct = new Dictionary<int, int>(new SameString(a));
+        var ids = Categories.StringIds(a, out var firsts);
         bool nulls = a.NullCount != 0;
-        for (int r = 0; r < n; r++)
-        {
-            if (nulls && !a.IsValid(r)) continue;
-            ref int id = ref CollectionsMarshal.GetValueRefOrAddDefault(distinct, r, out bool there);
-            if (!there)
-            {
-                id = firsts.Count;
-                firsts.Add(r);
-            }
-            ids[r] = id;
-        }
         // The rank of each distinct string.
         var byBytes = firsts.ToArray();
         System.Array.Sort(byBytes, (x, y) => a.GetBytes(x).SequenceCompareTo(a.GetBytes(y)));
@@ -241,18 +230,5 @@ public static class Sorting
             (fromRows, toRows) = (toRows, fromRows);
         }
         fromRows.CopyTo(rows);
-    }
-
-    // Two rows of a column of strings are equal when their bytes are.
-    private sealed class SameString(StringArray a) : IEqualityComparer<int>
-    {
-        public bool Equals(int x, int y) => a.GetBytes(x).SequenceEqual(a.GetBytes(y));
-
-        public int GetHashCode(int r)
-        {
-            var h = new HashCode();
-            h.AddBytes(a.GetBytes(r));
-            return h.ToHashCode();
-        }
     }
 }

@@ -258,22 +258,54 @@ and statistics. Done so far:
   ~table-summary~ of a whole table. The one-pass statistics sum the
   differences from the first value; a quantile is found by selection, not
   by a sort (60 ms became 16.5).
+- *Reshaping:* ~table-distinct~ (dplyr's ~distinct~ with ~.keep_all~),
+  ~table-append~ (~bind_rows~: columns by name, nulls where a table has
+  none), ~pivot-longer~ and ~pivot-wider~ (tidyr's). Rows of equal keys are
+  found with the hashes and comparisons of the joins. A column is put after
+  another by a copy of its buffers, not of each cell as Arrow's
+  ~ArrowArrayConcatenator~ does: an append of 1M rows to 1M rows became
+  21 ms from 75, and a pivot to longer rows 22 ms from 88.
+- *Bools:* Arrow's Boolean is ~Bool~ in the schema, with cells of ~bool~;
+  CSV reads ~true~ and ~false~ (and ~TRUE~, ~True~); ~table-summary~ counts a
+  bool as 0 or 1, so its mean is the share of trues.
+- *Categories:* ~table-categorize~ makes a column of strings an Arrow
+  dictionary of int codes and string levels, as R's ~factor~: the levels
+  sorted, or given, and a string not in them an Err (R makes it NA). Its
+  cells are strings, so a loop over strings works on it unchanged;
+  ~category-codes~ gives the codes as ~(Cells int)~ and ~category-groups~
+  the groups of the levels, so that a group-by has no hash. A sort is in the
+  order of the levels; a join on one category key matches codes through an
+  array; an append of other levels has the levels of both, in order, as R's
+  ~rbind~ of factors. A null under a join key now hashes the same whatever
+  value Arrow keeps under it, which a left join could make differ before.
+  The distinct strings of a column are found by open addressing over its
+  bytes, which made a sort by a string 72 ms from 110.
 
 Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
 
 | Operation                       | bjostat    | Polars, 1 | Polars, 24 |
 |---------------------------------+------------+-----------+------------|
 | sort by a number                | 43.9–49.6 ms | 53.5 ms | 25.4 ms    |
-| sort by a string, then a number | 103 ms     | 334 ms    | 48.7 ms    |
+| sort by a string, then a number | 71.7 ms    | 341 ms    | 49.8 ms    |
 | join by a string, to 4 rows     | 75–88 ms   | 44.1 ms   | 12.9 ms    |
 | join by a long, one to one      | 116–122 ms | 105 ms    | 25.3 ms    |
 | standard deviation              | 2.49 ms    | 0.63 ms   | 0.48 ms    |
 | median                          | 16.4 ms    | 11.5 ms   | 3.0 ms     |
 | correlation                     | 2.91 ms    | 1.08 ms   | 1.31 ms    |
 | summary of the table            | 95–100 ms  | 46.8 ms   | 26.2 ms    |
+| distinct by a string and a long | 60.2 ms    | 24.8 ms   | 14.5 ms    |
+| distinct rows (all distinct)    | 126 ms     | 113 ms    | 82.3 ms    |
+| append of two tables            | 21.0 ms    | 11.3 ms   | 9.31 ms    |
+| pivot longer, two columns       | 21.8 ms    | 4.78 ms   | 4.79 ms    |
+| pivot wider, two columns        | 151 ms     | 208 ms    | 106 ms     |
+| categorize a string column      | 12.6 ms    | 13.5 ms   | 2.37 ms    |
+| group by a category, sum        | 2.20 ms    | 5.98 ms   | 1.47 ms    |
+| sort by a category, then a number | 58.4 ms  | 271 ms    | 39.0 ms    |
+| join by a category, to 4 rows   | 10.5 ms    | 26.5 ms   | 9.46 ms    |
 
-The hash of a string key is made from its bytes for each row; a column of
-few distinct strings would be faster with codes. The one-pass statistics
+The hash of a string key is made from its bytes for each row: a join by
+strings is 81–90 ms, and one by a category of the same strings 10.5 ms. A
+join by strings could find the distinct strings first, as a category does. The one-pass statistics
 are sums of doubles, which Bjolang does not vectorize unless a program asks,
 because the vector adds in another order.
 
@@ -281,18 +313,14 @@ because the vector adds in another order.
 
 In the order that lets an analysis be done from start to end:
 
-1. *Table operations:* distinct rows, tables appended by rows, and pivots
-   (longer and wider).
-2. *Column types:* categorical columns (Arrow dictionaries: a group-by or a
-   join on them is one on small ints), and booleans.
-3. *Statistics:* counts by one or two keys (R's ~table~), and a t-digest for
+1. *Statistics:* counts by one or two keys (R's ~table~), and a t-digest for
    quantiles in one pass with little memory.
-4. *Models:* ~lm~ as a collector of a QR decomposition, with coefficients,
+2. *Models:* ~lm~ as a collector of a QR decomposition, with coefficients,
    standard errors, R² and p-values; then ~glm~. A formula macro later.
-5. *Distributions and random numbers:* density, distribution, quantile and
+3. *Distributions and random numbers:* density, distribution, quantile and
    samples of the normal, t, χ², F, binomial and Poisson distributions, and
    a generator with a seed.
-6. *Plots* as Vega-Lite or SVG, and *Parquet*.
+4. *Plots* as Vega-Lite or SVG, and *Parquet*.
 
 Not from R: the recycling of short vectors, silent conversions between
 types, NA that spreads through a sum unless the collector says so, and

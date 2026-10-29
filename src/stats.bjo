@@ -279,7 +279,8 @@
        (match (record-ref s sd) ((Some sd) (str ", sd " (number-text sd))) (None ""))))
 
 ;; The values of a column of numbers as doubles, nulls left out, or None for
-;; a column of another type.
+;; a column of another type. A bool is 0 or 1, so that the mean is the share
+;; of trues, as R's mean of a logical vector.
 (: (-> Table string ColumnType (Option (Option Summary))))
 (defun (column-summary t name type)
   (match type
@@ -291,6 +292,8 @@
                       (:acc (summarizing (cast double x))))))
     (Int (Some (loop (:for x* (ok-cells (ints-of t name))) (:when-let (Some x) x*)
                      (:acc (summarizing (cast double x))))))
+    (Bool (Some (loop (:for x* (ok-cells (bools-of t name))) (:when-let (Some x) x*)
+                      (:acc (summarizing (if x 1.0 0.0))))))
     (_ None)))
 
 (: (-> (Result TableError %a) %a))
@@ -307,10 +310,12 @@
 (defun (longs-of t name) (column-as t name))
 (: (-> Table string (Result TableError (Cells int))))
 (defun (ints-of t name) (column-as t name))
+(: (-> Table string (Result TableError (Cells bool))))
+(defun (bools-of t name) (column-as t name))
 
 ;; A table with a row for each column of `t`, as R's `summary` of a data
 ;; frame: its name, its type, how many values and nulls it has, and for a
-;; column of numbers the least, the quartiles, the mean, the greatest and the
+;; column of numbers or bools the least, the quartiles, the mean, the greatest and the
 ;; standard deviation, which are null for other columns and for a column of
 ;; nulls only.
 (: (-> Table Table))

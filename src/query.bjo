@@ -33,7 +33,7 @@
   map->table table-with
 
   ;; Groups by number
-  GroupIndex group-index group-of! group-count group-keys
+  GroupIndex group-index group-of! group-count group-keys category-groups
   SummingBy summing-by CountingBy counting-by MinBy min-by MaxBy max-by
   MeanBy mean-by groups->table)
 
@@ -376,6 +376,25 @@
      (mutablemap-set! ids k g)
      (mutablevec-add! keys k)
      g)))
+
+
+;; The groups of the levels of the category `name`, in order, so that the
+;; group of a row is its code, with no hash:
+;;
+;;     (def (Ok groups) (category-groups t "region"))
+;;     (def (Ok codes) (category-codes t "region"))
+;;     (loop (:for c* codes) (:for p* price)
+;;           (:when-let (Some c) c*) (:when-let (Some p) p*)
+;;           (:acc totals (summing-by groups (Tuple c p)))
+;;           => (groups->table groups "region" [(Tuple "total" totals)]))
+;;
+;; Each level is a group, also a level that no row has.
+(: (-> Table string (Result TableError (GroupIndex string))))
+(defun (category-groups t name)
+  (def (Ok levels) (category-levels t name) :propagate)
+  (def groups (group-index))
+  (loop (:for l levels) (:do (ignore (group-of! groups l))))
+  (Ok groups))
 
 (: (-> (GroupIndex %k) int))
 (defun (group-count groups) (mutablevec-length (record-ref groups keys)))

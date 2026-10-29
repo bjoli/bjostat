@@ -47,6 +47,10 @@
   table-select table-slice
   SortKey table-sort
   inner-join left-join semi-join anti-join
+  table-distinct table-append pivot-longer pivot-wider
+
+  ;; Categories
+  table-categorize category-levels category-codes
 
   ;; Files
   read-arrow write-arrow
@@ -129,6 +133,17 @@
   (clr-join (: Bjostat.Joins.Join (-> Table Table (Array string) int Table)))
   (clr-key-problem (: Bjostat.Joins.KeyProblem (-> Table Table (Array string) string)))
 
+  ;; Reshaping. A TableProblem is a table the arguments cannot make.
+  (clr-distinct (: Bjostat.Reshape.Distinct (-> Table (Array string) Table) #:exceptions (Bjostat.TableProblem)))
+  (clr-append (: Bjostat.Reshape.Append (-> (Array Table) Table) #:exceptions (Bjostat.TableProblem)))
+  (clr-pivot-longer (: Bjostat.Reshape.PivotLonger (-> Table (Array string) string string Table)
+                       #:exceptions (Bjostat.TableProblem)))
+  (clr-pivot-wider (: Bjostat.Reshape.PivotWider (-> Table string string Table) #:exceptions (Bjostat.TableProblem)))
+  (clr-categorize (: Bjostat.Categories.Categorize (-> Table string (Array string) Table)
+                     #:exceptions (Bjostat.TableProblem)))
+  (clr-levels (: Bjostat.Categories.Levels (-> AnyColumn (Array string))))
+  (clr-codes (: Bjostat.Categories.Codes (-> AnyColumn AnyColumn)))
+
   ;; Files. Arrow reports a file it cannot read with exceptions of several
   ;; types, so every exception is an Err.
   (clr-read-file (: Bjostat.Tables.ReadFile (-> string Table) #:exceptions (System.Exception)))
@@ -151,10 +166,14 @@
 
 ;; The type of a column's values. `Dates`, `DateTimes` and `Instants` are
 ;; columns of the types Date, DateTime and Instant of (std datetime): Arrow's
-;; Date32, timestamps with no time zone, and timestamps with one. `Other` is any Arrow type this
-;; module does not take apart yet, by Arrow's name for it: Boolean, Decimal
-;; and so on. A table holds it, prints it and writes it.
-(type (: ColumnType (Union Double Float Long Int String Dates DateTimes Instants (: Other string))))
+;; Date32, timestamps with no time zone, and timestamps with one. `Bool` is
+;; Arrow's Boolean, a bit for each value; its cells are bools. `Category` is
+;; a column of strings from a small set, as R's factor: an Arrow dictionary
+;; of int codes and string levels; its cells are strings. `Other` is any
+;; Arrow type this module does not take apart yet, by Arrow's name for it:
+;; Decimal and so on. A table holds it, prints it and writes it.
+(type (: ColumnType (Union Double Float Long Int String Bool Category Dates DateTimes Instants
+                                 (: Other string))))
 
 (: (-> AnyColumn ColumnType))
 (defun (type-of-column c)
@@ -164,6 +183,8 @@
     ("Int64" Long)
     ("Int32" Int)
     ("String" String)
+    ("Boolean" Bool)
+    ("Category" Category)
     ("Date32" Dates)
     ("Timestamp" DateTimes)
     ("TimestampTz" Instants)
@@ -177,6 +198,8 @@
     (Long "long")
     (Int "int")
     (String "string")
+    (Bool "bool")
+    (Category "category")
     (Dates "date")
     (DateTimes "datetime")
     (Instants "instant")
@@ -559,6 +582,106 @@
 ;; only.
 (: (-> Table Table (Vec string) (Result TableError Table)))
 (defun (anti-join left right keys) (join left right keys 3))
+
+;; ===========================================================================
+;; Reshaping
+;; ===========================================================================
+
+;; The table of a TableProblem's result, or an Err of its message.
+(: (-> (Result System.Exception Table) (Result TableError Table)))
+(defun (problem-or r)
+  (match r
+    ((Ok t) (Ok t))
+    ((Err e) (refuse (.-Message e)))))
+
+;; The first row of each distinct value of the columns `#:by`, in the order
+;; of the rows, with all the columns, as dplyr's distinct with .keep_all.
+;; With no `#:by`, all the columns are the key, and the result has no row
+;; twice. Two nulls are equal, as in a join.
+;;
+;;     (table-distinct sales #:by ["customer"])
+(: (-> Table (#:by (Vec string)) (Result TableError Table)))
+(defun (table-distinct t #:by [])
+  (problem-or (clr-distinct t (vec->array by))))
+
+;; The rows of the tables, one table after the other, as dplyr's bind_rows.
+;; Columns are matched by name: the columns are those of the first table, then
+;; those that each next table adds, and a table without a column has nulls in
+;; it. An Err for a name with columns of two types.
+(: (-> (Vec Table) (Result TableError Table)))
+(defun (table-append tables)
+  (problem-or (clr-append (vec->array tables))))
+
+;; Columns to rows, as tidyr's pivot_longer: each row becomes one row for each
+;; of the columns `cols`, with the column's name in `#:names-to` and its value
+;; in `#:values-to`. The other columns are repeated. The columns have to be of
+;; one type.
+;;
+;;     ;; country 2024 2025  ->  country year sales
+;;     (pivot-longer t ["2024" "2025"] #:names-to "year" #:values-to "sales")
+(: (-> Table (Vec string) (#:names-to string) (#:values-to string) (Result TableError Table)))
+(defun (pivot-longer t cols #:names-to "name" #:values-to "value")
+  (problem-or (clr-pivot-longer t (vec->array cols) names-to values-to)))
+
+;; Rows to columns, as tidyr's pivot_wider: a column for each distinct string
+;; of `#:names-from`, in the order they first come, with the values of
+;; `#:values-from`. The other columns tell the rows apart: one row for each of
+;; their distinct values, in the order of the first rows. A cell that no row
+;; gives is a null. An Err for two rows with the same values in the other
+;; columns and the same name, since a cell holds one value.
+;;
+;;     ;; country year sales  ->  country 2024 2025
+;;     (pivot-wider t #:names-from "year" #:values-from "sales")
+(: (-> Table (#:names-from string) (#:values-from string) (Result TableError Table)))
+(defun (pivot-wider t #:names-from "name" #:values-from "value")
+  (problem-or (clr-pivot-wider t names-from values-from)))
+
+;; ===========================================================================
+;; Categories
+;; ===========================================================================
+;;
+;; A category is a column of strings from a small set, as R's factor: each
+;; string, a level, is kept once, and each row has the number of its level,
+;; its code. A group-by, a sort or a join on a category works on the codes.
+;; Its cells, read as strings, are its levels:
+;;
+;;     (def (Ok t2) (table-categorize t "region"))
+;;     (loop (:for r* (: (ok (column-as t2 "region")) (Cells string))) ...)
+;;
+;; A sort of a category is in the order of its levels, as in R.
+
+;; The table with the column `name` a category. With no `#:levels`, the
+;; levels are its distinct strings in the order of their code points, as R's
+;; factor gives them; with `#:levels`, they are those, in that order, and a
+;; string that is not one of them is an Err rather than a null, as it would
+;; be in R. A null stays a null. A category is given new levels the same way.
+;;
+;;     (table-categorize t "size" #:levels ["small" "medium" "large"])
+(: (-> Table string (#:levels (Vec string)) (Result TableError Table)))
+(defun (table-categorize t name #:levels [])
+  (problem-or (clr-categorize t name (vec->array levels))))
+
+(: (-> Table string (Result TableError AnyColumn)))
+(defun (find-category t name)
+  (def (Ok c) (find-column t name) :propagate)
+  (match (type-of-column c)
+    (Category (Ok c))
+    (other (refuse (str "'" name "' is a column of " (type-text other) ", not a category.")))))
+
+;; The levels of the category `name`, in order: level `i` has code `i`.
+(: (-> Table string (Result TableError (Vec string))))
+(defun (category-levels t name)
+  (def (Ok c) (find-category t name) :propagate)
+  (Ok (array->vec (clr-levels c))))
+
+;; The codes of the category `name`, as cells of ints, None at a null. A loop
+;; over them reads ints from one span, which Bjolang can vectorize.
+(: (-> Table string (Result TableError (Cells int))))
+(defun (category-codes t name)
+  (def (Ok c) (find-category t name) :propagate)
+  (match (clr-cells-of (clr-codes c))
+    ((Some cells) (Ok (Cells (clr cells))))
+    (None (refuse (str "the codes of '" name "' are not ints.")))))
 
 ;; ===========================================================================
 ;; Files

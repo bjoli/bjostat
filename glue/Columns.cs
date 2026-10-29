@@ -27,7 +27,9 @@ public static partial class Columns
 
     /// <summary>The name of the Arrow type id: Double, Int64, String and so on.</summary>
     public static string TypeName(IArrowArray a) =>
-        a.Data.DataType is TimestampType { Timezone: not (null or "") } ? "TimestampTz" : a.Data.DataType.TypeId.ToString();
+        a.Data.DataType is TimestampType { Timezone: not (null or "") } ? "TimestampTz"
+        : Categories.Is(a) ? "Category"
+        : a.Data.DataType.TypeId.ToString();
 
     public static int Length(IArrowArray a) => a.Length;
 
@@ -216,6 +218,7 @@ public static partial class Columns
             // ISO 8601, as (std datetime) writes them.
             Date32Array d => DateOnly.FromDayNumber(d.GetValue(i)!.Value + TimeKind.EpochDayNumber).ToString("yyyy-MM-dd", c),
             TimestampArray t => TimestampText(t, i),
+            DictionaryArray d when Categories.Is(d) => System.Text.Encoding.UTF8.GetString(Categories.LevelBytes(d, i)),
             _ => "<" + a.Data.DataType.Name + ">",
         };
     }

@@ -50,3 +50,22 @@ bench("standard deviation", lambda: df["price"].std())
 bench("median", lambda: df["price"].median())
 bench("correlation", lambda: df.select(pl.corr("price", "qty")).item())
 bench("summary of the table", lambda: df.describe().height)
+two_prices = df.select("id", "price", pl.col("price").alias("price2"))
+prices_long = two_prices.unpivot(["price", "price2"], index="id", variable_name="name", value_name="value")
+with pl.StringCache():
+    by_codes = df.with_columns(pl.col("region").cast(pl.Categorical))
+    rates_codes = rates.with_columns(pl.col("region").cast(pl.Categorical))
+    bench("categorize a string column", lambda: df.with_columns(pl.col("region").cast(pl.Categorical)).height)
+    bench("group by category, sum", lambda: by_codes.group_by("region").agg(pl.col("price").sum()).height)
+    bench("sort by a category, then a number",
+          lambda: by_codes.sort(["region", "price"], descending=[False, True], maintain_order=True).height)
+    bench("join by a category to 4 rows",
+          lambda: by_codes.join(rates_codes, on="region", how="inner", maintain_order="left").height)
+bench("distinct by a string and a long",
+      lambda: df.unique(subset=["region", "qty"], keep="first", maintain_order=True).height)
+bench("distinct rows", lambda: df.unique(keep="first", maintain_order=True).height)
+bench("append, two tables", lambda: pl.concat([df, df], rechunk=True).height)
+bench("pivot longer, two columns",
+      lambda: two_prices.unpivot(["price", "price2"], index="id", variable_name="name", value_name="value").height)
+bench("pivot wider, two columns",
+      lambda: prices_long.pivot(on="name", index="id", values="value", maintain_order=True).height)

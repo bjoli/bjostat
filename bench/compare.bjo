@@ -144,4 +144,40 @@
 (def/bench "sort by a string, then a number"
   (table-row-count (ok (table-sort t [(ascending "region") (descending "price")]))))
 
+;; Reshaping: distinct rows, two copies of the table one after the other,
+;; and the two prices of each id as rows, then back as columns.
+(: Table)
+(def two-prices
+  (ok (table-with (ok (table-select t ["id" "price"])) "price2"
+                  (loop (:for p* price) (:acc (column-building/option (: p* (Option double))))))))
+(: Table)
+(def prices-long (ok (pivot-longer two-prices ["price" "price2"])))
+
+(def/bench "distinct by a string and a long" (table-row-count (ok (table-distinct t #:by ["region" "qty"]))))
+(def/bench "distinct rows" (table-row-count (ok (table-distinct t))))
+(def/bench "append, two tables" (table-row-count (ok (table-append [t t]))))
+(def/bench "pivot longer, two columns" (table-row-count (ok (pivot-longer two-prices ["price" "price2"]))))
+(def/bench "pivot wider, two columns" (table-row-count (ok (pivot-wider prices-long))))
+
+;; Categories: the region as codes and levels.
+(: Table)
+(def by-codes (ok (table-categorize t "region")))
+(: Table)
+(def region-rates-codes (ok (table-categorize region-rates "region")))
+
+(: (-> Table))
+(defun (by-category)
+  (def groups (ok (category-groups by-codes "region")))
+  (ok (loop (:for c* (ok (category-codes by-codes "region"))) (:for p* price)
+            (:when-let (Some c) c*) (:when-let (Some p) p*)
+            (:acc sums (summing-by groups (Tuple c p)))
+            => (groups->table groups "region" [(Tuple "price" sums)]))))
+
+(def/bench "categorize a string column" (table-row-count (ok (table-categorize t "region"))))
+(def/bench "group by category, sum" (table-row-count (by-category)))
+(def/bench "sort by a category, then a number"
+  (table-row-count (ok (table-sort by-codes [(ascending "region") (descending "price")]))))
+(def/bench "join by a category to 4 rows"
+  (table-row-count (ok (inner-join by-codes region-rates-codes ["region"]))))
+
 (run-benches)

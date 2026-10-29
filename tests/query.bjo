@@ -82,7 +82,7 @@
   (expect "a column replaced, in its place" (table-names relabelled) ["region" "price" "qty" "day"])
   (expect "its values" (texts relabelled "region") ["north!" "south!" "north!" "east!" "null"])
   (def flagged (ok (create-column sales "dear" (col "price") (fun (p) (> p 15.0)))))
-  (expect "a column of bool" (column-type flagged "dear") (Some (Other "Boolean")))
+  (expect "a column of bool" (column-type flagged "dear") (Some Bool))
   (expect "a step after a step"
           (table-row-count (ok (where-rows with-revenue (col "revenue") (fun (r) (> r 25.0)))))
           2)

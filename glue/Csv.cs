@@ -50,6 +50,9 @@ public sealed class CsvColumn
     public const int Date = 5;
     public const int DateTime = 6;
     public const int Instant = 7;
+    // true or false, as R and Python write them: true, TRUE, True, and the
+    // same of false.
+    public const int Bool = 8;
 
     private int _kind;
     private int _count;
@@ -63,6 +66,8 @@ public sealed class CsvColumn
     private byte[]? _bytes;
     private int _byteCount;
     private int[]? _ends;
+    // A bool is a byte, 0 or 1, until the column is built as bits.
+    private byte[]? _bools;
 
     // A bit for each value, 1 when it is valid. Null until the first null.
     private byte[]? _valid;
@@ -82,6 +87,7 @@ public sealed class CsvColumn
             case Instant: _longs = Rent<long>(FirstCapacity); break;
             case Float: _floats = Rent<float>(FirstCapacity); break;
             case Double: _doubles = Rent<double>(FirstCapacity); break;
+            case Bool: _bools = Rent<byte>(FirstCapacity); break;
             case String:
                 _bytes = Rent<byte>(FirstCapacity * 8);
                 _ends = Rent<int>(FirstCapacity);
@@ -128,6 +134,10 @@ public sealed class CsvColumn
                 if (!TryTimestamp(s, out long micros, out bool zoned) || zoned != (_kind == Instant)) return false;
                 Put(ref _longs!, micros);
                 break;
+            case Bool:
+                if (!TryBool(s, out bool b)) return false;
+                Put(ref _bools!, b ? (byte)1 : (byte)0);
+                break;
             default:
                 PutBytes(s);
                 break;
@@ -149,6 +159,7 @@ public sealed class CsvColumn
             case Instant: Put(ref _longs!, 0L); break;
             case Float: Put(ref _floats!, 0f); break;
             case Double: Put(ref _doubles!, 0.0); break;
+            case Bool: Put(ref _bools!, (byte)0); break;
             default: PutBytes(default); break;
         }
         if (_valid == null)
@@ -220,6 +231,7 @@ public sealed class CsvColumn
             Date => Primitive(Date32Type.Default, _ints!, bitmap),
             DateTime => Primitive(TimeKind.ArrowType(TimeKind.DateTime), _longs!, bitmap),
             Instant => Primitive(TimeKind.ArrowType(TimeKind.Instant), _longs!, bitmap),
+            Bool => Bits(bitmap),
             _ => Strings(bitmap),
         };
         Release();
@@ -258,15 +270,23 @@ public sealed class CsvColumn
         if (_doubles != null) ArrayPool<double>.Shared.Return(_doubles);
         if (_bytes != null) ArrayPool<byte>.Shared.Return(_bytes);
         if (_ends != null) ArrayPool<int>.Shared.Return(_ends);
+        if (_bools != null) ArrayPool<byte>.Shared.Return(_bools);
         if (_valid != null) ArrayPool<byte>.Shared.Return(_valid);
         _ints = null; _longs = null; _floats = null; _doubles = null;
-        _bytes = null; _ends = null; _valid = null;
+        _bytes = null; _ends = null; _bools = null; _valid = null;
     }
 
     private ArrayData Primitive<T>(IArrowType type, T[] values, ArrowBuffer bitmap) where T : struct
     {
         var bytes = MemoryMarshal.AsBytes(values.AsSpan(0, _count)).ToArray();
         return new ArrayData(type, _count, _nulls, 0, new[] { bitmap, new ArrowBuffer(bytes) });
+    }
+
+    private ArrayData Bits(ArrowBuffer bitmap)
+    {
+        var bits = new byte[(_count + 7) / 8];
+        for (int i = 0; i < _count; i++) bits[i >> 3] |= (byte)(_bools![i] << (i & 7));
+        return new ArrayData(BooleanType.Default, _count, _nulls, 0, new[] { bitmap, new ArrowBuffer(bits) });
     }
 
     private ArrayData Strings(ArrowBuffer bitmap)
@@ -289,6 +309,12 @@ public sealed class CsvColumn
 
     private static bool TryLong(ReadOnlySpan<byte> s, out long value) =>
         Utf8Parser.TryParse(s, out value, out int used) && used == s.Length;
+
+    private static bool TryBool(ReadOnlySpan<byte> s, out bool value)
+    {
+        value = s.SequenceEqual("true"u8) || s.SequenceEqual("TRUE"u8) || s.SequenceEqual("True"u8);
+        return value || s.SequenceEqual("false"u8) || s.SequenceEqual("FALSE"u8) || s.SequenceEqual("False"u8);
+    }
 
     private static bool TryDouble(ReadOnlySpan<byte> s, out double value) =>
         Utf8Parser.TryParse(s, out value, out int used) && used == s.Length;
@@ -318,6 +344,7 @@ public sealed class CsvColumn
         if (s.IsEmpty) return Empty;
         if (TryLong(s, out _)) return Long;
         if (TryDouble(s, out _)) return Double;
+        if (TryBool(s, out _)) return Bool;
         if (TryDate(s, out _)) return Date;
         if (TryTimestamp(s, out _, out bool zoned)) return zoned ? Instant : DateTime;
         return String;

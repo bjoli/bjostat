@@ -30,48 +30,14 @@ public static class Joins
         var lk = keys.Select(k => left.Column(left.Schema.GetFieldIndex(k))).ToArray();
         var rk = keys.Select(k => right.Column(right.Schema.GetFieldIndex(k))).ToArray();
 
-        // The right rows by the hash of their keys: the first row of each hash,
-        // and the next row with the same hash. The rows are put in from the
-        // last, each before the ones there, so each chain is in the order of
-        // the rows.
-        int rn = right.Length;
-        var next = new int[rn];
-        var heads = new Dictionary<ulong, int>();
-        var rh = Hashes(rk, rn);
-        for (int r = rn - 1; r >= 0; r--)
-        {
-            ref int head = ref CollectionsMarshal.GetValueRefOrAddDefault(heads, rh[r], out bool there);
-            next[r] = there ? head : -1;
-            head = r;
-        }
-        var same = lk.Select((a, k) => Equality(a, rk[k])).ToArray();
-
         int ln = left.Length;
-        var lh = Hashes(lk, ln);
         var leftRows = new List<int>(ln);
         var rightRows = new List<int>(kind == 0 || kind == 1 ? ln : 0);
-        for (int l = 0; l < ln; l++)
-        {
-            bool found = false;
-            if (heads.TryGetValue(lh[l], out int r))
-            {
-                for (; r >= 0; r = next[r])
-                {
-                    if (!SameKeys(same, l, r)) continue;
-                    found = true;
-                    if (kind >= 2) break;
-                    leftRows.Add(l);
-                    rightRows.Add(r);
-                }
-            }
-            if (kind == 1 && !found)
-            {
-                leftRows.Add(l);
-                rightRows.Add(-1);
-            }
-            else if ((kind == 2 && found) || (kind == 3 && !found))
-                leftRows.Add(l);
-        }
+        if (lk.Length == 1 && lk[0] is DictionaryArray lc && rk[0] is DictionaryArray rc
+            && Categories.Is(lc) && Categories.Is(rc))
+            MatchCategories(lc, rc, kind, leftRows, rightRows);
+        else
+            MatchHashes(lk, rk, kind, leftRows, rightRows);
 
         int n = leftRows.Count;
         var lrows = leftRows.ToArray();
@@ -112,6 +78,103 @@ public static class Joins
         return new RecordBatch(schema.Build(), columns, n);
     }
 
+    // The rows that match, by the hash of their keys. The right rows are
+    // put in a hash table: the first row of each hash, and the next row with
+    // the same hash. The rows are put in from the last, each before the ones
+    // there, so each chain is in the order of the rows.
+    private static void MatchHashes(IArrowArray[] lk, IArrowArray[] rk, int kind, List<int> leftRows, List<int> rightRows)
+    {
+        int rn = rk[0].Length;
+        var next = new int[rn];
+        var heads = new Dictionary<ulong, int>();
+        var rh = Hashes(rk, rn);
+        for (int r = rn - 1; r >= 0; r--)
+        {
+            ref int head = ref CollectionsMarshal.GetValueRefOrAddDefault(heads, rh[r], out bool there);
+            next[r] = there ? head : -1;
+            head = r;
+        }
+        var same = lk.Select((a, k) => Equality(a, rk[k])).ToArray();
+
+        int ln = lk[0].Length;
+        var lh = Hashes(lk, ln);
+        for (int l = 0; l < ln; l++)
+        {
+            bool found = false;
+            if (heads.TryGetValue(lh[l], out int r))
+            {
+                for (; r >= 0; r = next[r])
+                {
+                    if (!SameKeys(same, l, r)) continue;
+                    found = true;
+                    if (kind >= 2) break;
+                    leftRows.Add(l);
+                    rightRows.Add(r);
+                }
+            }
+            Unmatched(l, found, kind, leftRows, rightRows);
+        }
+    }
+
+    // The rows that match, by one key that is a category in both tables:
+    // each right level is given the left code of the same string once, and
+    // the right rows are then in chains by left code, in an array rather than
+    // a hash table. The slot after the last code is the nulls'.
+    private static void MatchCategories(DictionaryArray left, DictionaryArray right, int kind,
+                                        List<int> leftRows, List<int> rightRows)
+    {
+        var leftLevels = (StringArray)left.Dictionary;
+        var rightLevels = (StringArray)right.Dictionary;
+        int nullSlot = leftLevels.Length;
+        var leftCode = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int c = 0; c < leftLevels.Length; c++) leftCode[leftLevels.GetString(c)] = c;
+        // -1 for a right level that the left table does not have.
+        var codeOf = new int[rightLevels.Length];
+        for (int c = 0; c < rightLevels.Length; c++)
+            codeOf[c] = leftCode.TryGetValue(rightLevels.GetString(c), out int lc) ? lc : -1;
+
+        int rn = right.Length;
+        var next = new int[rn];
+        var heads = new int[nullSlot + 1];
+        System.Array.Fill(heads, -1);
+        var rcodes = ((Int32Array)right.Indices).Values;
+        for (int r = rn - 1; r >= 0; r--)
+        {
+            int slot = right.IsNull(r) ? nullSlot : codeOf[rcodes[r]];
+            if (slot < 0) continue;
+            next[r] = heads[slot];
+            heads[slot] = r;
+        }
+
+        int ln = left.Length;
+        var lcodes = ((Int32Array)left.Indices).Values;
+        bool nulls = left.NullCount != 0;
+        for (int l = 0; l < ln; l++)
+        {
+            int r = heads[nulls && left.IsNull(l) ? nullSlot : lcodes[l]];
+            bool found = r >= 0;
+            if (kind < 2)
+                for (; r >= 0; r = next[r])
+                {
+                    leftRows.Add(l);
+                    rightRows.Add(r);
+                }
+            Unmatched(l, found, kind, leftRows, rightRows);
+        }
+    }
+
+    // A left row with no match in a left join, or one a semi or anti join keeps.
+    private static void Unmatched(int l, bool found, int kind, List<int> leftRows, List<int> rightRows)
+    {
+        if (kind == 1 && !found)
+        {
+            leftRows.Add(l);
+            rightRows.Add(-1);
+        }
+        else if ((kind == 2 && found) || (kind == 3 && !found))
+            leftRows.Add(l);
+    }
+
     /// <summary>
     /// The text of the first problem with the keys, or the empty string: a key
     /// that a table does not have, a key of other types in the two tables, a
@@ -128,63 +191,83 @@ public static class Joins
             if (ri < 0) return $"the right table has no column '{k}'.";
             var lt = left.Schema.GetFieldByIndex(li).DataType;
             var rt = right.Schema.GetFieldByIndex(ri).DataType;
-            if (!KeyType(lt)) return $"'{k}' is a column of {lt.Name}, which cannot be a key.";
-            if (!SameType(lt, rt)) return $"'{k}' is a column of {lt.Name} in the left table and of {rt.Name} in the right.";
+            if (!KeyType(lt)) return $"'{k}' is a column of {Reshape.TypeText(lt)}, which cannot be a key.";
+            if (!SameType(lt, rt))
+                return $"'{k}' is a column of {Reshape.TypeText(lt)} in the left table and of {Reshape.TypeText(rt)} in the right.";
         }
         return "";
     }
 
-    private static bool KeyType(IArrowType t) =>
+    internal static bool KeyType(IArrowType t) =>
         t is DoubleType or FloatType or Int64Type or Int32Type or Int16Type or UInt8Type
-            or StringType or BooleanType or Date32Type or TimestampType;
+            or StringType or BooleanType or Date32Type or TimestampType
+        || Categories.IsType(t);
 
-    private static bool SameType(IArrowType a, IArrowType b) =>
+    internal static bool SameType(IArrowType a, IArrowType b) =>
         a.TypeId == b.TypeId
-        && (a is not TimestampType ta || b is TimestampType tb && ta.Unit == tb.Unit && ta.Timezone == tb.Timezone);
+        && (a is not TimestampType ta || b is TimestampType tb && ta.Unit == tb.Unit && ta.Timezone == tb.Timezone)
+        && (a is not DictionaryType || Categories.IsType(a) && Categories.IsType(b));
 
     // The hash of each row's keys. A null and a NaN each have one hash, and
     // -0.0 has that of 0.0, since they are equal keys.
-    private static ulong[] Hashes(IArrowArray[] keys, int n)
+    internal static ulong[] Hashes(IArrowArray[] keys, int n)
     {
         var h = new ulong[n];
         System.Array.Fill(h, 14695981039346656037UL);
+        // The value of each row in one key, then mixed into its hash.
+        var v = new ulong[n];
         foreach (var a in keys)
         {
             switch (a)
             {
-                case DoubleArray d: Mix(h, d.Values, x => double.IsNaN(x) ? 0x7FF8_0000_0000_0001UL : BitConverter.DoubleToUInt64Bits(x == 0.0 ? 0.0 : x)); break;
-                case FloatArray f: Mix(h, f.Values, x => float.IsNaN(x) ? 0x7FC0_0001UL : BitConverter.SingleToUInt32Bits(x == 0.0f ? 0.0f : x)); break;
-                case Int64Array l: Mix(h, l.Values, x => (ulong)x); break;
-                case Int32Array i: Mix(h, i.Values, x => (ulong)x); break;
-                case Int16Array s: Mix(h, s.Values, x => (ulong)x); break;
-                case UInt8Array b: Mix(h, b.Values, x => x); break;
-                case Date32Array d: Mix(h, d.Values, x => (ulong)x); break;
-                case TimestampArray t: Mix(h, t.Values, x => (ulong)x); break;
+                case DoubleArray d: Values(v, d.Values, x => double.IsNaN(x) ? 0x7FF8_0000_0000_0001UL : BitConverter.DoubleToUInt64Bits(x == 0.0 ? 0.0 : x)); break;
+                case FloatArray f: Values(v, f.Values, x => float.IsNaN(x) ? 0x7FC0_0001UL : BitConverter.SingleToUInt32Bits(x == 0.0f ? 0.0f : x)); break;
+                case Int64Array l: Values(v, l.Values, x => (ulong)x); break;
+                case Int32Array i: Values(v, i.Values, x => (ulong)x); break;
+                case Int16Array s: Values(v, s.Values, x => (ulong)x); break;
+                case UInt8Array b: Values(v, b.Values, x => x); break;
+                case Date32Array d: Values(v, d.Values, x => (ulong)x); break;
+                case TimestampArray t: Values(v, t.Values, x => (ulong)x); break;
                 case BooleanArray b:
-                    for (int i = 0; i < n; i++) Step(ref h[i], b.GetValue(i) == true ? 1UL : 2UL);
+                    for (int i = 0; i < n; i++) v[i] = b.GetValue(i) == true ? 1UL : 2UL;
                     break;
                 case StringArray s:
-                    for (int i = 0; i < n; i++)
-                    {
-                        var hc = new HashCode();
-                        hc.AddBytes(s.GetBytes(i));
-                        Step(ref h[i], (ulong)(uint)hc.ToHashCode() * 0x9E3779B97F4A7C15UL);
-                    }
+                    for (int i = 0; i < n; i++) v[i] = StringHash(s.GetBytes(i));
                     break;
+                case DictionaryArray { Dictionary: StringArray levels, Indices: Int32Array codes }:
+                {
+                    // The hash of each level once; a row's is that of its
+                    // level, so two categories of other levels agree.
+                    var levelHash = new ulong[levels.Length + 1];
+                    for (int l = 0; l < levels.Length; l++) levelHash[l] = StringHash(levels.GetBytes(l));
+                    var values = codes.Values;
+                    for (int i = 0; i < n; i++)
+                        v[i] = levelHash[(uint)values[i] < (uint)levels.Length ? values[i] : levels.Length];
+                    break;
+                }
                 default:
                     throw new ArgumentException($"(bjostat table): a column of {a.Data.DataType.Name} cannot be a key");
             }
-            // A null has one hash, whatever value is under it.
+            // A null has one hash, whatever value is under it: after a left
+            // join, that is the value of another row.
             if (a.NullCount != 0)
                 for (int i = 0; i < n; i++)
-                    if (a.IsNull(i)) Step(ref h[i], 0x9E3779B97F4A7C15UL);
+                    if (a.IsNull(i)) v[i] = 0x9E3779B97F4A7C15UL;
+            for (int i = 0; i < n; i++) Step(ref h[i], v[i]);
         }
         return h;
     }
 
-    private static void Mix<T>(ulong[] h, ReadOnlySpan<T> values, Func<T, ulong> value)
+    private static ulong StringHash(ReadOnlySpan<byte> bytes)
     {
-        for (int i = 0; i < h.Length; i++) Step(ref h[i], value(values[i]));
+        var hc = new HashCode();
+        hc.AddBytes(bytes);
+        return (ulong)(uint)hc.ToHashCode() * 0x9E3779B97F4A7C15UL;
+    }
+
+    private static void Values<T>(ulong[] v, ReadOnlySpan<T> values, Func<T, ulong> value)
+    {
+        for (int i = 0; i < v.Length; i++) v[i] = value(values[i]);
     }
 
     private static void Step(ref ulong h, ulong v)
@@ -193,7 +276,7 @@ public static class Joins
         h ^= h >> 29;
     }
 
-    private static bool SameKeys(Func<int, int, bool>[] same, int l, int r)
+    internal static bool SameKeys(Func<int, int, bool>[] same, int l, int r)
     {
         foreach (var f in same)
             if (!f(l, r)) return false;
@@ -202,7 +285,7 @@ public static class Joins
 
     // Whether row i of a and row j of b have the same key, two nulls and two
     // NaNs being the same.
-    private static Func<int, int, bool> Equality(IArrowArray a, IArrowArray b)
+    internal static Func<int, int, bool> Equality(IArrowArray a, IArrowArray b)
     {
         Func<int, int, bool> values = (a, b) switch
         {
@@ -216,6 +299,12 @@ public static class Joins
             (TimestampArray x, TimestampArray y) => (i, j) => x.Values[i] == y.Values[j],
             (BooleanArray x, BooleanArray y) => (i, j) => x.GetValue(i) == y.GetValue(j),
             (StringArray x, StringArray y) => (i, j) => x.GetBytes(i).SequenceEqual(y.GetBytes(j)),
+            // Two categories of the same levels compare codes; others, the
+            // levels' strings.
+            (DictionaryArray x, DictionaryArray y) when Categories.Is(x) && Categories.Is(y) =>
+                ReferenceEquals(x.Dictionary, y.Dictionary)
+                    ? CodesEqual((Int32Array)x.Indices, (Int32Array)y.Indices)
+                    : (i, j) => Categories.LevelBytes(x, i).SequenceEqual(Categories.LevelBytes(y, j)),
             _ => throw new ArgumentException($"(bjostat table): a column of {a.Data.DataType.Name} cannot be a key"),
         };
         if (a.NullCount == 0 && b.NullCount == 0) return values;
@@ -226,8 +315,11 @@ public static class Joins
         };
     }
 
+    private static Func<int, int, bool> CodesEqual(Int32Array x, Int32Array y) =>
+        (i, j) => x.Values[i] == y.Values[j];
+
     // The columns of `t` at the rows; a row of -1 is a null in each column.
-    private static IArrowArray[] TakeOrNull(RecordBatch t, int[] rows)
+    internal static IArrowArray[] TakeOrNull(RecordBatch t, int[] rows)
     {
         int n = rows.Length;
         bool missing = rows.Any(r => r < 0);
@@ -249,7 +341,7 @@ public static class Joins
     }
 
     // The column with a null at each place whose row is -1.
-    private static IArrowArray HideMissing(IArrowArray a, int[] rows)
+    internal static IArrowArray HideMissing(IArrowArray a, int[] rows)
     {
         var data = a.Data;
         var bits = new byte[(rows.Length + 7) / 8];
@@ -265,8 +357,9 @@ public static class Joins
     }
 
     // A column of n nulls of the type.
-    private static IArrowArray Nulls(IArrowType type, int n)
+    internal static IArrowArray Nulls(IArrowType type, int n)
     {
+        if (Categories.IsType(type)) return Categories.Nulls(n);
         var bits = new ArrowBuffer(new byte[(n + 7) / 8]);
         ArrayData data = type switch
         {

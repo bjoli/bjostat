@@ -80,6 +80,11 @@ public static class Query
             BooleanType => new ArrayData(data.DataType, rows.Length, nulls, 0,
                 new[] { bitmap, TakeBits(data.Buffers[1].Span, data.Offset, data.Length, rows) }),
             StringType or BinaryType => TakeBinary(data, rows, nulls, bitmap),
+            // A category: its codes, with the same levels. A DictionaryType
+            // is a FixedWidthType too, so this comes first.
+            DictionaryType { IndexType: FixedWidthType iw } when iw.BitWidth % 8 == 0 => new ArrayData(data.DataType, rows.Length, nulls, 0,
+                new[] { bitmap, TakeFixed(data.Buffers[1].Span, data.Offset, data.Length, iw.BitWidth / 8, rows) },
+                null, data.Dictionary),
             FixedWidthType fw when fw.BitWidth % 8 == 0 => new ArrayData(data.DataType, rows.Length, nulls, 0,
                 new[] { bitmap, TakeFixed(data.Buffers[1].Span, data.Offset, data.Length, fw.BitWidth / 8, rows) }),
             _ => TakeBySlices(a, rows).Data,
