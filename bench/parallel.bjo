@@ -2,18 +2,29 @@
 ;; License, v. 2.0. If a copy of the MPL was not distributed with this
 ;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-;; bjostat/bench/parallel.bjo — a loop over parts of a table, each a fiber
-;; of Bjolang's pool, against the same loop on one thread: the sum of
-;; price × qty of 1 000 000 rows. A prototype for the plan's parallel loops.
+;; bjostat/bench/parallel.bjo — a loop over parts of a table on several
+;; cores, against the same loop on one thread: the sum of price × qty of
+;; 1 000 000 rows. A prototype for the plan's parallel loops.
 ;;
 ;;     bjo bench bench/parallel.bjo --all
 ;;
-;; Do not start the fibers from a module-level def: they read the module's
+;; Each part is a slice of the table (table-slice, no copy). Three ways to
+;; run the parts:
+;; - A, fibers that compute: fast, and wrong. Fibers run on Bjolang's run
+;;   queues, one pump for each core; a fiber that computes holds a pump, and
+;;   the fibers queued behind it wait.
+;; - B, spawn/thread: a thread of its own for each part, which costs more to
+;;   make than a part of a millisecond takes.
+;; - C, blocking: a Task of .NET's pool, as an event. A fiber for each part
+;;   waits for its event, suspended, so no pump is held. This is the way.
+;;
+;; Do not start the parts from a module-level def: they read the module's
 ;; values while the module is set up, and wait for it, as it waits for them.
 
 (import (std prelude))
 (import (std bench))
 (import (bjostat table))
+
 
 (: int) (def rows 1000000)
 
@@ -25,7 +36,6 @@
     ((Ok t) t)
     ((Err e) (panic! (displayed e)))))
 
-;; The sum of price × qty of a table: the loop each part runs.
 (: (-> Table double))
 (defun (revenue u)
   (def price (: (match (column-as u "price") ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells double)))
@@ -33,29 +43,49 @@
   (loop (:for p* price) (:for q* qty) (:when-let (Some p) p*) (:when-let (Some q) q*)
         (:acc (summing (* p (cast double q))))))
 
-;; The same, in `parts` slices of the table, each a fiber of the pool, and
-;; the partial sums added in the order of the slices.
-(: (-> int double))
-(defun (revenue/parallel parts)
+(: (-> int int Table))
+(defun (part parts k)
   (def size (/ (+ rows (- parts 1)) parts))
-  (with-scope
-    (def promises
-      {vecing (spawn-thunk (fun () (revenue (table-slice t #:from (* k size) #:to (min rows (* (+ k 1) size))))))
-              (:for k (range 0 parts))})
-    (loop (:for p promises) (:acc (summing (joined p))))))
+  (table-slice t #:from (* k size) #:to (min rows (* (+ k 1) size))))
 
-;; The value of a promise: parked for in ordinary code, suspended for in a
-;; fiber, where parking would hold a thread of the pool.
+(: (-> (Result Exception double) double))
+(defun (ok-sum r) (match r ((Ok v) v) ((Err e) (raise e))))
+
 (: (-> (Promise %a) %a))
 (defun (joined p)
   (by-colour (#:sync (promise-join/sync p))
              (#:bjo (match (sync (promise-join p)) ((Ok v) v) ((Err e) (raise e))))))
 
+;; A: each part a fiber that computes: it holds a pump of the run queues.
+(: (-> int double))
+(defun (on-fibers parts)
+  (with-scope
+    (def ps {vecing (spawn-thunk (fun () (revenue (part parts k)))) (:for k (range 0 parts))})
+    (loop (:for p ps) (:acc (summing (joined p))))))
+
+;; B: each part on a thread of its own, spawn/thread; a fiber for each waits
+;; for its event, suspended.
+(: (-> int double))
+(defun (on-threads parts)
+  (with-scope
+    (def ps {vecing (bjo (sync (spawn/thread (fun () (revenue (part parts k)))))) (:for k (range 0 parts))})
+    (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
+
+;; C: each part a Task of .NET's pool, by blocking, which is an event; a
+;; fiber for each waits for it, suspended. No pump is held.
+(: (-> int double))
+(defun (on-pool parts)
+  (with-scope
+    (def ps {vecing (bjo (sync (blocking (fun () (revenue (part parts k))))))
+                    (:for k (range 0 parts))})
+    (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
+
 (def/bench "1 thread" (revenue t))
-(def/bench "2 parts" (revenue/parallel 2))
-(def/bench "4 parts" (revenue/parallel 4))
-(def/bench "8 parts" (revenue/parallel 8))
-(def/bench "12 parts" (revenue/parallel 12))
-(def/bench "24 parts" (revenue/parallel 24))
+(def/bench "fibers, 8 parts" (on-fibers 8))
+(def/bench "spawn/thread, 8 parts" (on-threads 8))
+(def/bench "blocking, 8 parts" (on-pool 8))
+(def/bench "fibers, 12 parts" (on-fibers 12))
+(def/bench "spawn/thread, 12 parts" (on-threads 12))
+(def/bench "blocking, 12 parts" (on-pool 12))
 
 (run-benches)

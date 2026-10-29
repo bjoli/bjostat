@@ -434,23 +434,33 @@ loops before anything else, as they change the Collector trait:
 1. *Parallel loops.* Polars on 24 threads is 3 to 10 times faster than
    every library on one, and bjostat has no way to use a second core. A
    prototype, bench/parallel.bjo, cuts a table into slices
-   (~table-slice~, no copy), runs the same loop on each slice as a fiber
-   (~spawn-thunk~ in a ~with-scope~), and adds the partial sums in the
-   order of the slices. The sum of price × qty of 1M rows (measured): 2.49
-   ms on one thread, 1.43 ms in 2 parts, 0.76 in 4, 0.48 in 8, 0.44 in 12
-   and 0.54 in 24; from 8 parts on, memory is the limit.
+   (~table-slice~, no copy), runs the same loop on each slice, and adds the
+   partial sums in the order of the slices.
 
-   How it fits Bjolang's CML: the parts are fibers of the pool that runs
-   every other fiber of the program, on real threads. So a program that
-   already runs many fibers, as a server does, shares the cores with the
-   parts instead of having more threads than cores; a scope waits for the
-   parts and cancels them; fiber-trace sees them. ~spawn/thread~ is not
-   needed: it makes a thread of 1 MB of stack for each call, which costs
-   more than a part of a millisecond. The wait for the parts is
-   ~by-colour~: ~promise-join/sync~ in ordinary code, ~(sync
-   (promise-join p))~ in a bjoroutine, which must not park a thread of the
-   pool. With ~promise-join/sync~ alone, the benchmark, which runs its
-   bodies in fibers, hung.
+   How it fits Bjolang's CML: a part is not a fiber. Fibers run on
+   Bjolang's run queues, one pump for each core, and a fiber that computes
+   for a millisecond holds its pump while the fibers queued behind it wait.
+   A part runs off the pumps, and its end is an event, which the program
+   syncs on as on any other: a fiber waits for it suspended, and ordinary
+   code parks. The sum of price × qty of 1M rows (measured, the median of
+   20; one thread 2.54 ms):
+
+   | Each part                                   | 8 parts | 12 parts |
+   |---------------------------------------------+---------+----------|
+   | a fiber that computes (holds a pump; wrong) | 0.49 ms | 0.47 ms  |
+   | ~spawn/thread~, a new thread                | 1.25 ms | 1.50 ms  |
+   | ~blocking~, a Task of .NET's pool           | 0.52 ms | 0.51 ms  |
+
+   ~blocking~ is as fast as the fibers and holds no pump; ~spawn/thread~
+   makes a thread for each part, which takes longer than the part. So the
+   parts go to .NET's pool, as events. In an earlier run with fibers, 2
+   parts took 1.43 ms, 4 took 0.76, 24 took 0.54: from 8 parts on, memory
+   is the limit. Still to do: the name ~blocking~ says a call that parks,
+   not one that computes, so (bjostat) needs a function of its own for it;
+   a pool of threads of its own would keep the parts off the threads that
+   carry the pumps, which a test should measure: the latency of a fiber
+   with a timer while a parallel loop runs. A Task from the glue cannot be
+   made an event yet (see the findings below).
 
    What is to decide:
    - *Combining.* A part gives the accumulator of its collectors, and two
@@ -478,9 +488,9 @@ loops before anything else, as they change the Collector trait:
      collectors combined, needs no change in Bjolang; a ~:parallel~
      clause of the loop would be shorter and needs the compiler. Try the
      function first.
-   - *What runs it.* Fibers of the pool, as the prototype. The copy of
-     the kept columns of a filter runs on .NET's ~Parallel.For~
-     (glue/Query.cs), outside Bjolang's scheduler; it should go through
+   - *What runs it.* Tasks of .NET's pool as events, as the prototype, or
+     threads of bjostat's own. The copy of the kept columns of a filter
+     runs on .NET's ~Parallel.For~ (glue/Query.cs); it should go through
      the same parts.
 2. *Ids instead of hashes for strings and integers.* bjostat is the
    slowest of five at a group by a string (29.4 ms) and at a join by a
@@ -564,6 +574,12 @@ Still open, checked again on the vectorise branch:
   declarations: a Bjolang struct with a field ~(Column %a)~ is refused by C#,
   as Arrow's ~PrimitiveArray<T>~ needs ~where T : struct~. The glue's
   ~Cells<T>~ has no constraint for that reason.
+- A generic method of a package's C# glue that returns a ~Task<T>~ cannot
+  be imported ~#:async~: "no overload of it returns a Task or a
+  ValueTask", though it does. The example of Docs/Syntax.org,
+  ~Task.Run (-> (-> %a) %a) #:async~, fails too: only the overloads of
+  ~Run~ that are not generic are candidates. So a pool of threads in the
+  glue cannot hand its parts to ~task->event~.
 - A module-level ~def~ that starts fibers which read the module's other
   values hangs: the fibers wait for the module to be set up (its static
   constructor in .NET), and the module waits for the fibers. Found with
