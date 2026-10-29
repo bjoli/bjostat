@@ -1,6 +1,6 @@
 (package
   (name (bjostat))
-  (version "0.1.0")
+  (version "0.1.1")
   (description "Tables of data for Bjolang: Apache Arrow columns, a schema known when the program runs, and fast kernels over spans.")
   (license "MPL-2.0")
 
