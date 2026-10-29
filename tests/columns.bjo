@@ -1,0 +1,62 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/columns.bjo — the macro columns: the columns it binds, at
+;; their types, and the Errs of a column that is not there or of another
+;; type.
+;;
+;;     bjo run tests/columns.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (only (std datetime) Date date ->year))
+(import (bjostat table))
+(import (bjostat csv))
+(import (bjostat columns))
+
+(: Table)
+(def sales
+  (match (csv->table "region,price,qty,paid,first seen\nnorth,2.5,3,true,2025-01-02\nsouth,4.0,1,false,2024-06-30\n")
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))
+
+;; Each column at its type, used as such.
+(: (-> Table (Result TableError string)))
+(defun (describe t)
+  (columns t (region string) (price double) (qty long) (paid bool) (seen "first seen" date))
+  (def revenue (loop (:for p* price) (:for q* qty) (:when-let (Some p) p*) (:when-let (Some q) q*)
+                     (:acc (summing (* p (cast double q))))))
+  (def paid-count (loop (:for b* paid) (:when-let (Some b) b*) (:when b) (:acc (counting b))))
+  (def years (loop (:for d* seen) (:when-let (Some d) d*) (:acc (vecing (->year d)))))
+  (def names (loop (:for r* region) (:when-let (Some r) r*) (:acc (vecing r))))
+  (Ok (str (double->string revenue) " " (int->string paid-count) " "
+           (int->string (vec-ref years 0)) " " (vec-ref names 1))))
+
+(: (-> Table (Result TableError double)))
+(defun (missing t)
+  (columns t (price double) (cost double))
+  (Ok 0.0))
+
+(: (-> Table (Result TableError double)))
+(defun (wrong-type t)
+  (columns t (qty double))
+  (Ok 0.0))
+
+(: (-> (Result TableError %a) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+(defun (main)
+  (expect "every column at its type" (describe sales) (Ok "11.5 1 2025 south"))
+  (expect "a column that is not there"
+          (error-of (missing sales))
+          "the table has no column 'cost'. Its columns are: region, price, qty, paid, first seen.")
+  (expect "a column of another type"
+          (error-of (wrong-type sales))
+          "'qty' is a column of long, not of double.")
+  0)

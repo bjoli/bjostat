@@ -334,6 +334,13 @@ and statistics. Done so far:
   so a second loop over the rows gives R's residuals, ~hatvalues~,
   ~rstandard~ and the intervals of ~predict~, of the mean and of a new
   response. Checked against R's ~cars~ to 1e-12.
+- *Columns and categories, typed:* the macro ~columns~ of ~(bjostat
+  columns)~ takes several columns at the types written, as a ~def*~ of
+  ~column-as~ with ~:propagate~; ~with-categories~ makes any model take the
+  codes of categories as predictors of their indicators, with R's names.
+  Not a formula macro as R's ~y ~ x + z~: the types of its columns would be
+  checked when the program runs, or written in the formula, and the loop
+  says each type and what a null does.
 
 Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
 
@@ -370,17 +377,10 @@ because the vector adds in another order.
 
 In the order that lets an analysis be done from start to end:
 
-1. *Models:* not a formula macro as R's ~y ~ x + z~: the types of its columns would
-   be checked when the program runs, or written in the formula, and the
-   loop says each one and what a null does. Instead, two smaller things
-   that keep every type written: a ~columns~ macro, that only says once
-   what ~column-as~, its type and ~:propagate~ say for each column, as
-   ~(columns t (price double) (rooms long))~; and a collector that takes a
-   category's code as a predictor and makes its indicators and names.
-2. *More tests:* Wilcoxon's and Fisher's exact test, the correlation test,
+1. *More tests:* Wilcoxon's and Fisher's exact test, the correlation test,
    and an analysis of variance of a model.
-3. *Statistics:* a t-digest for quantiles in one pass with little memory.
-4. *Plots* as Vega-Lite or SVG, and *Parquet*.
+2. *Statistics:* a t-digest for quantiles in one pass with little memory.
+3. *Plots* as Vega-Lite or SVG, and *Parquet*.
 
 Not from R: the recycling of short vectors, silent conversions between
 types, NA that spreads through a sum unless the collector says so, and

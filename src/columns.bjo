@@ -1,0 +1,65 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/src/columns.bjo — the module (bjostat columns): the macro
+;; `columns`, which takes several columns of a table at their types in one
+;; form.
+;;
+;;     (columns t (price double) (rooms long) (seen "first seen" date))
+;;
+;; is the same as
+;;
+;;     (def* ((Ok price) (: (column-as t "price") (Result TableError (Cells double))) :propagate)
+;;           ((Ok rooms) (: (column-as t "rooms") (Result TableError (Cells long))) :propagate)
+;;           ((Ok seen) (date-cells t "first seen") :propagate))
+;;
+;; Nothing is guessed: each column has the type written, and is an Err of
+;; the function around it when the table has no such column or one of
+;; another type, as column-as is. A clause is (name type), whose column is
+;; named as the name, or (name "column" type). The type is that of the
+;; cells: double, float, long, int, string or bool; or date, datetime or
+;; instant, of (std datetime). The function around it returns a
+;; (Result TableError ...), and imports (bjostat table).
+;;
+;; A macro is in a module of its own, as Bjolang runs it while it compiles
+;; the modules that import it.
+
+(export columns)
+
+(import (std prelude))
+(import (std syntax-match))
+
+;; The form that reads one column, of the clause's name, column and type.
+(: (-> Syntax Syntax Syntax Syntax Syntax))
+(defun (column-binding table name column type)
+  (def kind (match type ((SSym s) (symbol->string s)) (_ "")))
+  (cond
+    ((= kind "date") #'((Ok ,name) (date-cells ,table ,column) :propagate))
+    ((= kind "datetime") #'((Ok ,name) (datetime-cells ,table ,column) :propagate))
+    ((= kind "instant") #'((Ok ,name) (instant-cells ,table ,column) :propagate))
+    ((or (= kind "double") (= kind "float") (= kind "long") (= kind "int") (= kind "string") (= kind "bool"))
+     #'((Ok ,name) (: (column-as ,table ,column) (Result TableError (Cells ,type))) :propagate))
+    (else (syntax-error type (str "columns: '" (syntax->string type) "' is not a type of cells. "
+                                  "One is double, float, long, int, string, bool, date, datetime or instant.")))))
+
+(: (-> Syntax Syntax Syntax))
+(defun (clause-binding table clause)
+  (syntax-match clause
+    ((name column type)
+     (match column
+       ((SStr _) (column-binding table name column type))
+       (_ (syntax-error clause "columns: a clause is (name type) or (name \"column\" type)."))))
+    ((name type)
+     (match name
+       ((SSym s) (column-binding table name (SStr (symbol->string s)) type))
+       (_ (syntax-error clause "columns: a clause is (name type) or (name \"column\" type)."))))
+    (bad (syntax-error bad "columns: a clause is (name type) or (name \"column\" type)."))))
+
+(def/macro (columns form inject compare)
+  (syntax-match form
+    ((_ table clause ...)
+     (if (= (length clause) 0)
+         (syntax-error form "columns takes a table and at least one clause.")
+         #'(def* ,@(loop (:for c clause) (:acc (listing (clause-binding table c)))))))
+    (bad (syntax-error bad "columns takes a table and clauses as (name type)."))))

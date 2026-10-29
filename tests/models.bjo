@@ -277,6 +277,29 @@
                          (:acc (linear-model (indicator-names "drug" sleep-levels) (Tuple y (indicators 2 code)))))))
   (expect "a category: the terms" (record-ref by-drug terms) ["(Intercept)" "drugtwo"])
   (expect "a category: the means" (all-close? (record-ref by-drug estimates) [0.75 1.58] 1e-12) #t)
+  (def drug-table (match (table-categorize
+                           (match (make-table [(named-strings "drug" (array->string-column
+                                                                       {arraying (if (< i 10) "one" "two") (:for i (range 0 20))}))
+                                               (named "extra" (array->column {arraying (match (vec-ref sleep-rows i) ((Tuple y _) y))
+                                                                                       (:for i (range 0 20))}))])
+                             ((Ok t) t) ((Err e) (panic! (displayed e))))
+                           "drug")
+                       ((Ok t) t) ((Err e) (panic! (displayed e)))))
+  (def drug-levels (match (category-levels drug-table "drug") ((Ok l) l) ((Err e) (panic! (displayed e)))))
+  (def drug-codes (match (category-codes drug-table "drug") ((Ok c) c) ((Err e) (panic! (displayed e)))))
+  (def extras (: (match (column-as drug-table "extra") ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells double)))
+  (def by-category (ok (loop (:for c* drug-codes) (:for y* extras)
+                             (:when-let (Some c) c*) (:when-let (Some y) y*)
+                             (:acc (with-categories linear-model [] [(Tuple "drug" drug-levels)] (Tuple y [] [c]))))))
+  (expect "with-categories: the model of the indicators made by hand"
+          (Tuple (record-ref by-category terms) (all-close? (record-ref by-category estimates) (record-ref by-drug estimates) 1e-14))
+          (Tuple ["(Intercept)" "drugtwo"] #t))
+  (expect "with-categories: a number and a category, of a logistic model"
+          (record-ref (glm-ok (loop (:for w wt) (:for a am) (:for i (range 0 32))
+                                    (:acc (with-categories logistic-model ["wt"] [(Tuple "cyl" ["4" "6" "8"])]
+                                                           (Tuple a [w] [(% i 3)])))))
+                      terms)
+          ["(Intercept)" "wt" "cyl6" "cyl8"])
   (expect "indicators of three levels" (Tuple (indicators 3 0) (indicators 3 2)) (Tuple [0.0 0.0] [0.0 1.0]))
 
   ;; What cannot be fitted

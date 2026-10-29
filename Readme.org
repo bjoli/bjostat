@@ -224,6 +224,26 @@ Prices rise fastest in Nigeria, 104% a year, and fall in Seychelles, -4.21%.
 Nearly two countries in three buy more than they sell. The other third,
 it seems, is very busy.
 
+** The macro (bjostat columns)
+
+~columns~ takes several columns of a table at their types in one form, so
+that each is named once:
+
+#+BEGIN_SRC scheme
+(import (bjostat columns))
+
+(columns t (price double) (qty long) (seen "first seen" date))
+;; the same as
+(def* ((Ok price) (: (column-as t "price") (Result TableError (Cells double))) :propagate)
+      ((Ok qty) (: (column-as t "qty") (Result TableError (Cells long))) :propagate)
+      ((Ok seen) (date-cells t "first seen") :propagate))
+#+END_SRC
+
+Nothing is guessed: each column has the type written, and a column the
+table does not have, or one of another type, is an ~Err~ of the function
+around it. The types are ~double~, ~float~, ~long~, ~int~, ~string~,
+~bool~, ~date~, ~datetime~ and ~instant~.
+
 ** The module (bjostat query)
 
 A query is a ~loop~ over a table's cells, with collectors for its results.
@@ -365,6 +385,12 @@ over them: ~(model-residual m y xs)~, ~(model-leverage m xs)~ (R's
       (:acc (column-building (model-residual m d [s]))))
 #+END_SRC
 
+~(with-categories linear-model ["area"] [(Tuple "region" levels)] (Tuple y [a] [code]))~
+is a model of a number and a category: each category, its name and levels,
+is a predictor of its indicators, with R's names, and each element has the
+category's code. It takes ~linear-model~, ~linear-model/origin~,
+~logistic-model~ or ~poisson-model~.
+
 ~(model-intervals m 0.95)~ is R's ~confint~, and ~(glm-intervals m 0.95)~ its
 ~confint.default~, of Wald. A category is a predictor as R makes it, a 0 or
 1 for each level but the first: ~(indicators (vec-length levels) code)~ of
@@ -415,5 +441,6 @@ bjo run tests/counts.bjo
 bjo run tests/distributions.bjo
 bjo run tests/models.bjo
 bjo run tests/hypothesis.bjo
+bjo run tests/columns.bjo
 bjo bench bench/csv.bjo --all
 #+END_SRC

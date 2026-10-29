@@ -36,6 +36,7 @@
   glm->table glm->string glm-predict
   ;; Intervals and predictors of categories
   model-intervals glm-intervals indicators indicator-names
+  WithCategories with-categories
   ;; Rows, after the fit
   model-residual model-leverage model-standardized-residual
   model-mean-interval model-prediction-interval glm-residual)
@@ -528,3 +529,48 @@
 ;; "response".
 (: (-> GeneralizedModel double (Vec double) double))
 (defun (glm-residual m y xs) (- y (glm-predict m xs)))
+
+;; Categories as predictors of any of the models above: each element is the
+;; response, the predictors of numbers, and the code of each category, and
+;; each category is a predictor of its indicators, with R's names.
+;;
+;;     (def (Ok regions) (category-levels t "region"))
+;;     (loop (:for c* (ok (category-codes t "region"))) (:for a* area) (:for y* price)
+;;           (:when-let (Some c) c*) (:when-let (Some a) a*) (:when-let (Some y) y*)
+;;           (:acc (with-categories linear-model ["area"] [(Tuple "region" regions)]
+;;                                  (Tuple y [a] [c]))))
+;;
+;; `make` is the collector's constructor of names: linear-model,
+;; linear-model/origin, logistic-model or poisson-model. Each category is its
+;; name and its levels, as category-levels gives them.
+(type (: (WithCategories %c) #:opaque (Struct (: inner %c) (: counts (Vec int)))))
+
+(: (-> (-> (Vec string) %c) (Vec string) (Vec (Tuple string (Vec string))) (WithCategories %c)))
+(defun (with-categories make names categories)
+  (def all (vec-append-all names (loop (:for (Tuple name levels) categories)
+                                      (:acc (vecing (indicator-names name levels))))))
+  (WithCategories (inner (make all))
+                  (counts (vec-map (fun (c) (vec-length (snd c))) categories))))
+
+;; The vectors one after the other.
+(: (-> (Vec %a) (Vec (Vec %a)) (Vec %a)))
+(defun (vec-append-all first rest)
+  (loop (:for v rest)
+        (:acc all (folding first (loop (:for x v) (:acc a (folding all (vec-add a x))))))))
+
+;; The predictors of numbers, then the indicators of each category's code.
+(: (-> (Vec double) (Vec int) (Vec int) (Vec double)))
+(defun (with-indicators xs codes counts)
+  (vec-append-all xs {vecing (indicators (vec-ref counts i) (vec-ref codes i)) (:for i (range 0 (vec-length codes)))}))
+
+(impl (Collector (WithCategories %c))
+  (where (Collector %c #:elem (Tuple double (Vec double))))
+  (type %elem (Tuple double (Vec double) (Vec int)))
+  (type %acc (assoc Collector acc %c))
+  (type %out (assoc Collector out %c))
+  (defun (collector-init c) (collector-init (record-ref c inner)))
+  (defun (collector-step c acc e)
+    (match e
+      ((Tuple y xs codes)
+       (collector-step (record-ref c inner) acc (Tuple y (with-indicators xs codes (record-ref c counts)))))))
+  (defun (collector-finish c acc) (collector-finish (record-ref c inner) acc)))
