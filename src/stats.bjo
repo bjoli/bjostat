@@ -322,16 +322,20 @@
 ;; frame: its name, its type, how many values and nulls it has, and for a
 ;; column of numbers or bools the least, the quartiles, the mean, the greatest and the
 ;; standard deviation, which are null for other columns and for a column of
-;; nulls only.
+;; nulls only. Each column is summarized as a part on bjostat's workers; a
+;; bjoroutine waits for them suspended.
 (: (-> Table Table))
 (defun (table-summary t)
   (def schema (table-schema t))
   (def rows (cast long (table-row-count t)))
   (def stats
-    {vecing (match (column-summary t name type)
-              ((Some s) s)
-              (None None))
-            (:for (Tuple name type) schema)})
+    (computed (computing-each (vec-length schema)
+                              (fun (k)
+                                (match (vec-ref schema k)
+                                  ((Tuple name type)
+                                   (match (column-summary t name type)
+                                     ((Some s) s)
+                                     (None None))))))))
   (def nulls {arraying (match (column-nulls t name) ((Some n) (cast long n)) (None 0L))
                        (:for (Tuple name _) schema)})
   (: (-> (-> Summary double) AnyColumn))

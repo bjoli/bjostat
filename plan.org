@@ -571,7 +571,12 @@ loops before anything else, as they change the Collector trait:
    fiber for each: 263 loops of the square roots against 213 to 225.
 
    Next (phase 1): bjostat's own operations in parts on the workers, one at
-   a time, each measured against Polars on 24 threads. Later (phase 2), the
+   a time, each measured against Polars on 24 threads. Done:
+   - ~table-summary~, a part for each column: 81.1 to 40.2 ms on the narrow
+     file (3 columns of numbers), 395 to 59.0 on the wide one (9); Polars
+     on 24 threads 25.3 and 95.1. A column is one part, so the summary
+     takes as long as its slowest column at least. (~bjo bench~ counts what
+     the measuring thread allocates, so the parts' memory is not in it.) Later (phase 2), the
    parallel loops of a program, as a clause of the loop in Bjolang's
    compiler: not yet.
 
