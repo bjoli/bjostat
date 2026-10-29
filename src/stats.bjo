@@ -7,13 +7,12 @@
 ;;
 ;; Each statistic is a collector of doubles, so it is a loop like any other:
 ;;
-;;     (loop (:for p* price) (:when-let (Some p) p*) (:acc (standard-deviation p)))
-;;     (loop (:for p* price) (:for q* qty)
-;;           (:when-let (Some p) p*) (:when-let (Some q) q*)
+;;     (loop (:for p (skip-nulls price)) (:acc (standard-deviation p)))
+;;     (loop (:for (Tuple p q) (complete-rows (Tuple price qty)))
 ;;           (:acc (correlation (Tuple p (cast double q)))))
 ;;
-;; A null is left out by the loop, with :when-let, where R would need
-;; `na.rm = TRUE`. A statistic of too few values is None: the mean of none,
+;; A null is left out by the loop, with skip-nulls, complete-rows or
+;; :when-let, where R would need `na.rm = TRUE`. A statistic of too few values is None: the mean of none,
 ;; the variance of fewer than two. The variance and the standard deviation
 ;; are those of a sample, with n - 1, as R's `var` and `sd`. The mean, the
 ;; variance and the covariance are computed in one pass, from sums of the

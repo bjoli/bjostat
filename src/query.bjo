@@ -345,8 +345,7 @@
 ;; array by that number, as Polars and DuckDB do it:
 ;;
 ;;     (def groups (group-index))
-;;     (loop (:for r* region) (:for p* price)
-;;           (:when-let (Some r) r*) (:when-let (Some p) p*)
+;;     (loop (:for (Tuple r p) (complete-rows (Tuple region price)))
 ;;           (:let g (group-of! groups r))
 ;;           (:acc totals (summing-by groups (Tuple g p)))
 ;;           (:acc counts (counting-by groups (Tuple g p)))
@@ -383,8 +382,7 @@
 ;;
 ;;     (def (Ok groups) (category-groups t "region"))
 ;;     (def (Ok codes) (category-codes t "region"))
-;;     (loop (:for c* codes) (:for p* price)
-;;           (:when-let (Some c) c*) (:when-let (Some p) p*)
+;;     (loop (:for (Tuple c p) (complete-rows (Tuple codes price)))
 ;;           (:acc totals (summing-by groups (Tuple c p)))
 ;;           => (groups->table groups "region" [(Tuple "total" totals)]))
 ;;

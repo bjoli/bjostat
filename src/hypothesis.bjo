@@ -6,9 +6,8 @@
 ;; collectors, and the chi-squared test of a table of counts, as R's t.test
 ;; and chisq.test.
 ;;
-;;     (loop (:for x* weight) (:when-let (Some x) x*) (:acc (one-sample-t-test 70.0 x)))
-;;     (loop (:for g* group) (:for x* weight)
-;;           (:when-let (Some g) g*) (:when-let (Some x) x*)
+;;     (loop (:for x (skip-nulls weight)) (:acc (one-sample-t-test 70.0 x)))
+;;     (loop (:for (Tuple g x) (complete-rows (Tuple group weight)))
 ;;           (:acc (welch-t-test 0.0 (Tuple (= g "treated") x))))
 ;;     (chi-squared-test (ok (table-crosstab survey "smoker" "sex")))
 ;;

@@ -458,6 +458,12 @@ A ~TTest~ has the p-value of the two-sided alternative and ~p-less~ and
 ~p-greater~ of the one-sided ones. A ~ChiSquaredTest~ has the statistic,
 the degrees of freedom, the p-value and the table of expected counts.
 
+** Charts
+
+Charts of tables are in a package of their own, [[https://github.com/bjoli/bjostat-plot][bjostat-plot]]: scatter,
+line and bar charts and histograms as Vega-Lite, saved as JSON, SVG, PNG or
+PDF. Its examples are R's ~cars~ and the Palmer penguins of two R tutorials.
+
 ** Plans
 
 What comes next is in [[file:plan.org][plan.org]].
@@ -478,5 +484,15 @@ bjo run tests/distributions.bjo
 bjo run tests/models.bjo
 bjo run tests/hypothesis.bjo
 bjo run tests/columns.bjo
+#+END_SRC
+
+The benchmarks:
+
+#+BEGIN_SRC sh
 bjo bench bench/csv.bjo --all
+bjo bench bench/query.bjo --all
+bjo bench bench/nulls.bjo --all
+python3 bench/compare/make_data.py scratch/compare.csv   # the file of the next two
+bjo bench bench/compare.bjo --all
+POLARS_MAX_THREADS=1 python3 bench/compare/polars_bench.py scratch/compare.csv
 #+END_SRC

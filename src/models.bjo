@@ -6,10 +6,9 @@
 ;; least squares, as R's lm, fitted by a collector.
 ;;
 ;; A model is a loop like any other statistic. Each row gives the response
-;; and its predictors; a null is left out by the loop:
+;; and its predictors; complete-rows leaves out a row with a null:
 ;;
-;;     (loop (:for p* price) (:for a* area) (:for r* rooms)
-;;           (:when-let (Some p) p*) (:when-let (Some a) a*) (:when-let (Some r) r*)
+;;     (loop (:for (Tuple p a r) (complete-rows (Tuple price area rooms)))
 ;;           (:acc (linear-model ["area" "rooms"] (Tuple p [a (cast double r)]))))
 ;;
 ;; is R's lm(price ~ area + rooms). The model has an intercept, as in R;
@@ -278,8 +277,7 @@
 ;; Logistic regression, R's glm(family = binomial), and Poisson regression,
 ;; R's glm(family = poisson), with their usual links, the logit and the log:
 ;;
-;;     (loop (:for w* weight) (:for a* automatic)
-;;           (:when-let (Some w) w*) (:when-let (Some a) a*)
+;;     (loop (:for (Tuple w a) (complete-rows (Tuple weight automatic)))
 ;;           (:acc (logistic-model ["weight"] (Tuple (if a 1.0 0.0) [w]))))
 ;;
 ;; The fit is iteratively reweighted least squares, as R's: each step is a
@@ -455,8 +453,7 @@
 ;;
 ;;     (def (Ok levels) (category-levels t "region"))
 ;;     (def (Ok codes) (category-codes t "region"))
-;;     (loop (:for c* codes) (:for y* sales)
-;;           (:when-let (Some c) c*) (:when-let (Some y) y*)
+;;     (loop (:for (Tuple c y) (complete-rows (Tuple codes sales)))
 ;;           (:acc (linear-model (indicator-names "region" levels)
 ;;                               (Tuple y (indicators (vec-length levels) c)))))
 
@@ -479,7 +476,7 @@
 ;; A model does not keep its rows, so what it says of each row is made by a
 ;; second loop over them, as a column or a statistic:
 ;;
-;;     (loop (:for s* speed) (:for d* dist) (:when-let (Some s) s*) (:when-let (Some d) d*)
+;;     (loop (:for (Tuple s d) (complete-rows (Tuple speed dist)))
 ;;           (:acc (column-building (model-residual m d [s]))))
 
 ;; The predictors with the intercept's 1 first, when the model has one.
@@ -540,8 +537,7 @@
 ;; each category is a predictor of its indicators, with R's names.
 ;;
 ;;     (def (Ok regions) (category-levels t "region"))
-;;     (loop (:for c* (ok (category-codes t "region"))) (:for a* area) (:for y* price)
-;;           (:when-let (Some c) c*) (:when-let (Some a) a*) (:when-let (Some y) y*)
+;;     (loop (:for (Tuple c a y) (complete-rows (Tuple (ok (category-codes t "region")) area price)))
 ;;           (:acc (with-categories linear-model ["area"] [(Tuple "region" regions)]
 ;;                                  (Tuple y [a] [c]))))
 ;;
