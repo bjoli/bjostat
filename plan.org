@@ -576,7 +576,13 @@ loops before anything else, as they change the Collector trait:
      file (3 columns of numbers), 395 to 59.0 on the wide one (9); Polars
      on 24 threads 25.3 and 95.1. A column is one part, so the summary
      takes as long as its slowest column at least. (~bjo bench~ counts what
-     the measuring thread allocates, so the parts' memory is not in it.) Later (phase 2), the
+     the measuring thread allocates, so the parts' memory is not in it.)
+   - ~table-append~, a column on each worker: 24.2 to 11.0 ms on the narrow
+     file, 40.5 to 19.9 on the wide; Polars on 24 threads 9.41 and 18.1.
+   - Tried and left out: the ids of a count's, a crosstab's and a
+     distinct's other keys on the workers while the first is numbered. No
+     change (count by a string and a long 15.2 ms before and after): the
+     time is in the ids of the string and in what comes after them. Later (phase 2), the
    parallel loops of a program, as a clause of the loop in Bjolang's
    compiler: not yet.
 

@@ -296,8 +296,11 @@ public static class Reshape
             }
 
         int n = tables.Sum(t => t.Length);
-        var columns = fields.Select(f =>
+        // A column on each worker.
+        var columns = new IArrowArray[fields.Count];
+        Workers.For(fields.Count, c =>
         {
+            var f = fields[c];
             var pieces = tables
                 .Where(t => t.Length > 0)
                 .Select(t =>
@@ -306,13 +309,13 @@ public static class Reshape
                     return i < 0 ? Joins.Nulls(f.DataType, t.Length) : t.Column(i);
                 })
                 .ToList();
-            return pieces.Count switch
+            columns[c] = pieces.Count switch
             {
                 0 => Joins.Nulls(f.DataType, 0),
                 1 => pieces[0],
                 _ => Concat(pieces, f.DataType),
             };
-        }).ToList();
+        });
         var schema = new Schema.Builder();
         foreach (var f in fields) schema.Field(f);
         return new RecordBatch(schema.Build(), columns, n);
