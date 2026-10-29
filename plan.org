@@ -312,6 +312,15 @@ and statistics. Done so far:
   1.1e-8, where the normal equations in doubles are within 6e-3. Measured
   on 1M rows: 17.7 ms for one predictor, 62.6 ms for three, which allocate
   a Vec for each row.
+- *Generalized linear models:* ~logistic-model~ and ~poisson-model~, R's
+  ~glm~ of the binomial and Poisson families with the logit and the log, by
+  iteratively reweighted least squares with R's start and stop; each step
+  is the Givens QR of the weighted rows, which the collector keeps.
+  Estimates, standard errors, z values, p-values, deviances and AIC agree
+  with R's mtcars ~am ~ wt~ and with Newton's method at 50 digits to 1e-7.
+  The standard errors are of the weights at the estimates, one pass more;
+  R's are of the weights of the last step, a step behind, and differ by
+  about 1e-4 (R prints 1.436 for 1.43653).
 
 Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
 
@@ -348,8 +357,7 @@ because the vector adds in another order.
 
 In the order that lets an analysis be done from start to end:
 
-1. *Models:* ~glm~ (logistic and Poisson regression, by iteratively
-   reweighted least squares over the rows kept), categories as predictors
+1. *Models:* categories as predictors
    (a column of 0 and 1 for each level but the first), residuals and
    confidence intervals. A formula macro later.
 2. *Tests:* t-tests and the χ² test of a crosstab.

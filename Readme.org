@@ -338,6 +338,21 @@ gives the response and its predictors.
 | ~(model->table m)~ | The coefficients as a table, as broom's ~tidy~ |
 | ~(model-predict m xs)~ | The response the model gives |
 
+Logistic and Poisson regression, R's ~glm~ of the ~binomial~ and ~poisson~
+families, are collectors of the same rows:
+
+| Collector or function | What it makes |
+|------------------------+---------------|
+| ~(logistic-model names (Tuple y xs))~ | A ~GeneralizedModel~ of a response from 0 to 1, with the logit |
+| ~(poisson-model names (Tuple y xs))~ | The same of counts, with the log |
+| ~(glm->string m)~, ~(glm->table m)~ | As R's ~summary.glm~, and as broom's ~tidy~ |
+| ~(glm-predict m xs)~ | The mean response: a probability, or a mean count |
+
+A ~GeneralizedModel~ has the estimates, standard errors, z values and
+p-values, the deviance and the null deviance, the AIC, and whether the fit
+converged. It is fitted by iteratively reweighted least squares, as R's, so
+its collector keeps the rows.
+
 A ~LinearModel~ has the terms, the estimates, standard errors, t values and
 p-values, sigma, the degrees of freedom, R², adjusted R², and the F
 statistic and its p-value, as ~summary.lm~. The rows are not kept: each one
