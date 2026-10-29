@@ -1,0 +1,61 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/parallel.bjo — a loop over parts of a table, each a fiber
+;; of Bjolang's pool, against the same loop on one thread: the sum of
+;; price × qty of 1 000 000 rows. A prototype for the plan's parallel loops.
+;;
+;;     bjo bench bench/parallel.bjo --all
+;;
+;; Do not start the fibers from a module-level def: they read the module's
+;; values while the module is set up, and wait for it, as it waits for them.
+
+(import (std prelude))
+(import (std bench))
+(import (bjostat table))
+
+(: int) (def rows 1000000)
+
+(: Table)
+(def t
+  (match (make-table
+           [(named "price" (array->column {arraying (cast double (% (* i 7919) 500)) (:for i (range 0 rows))}))
+            (named "qty" (array->column {arraying (cast long (% (* i 31) 40)) (:for i (range 0 rows))}))])
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))
+
+;; The sum of price × qty of a table: the loop each part runs.
+(: (-> Table double))
+(defun (revenue u)
+  (def price (: (match (column-as u "price") ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells double)))
+  (def qty (: (match (column-as u "qty") ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells long)))
+  (loop (:for p* price) (:for q* qty) (:when-let (Some p) p*) (:when-let (Some q) q*)
+        (:acc (summing (* p (cast double q))))))
+
+;; The same, in `parts` slices of the table, each a fiber of the pool, and
+;; the partial sums added in the order of the slices.
+(: (-> int double))
+(defun (revenue/parallel parts)
+  (def size (/ (+ rows (- parts 1)) parts))
+  (with-scope
+    (def promises
+      {vecing (spawn-thunk (fun () (revenue (table-slice t #:from (* k size) #:to (min rows (* (+ k 1) size))))))
+              (:for k (range 0 parts))})
+    (loop (:for p promises) (:acc (summing (joined p))))))
+
+;; The value of a promise: parked for in ordinary code, suspended for in a
+;; fiber, where parking would hold a thread of the pool.
+(: (-> (Promise %a) %a))
+(defun (joined p)
+  (by-colour (#:sync (promise-join/sync p))
+             (#:bjo (match (sync (promise-join p)) ((Ok v) v) ((Err e) (raise e))))))
+
+(def/bench "1 thread" (revenue t))
+(def/bench "2 parts" (revenue/parallel 2))
+(def/bench "4 parts" (revenue/parallel 4))
+(def/bench "8 parts" (revenue/parallel 8))
+(def/bench "12 parts" (revenue/parallel 12))
+(def/bench "24 parts" (revenue/parallel 24))
+
+(run-benches)

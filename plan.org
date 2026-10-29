@@ -428,11 +428,79 @@ because the vector adds in another order.
 
 ** Next: the rest of what R has
 
-In the order that lets an analysis be done from start to end:
+First what the comparison with Polars, pandas and R taught, the parallel
+loops before anything else, as they change the Collector trait:
 
-1. *Statistics:* a t-digest for quantiles in one pass with little memory.
-2. *Parquet*.
-3. *Nulls of dates and times.* ~skip-nulls~ and ~complete-rows~ take
+1. *Parallel loops.* Polars on 24 threads is 3 to 10 times faster than
+   every library on one, and bjostat has no way to use a second core. A
+   prototype, bench/parallel.bjo, cuts a table into slices
+   (~table-slice~, no copy), runs the same loop on each slice as a fiber
+   (~spawn-thunk~ in a ~with-scope~), and adds the partial sums in the
+   order of the slices. The sum of price × qty of 1M rows (measured): 2.49
+   ms on one thread, 1.43 ms in 2 parts, 0.76 in 4, 0.48 in 8, 0.44 in 12
+   and 0.54 in 24; from 8 parts on, memory is the limit.
+
+   How it fits Bjolang's CML: the parts are fibers of the pool that runs
+   every other fiber of the program, on real threads. So a program that
+   already runs many fibers, as a server does, shares the cores with the
+   parts instead of having more threads than cores; a scope waits for the
+   parts and cancels them; fiber-trace sees them. ~spawn/thread~ is not
+   needed: it makes a thread of 1 MB of stack for each call, which costs
+   more than a part of a millisecond. The wait for the parts is
+   ~by-colour~: ~promise-join/sync~ in ordinary code, ~(sync
+   (promise-join p))~ in a bjoroutine, which must not park a thread of the
+   pool. With ~promise-join/sync~ alone, the benchmark, which runs its
+   bodies in fibers, hung.
+
+   What is to decide:
+   - *Combining.* A part gives the accumulator of its collectors, and two
+     accumulators become one by a new method, ~collector-combine~, in a
+     trait of its own beside Collector, so that a collector without it
+     still works on one thread. Sums, counts, the moments (~moments-add~
+     is already there), means, variances, correlations and a linear
+     model (two R factors of a QR, stacked and rotated again) combine.
+     ~selecting~, ~column-building~ and ~vecing~ combine by putting the
+     parts one after the other. The median and quantiles combine by their
+     values, or by a t-digest. ~folding~ does not, unless the program
+     gives the combine.
+   - *Groups.* ~group-of!~ writes one GroupIndex, which two threads cannot
+     share. Each part needs an index of its own, and the combine numbers
+     the groups of the second part again in the first. Groups of a
+     category, ~category-groups~, are numbered before the loop, and
+     combine by adding arrays.
+   - *The same result on every machine.* A sum of doubles depends on its
+     order. If the number of parts came from the number of cores, a mean
+     would differ between machines. So the size of a part comes from the
+     rows, as 64 000 of them, and the parts are combined in their order,
+     whatever the number of threads that run them.
+   - *How a program asks for it.* The loop stays the one API. A function
+     over parts, ~(in-parts t (fun (u) (loop ...)))~ with the loop's
+     collectors combined, needs no change in Bjolang; a ~:parallel~
+     clause of the loop would be shorter and needs the compiler. Try the
+     function first.
+   - *What runs it.* Fibers of the pool, as the prototype. The glue's
+     copies of columns use C# threads of their own now; they should go to
+     the same pool.
+2. *Ids instead of hashes for strings and integers.* bjostat is the
+   slowest of five at a group by a string (29.4 ms) and at a join by a
+   long (136 ms, 137 MB), and slow at a join by a string (82.5 ms). Its
+   counts and categories already give each key an id without a hash of
+   each row: a count by a string takes 15.7 ms and a group by a category
+   2.45 ms. Use the ids for ~group-of!~ of strings and for joins by
+   strings, and for an integer key the distance from the least as an
+   index, as the counts do, when the keys are dense enough. Check also
+   whether both keys of a join are sorted and unique, as pandas does: its
+   join by ~id~ takes 2 ms.
+3. *CSV fields as spans.* bjostat reads the file in 189 ms, Polars in 73
+   and data.table in 141: ~(text csv)~ makes a string of each field and an
+   array of each row.
+4. *A second file for the comparison,* of another shape: keys of many
+   values, nulls in the numbers, more columns. One file says little:
+   bjostat's distinct of rows is fast only because ~id~ makes each row
+   distinct.
+5. *Statistics:* a t-digest for quantiles in one pass with little memory.
+6. *Parquet*.
+7. *Nulls of dates and times.* ~skip-nulls~ and ~complete-rows~ take
    ~Cells~ only, not ~DateCells~, ~DateTimeCells~ or ~InstantCells~. A
    trait of a column with nulls (its length, its null count, whether a row
    is valid, the value at a row), with an implementation for each of the
@@ -495,6 +563,11 @@ Still open, checked again on the vectorise branch:
   declarations: a Bjolang struct with a field ~(Column %a)~ is refused by C#,
   as Arrow's ~PrimitiveArray<T>~ needs ~where T : struct~. The glue's
   ~Cells<T>~ has no constraint for that reason.
+- A module-level ~def~ that starts fibers which read the module's other
+  values hangs: the fibers wait for the module to be set up (its static
+  constructor in .NET), and the module waits for the fibers. Found with
+  bench/parallel.bjo; the same code from ~main~ or a benchmark body works.
+  It should be an error, or the fibers should not wait.
 - ~array->column~ is generic over any ~%a~, so an array of strings
   compiles and is then an exception of Arrow at run time: Bjolang's string
   is a struct, which meets ~where T : struct~, but holds a reference, which
