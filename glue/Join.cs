@@ -96,25 +96,48 @@ public static class Joins
         }
         var same = lk.Select((a, k) => Equality(a, rk[k])).ToArray();
 
+        // The left rows in parts on bjostat's workers, each with lists of
+        // its own, put one after the other in the order of the parts. The
+        // hash table is only read here, which a Dictionary allows on many
+        // threads.
         int ln = lk[0].Length;
-        var lh = Hashes(lk, ln);
-        for (int l = 0; l < ln; l++)
+        int parts = (ln + PartRows - 1) / PartRows;
+        var partLeft = new List<int>[parts];
+        var partRight = new List<int>[parts];
+        Workers.For(parts, p =>
         {
-            bool found = false;
-            if (heads.TryGetValue(lh[l], out int r))
+            int from = p * PartRows, to = Math.Min(ln, from + PartRows);
+            var lh = Hashes(lk.Select(a => ArrowArrayFactory.Slice(a, from, to - from)).ToArray(), to - from);
+            var lrows = new List<int>(to - from);
+            var rrows = new List<int>(kind == 0 || kind == 1 ? to - from : 0);
+            for (int l = from; l < to; l++)
             {
-                for (; r >= 0; r = next[r])
+                bool found = false;
+                if (heads.TryGetValue(lh[l - from], out int r))
                 {
-                    if (!SameKeys(same, l, r)) continue;
-                    found = true;
-                    if (kind >= 2) break;
-                    leftRows.Add(l);
-                    rightRows.Add(r);
+                    for (; r >= 0; r = next[r])
+                    {
+                        if (!SameKeys(same, l, r)) continue;
+                        found = true;
+                        if (kind >= 2) break;
+                        lrows.Add(l);
+                        rrows.Add(r);
+                    }
                 }
+                Unmatched(l, found, kind, lrows, rrows);
             }
-            Unmatched(l, found, kind, leftRows, rightRows);
+            partLeft[p] = lrows;
+            partRight[p] = rrows;
+        });
+        for (int p = 0; p < parts; p++)
+        {
+            leftRows.AddRange(partLeft[p]);
+            rightRows.AddRange(partRight[p]);
         }
     }
+
+    // The rows of a part of a join's left table.
+    private const int PartRows = 1 << 16;
 
     // The rows that match, by one key that is a category in both tables:
     // each right level is given the left code of the same string once, and

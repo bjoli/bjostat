@@ -579,6 +579,14 @@ loops before anything else, as they change the Collector trait:
      the measuring thread allocates, so the parts' memory is not in it.)
    - ~table-append~, a column on each worker: 24.2 to 11.0 ms on the narrow
      file, 40.5 to 19.9 on the wide; Polars on 24 threads 9.41 and 18.1.
+   - Joins by hashes, the left rows in parts of 65 536, each hashed and
+     matched on a worker into lists of its own, put one after the other in
+     order; the hash table of the right rows is built on one thread. A join
+     by a string to the keys: 68.5 to 25.6 ms (narrow), 91.6 to 32.3
+     (wide); by a long, one to one: 104 to 65.2, 245 to 72.6. Polars on 24
+     threads: 10.7 and 18.0, 22.5 and 35.6. What is left in the join by a
+     long is most likely the hash table of 1M right rows, built on one
+     thread. A join by a category goes another way, and is as before.
    - Tried and left out: the ids of a count's, a crosstab's and a
      distinct's other keys on the workers while the first is numbered. No
      change (count by a string and a long 15.2 ms before and after): the
