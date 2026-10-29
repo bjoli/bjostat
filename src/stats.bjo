@@ -30,7 +30,9 @@
   Summary Summarizing summary->string
   table-summary
   ;; The accumulators, opaque
-  Moments CoMoments SummaryAcc)
+  Moments CoMoments SummaryAcc
+  ;; Moments, for other modules' collectors
+  no-moments moments-add moments-count moments-mean moments-variance)
 
 (import (std prelude))
 
@@ -59,6 +61,10 @@
   (Moments (n (+ (record-ref m n) 1L)) (k k)
            (s1 (+ (record-ref m s1) d)) (s2 (+ (record-ref m s2) (* d d)))))
 
+(: (-> Moments long))
+(defun (moments-count m) (record-ref m n))
+
+;; The mean of the values; NaN of none.
 (: (-> Moments double))
 (defun (moments-mean m)
   (+ (record-ref m k) (/ (record-ref m s1) (cast double (record-ref m n)))))

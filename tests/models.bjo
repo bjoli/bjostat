@@ -113,6 +113,11 @@
 (def am [1.0 1.0 1.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0 1.0 1.0 0.0 0.0 0.0 0.0 0.0
          1.0 1.0 1.0 1.0 1.0 1.0 1.0])
 
+(: (Vec double))
+(def sleep1 [0.7 -1.6 -0.2 -1.2 -0.1 3.4 3.7 0.8 0.0 2.0])
+(: (Vec double))
+(def sleep2 [1.9 0.8 1.1 0.1 -0.1 4.4 5.5 1.6 4.6 3.4])
+
 (defun (main)
   ;; R's cars: lm(dist ~ speed)
   (def cars (ok (loop (:for s speed) (:for d dist) (:acc (simple-linear-model "speed" (Tuple d s))))))
@@ -230,6 +235,31 @@
           (record-ref (glm-ok (loop (:for w wt) (:acc (logistic-model ["wt"] (Tuple (if (< w 3.0) 1.0 0.0) [w])))))
                       converged?)
           #f)
+
+  ;; Intervals, as R's confint and confint.default
+  (: (-> Table string (Vec double)))
+  (defun (doubles-of t name) {vecing (option-value x 0.0) (:for x (: (match (column-as t name) ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells double)))})
+  (def ci (model-intervals cars 0.95))
+  (expect "cars: confint"
+          (Tuple (all-close? (doubles-of ci "lower") [-31.167849602388644 3.0969643281403228] 1e-12)
+                 (all-close? (doubles-of ci "upper") [-3.9903401786332538 4.7678531901078524] 1e-12))
+          (Tuple #t #t))
+  (def gci (glm-intervals logit 0.95))
+  (expect "mtcars: Wald intervals"
+          (Tuple (all-close? (doubles-of gci "lower") [3.2008023323924542 -6.8395126201076406] 1e-7)
+                 (all-close? (doubles-of gci "upper") [20.879937124922188 -1.2084273042387624] 1e-7))
+          (Tuple #t #t))
+
+  ;; A category as predictors: of sleep, the intercept is the mean of the
+  ;; first drug and the coefficient the difference of the second's.
+  (def sleep-levels ["one" "two"])
+  (def sleep-rows {vecing (Tuple (if (< i 10) (vec-ref sleep1 i) (vec-ref sleep2 (- i 10))) (if (< i 10) 0 1))
+                          (:for i (range 0 20))})
+  (def by-drug (ok (loop (:for (Tuple y code) sleep-rows)
+                         (:acc (linear-model (indicator-names "drug" sleep-levels) (Tuple y (indicators 2 code)))))))
+  (expect "a category: the terms" (record-ref by-drug terms) ["(Intercept)" "drugtwo"])
+  (expect "a category: the means" (all-close? (record-ref by-drug estimates) [0.75 1.58] 1e-12) #t)
+  (expect "indicators of three levels" (Tuple (indicators 3 0) (indicators 3 2)) (Tuple [0.0 0.0] [0.0 1.0]))
 
   ;; What cannot be fitted
   (expect "two rows for two coefficients"

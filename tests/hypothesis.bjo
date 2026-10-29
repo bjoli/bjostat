@@ -1,0 +1,125 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/hypothesis.bjo — t-tests against R's of its sleep data, and
+;; chi-squared tests, both against values at 50 digits of mpmath
+;; (scratch/htest_ref.py made them).
+;;
+;;     bjo run tests/hypothesis.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjostat table))
+(import (bjostat csv))
+(import (bjostat hypothesis))
+
+(: (-> double double bool))
+(defun (close? got want)
+  (<= (abs (- got want)) (* 1e-11 (max 1e-300 (abs want)))))
+
+(: (-> (Result TestError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> string Table))
+(defun (csv text)
+  (match (csv->table text)
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result TestError %a) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+;; Every number of a t-test: estimate, standard error, t, df, the three
+;; p-values and the 95% interval.
+(: (-> string TTest (Vec double) void))
+(defun (check name r want)
+  (def (Tuple low high) (t-test-interval r 0.95))
+  (def got [(record-ref r estimate) (record-ref r standard-error) (record-ref r statistic) (record-ref r df)
+            (record-ref r p-value) (record-ref r p-less) (record-ref r p-greater) low high])
+  (def wrong (loop (:for i (range 0 9)) (:when (not (close? (vec-ref got i) (vec-ref want i)))) (:acc (vecing i))))
+  (expect (str name ": every number") wrong []))
+
+;; R's sleep: the extra hours of sleep of ten people with each of two drugs.
+(: (Vec double))
+(def drug1 [0.7 -1.6 -0.2 -1.2 -0.1 3.4 3.7 0.8 0.0 2.0])
+(: (Vec double))
+(def drug2 [1.9 0.8 1.1 0.1 -0.1 4.4 5.5 1.6 4.6 3.4])
+
+(: (Vec (Tuple bool double)))
+(def both {vecing (if (< i 10) (Tuple #t (vec-ref drug1 i)) (Tuple #f (vec-ref drug2 (- i 10))))
+                  (:for i (range 0 20))})
+
+(defun (main)
+  (check "Welch, t.test(extra ~ group, sleep)"
+         (ok (loop (:for e both) (:acc (welch-t-test 0.0 e))))
+         [-1.58 0.84909101723876196 -1.8608134674868531 17.77647351617849 0.079394140187358138
+          0.039697070093679069 0.96030292990632093 -3.365483230711711 0.20548323071171097])
+  (check "pooled, var.equal = TRUE"
+         (ok (loop (:for e both) (:acc (pooled-t-test 0.0 e))))
+         [-1.58 0.84909101723876196 -1.8608134674868531 18.0 0.079186714215938111
+          0.039593357107969055 0.96040664289203094 -3.3638740322875986 0.20387403228759855])
+  (check "paired, paired = TRUE"
+         (ok (loop (:for a drug1) (:for b drug2) (:acc (paired-t-test 0.0 (Tuple a b)))))
+         [-1.58 0.38895872388839524 -4.0621276833820361 9.0 0.0028328901973842727
+          0.0014164450986921364 0.99858355490130786 -2.4598857632769828 -0.7001142367230172])
+  (check "one sample, mu = 0.5"
+         (ok (loop (:for x drug1) (:acc (one-sample-t-test 0.5 x))))
+         [0.75 0.56573452745572773 0.44190338023794043 9.0 0.66898662361467481
+          0.6655066881926626 0.3344933118073374 -0.52978041352623256 2.0297804135262326])
+  (def welch (ok (loop (:for e both) (:acc (welch-t-test 0.0 e)))))
+  (expect "the means and counts" (Tuple (record-ref welch means) (record-ref welch counts)) (Tuple [0.75 2.33] [10L 10L]))
+  (expect "printed"
+          (t-test->string welch)
+          (str "Welch Two Sample t-test\n"
+               "t = -1.861, df = 17.776, p-value = 0.07939\n"
+               "95 percent confidence interval: -3.36548 0.205483\n"
+               "estimate: -1.58\n"))
+  (expect "one value" (error-of (loop (:for x [1.0]) (:acc (one-sample-t-test 0.0 x))))
+          "1 values are too few: a t-test needs at least 2.")
+  (expect "values all the same" (error-of (loop (:for x [2.0 2.0 2.0]) (:acc (one-sample-t-test 0.0 x))))
+          "the values are all the same, so the t statistic is not a number.")
+  (expect "a sample of one" (error-of (loop (:for e [(Tuple #t 1.0) (Tuple #f 2.0) (Tuple #f 3.0)]) (:acc (welch-t-test 0.0 e))))
+          "the samples have 1 and 2 values: a t-test needs at least 2 in each.")
+
+  ;; Chi-squared
+  (def two (csv "sex,no,yes\nf,12,5\nm,7,9\n"))
+  (def corrected (ok (chi-squared-test two)))
+  (expect "2 × 2, with Yates's correction: statistic, df, p"
+          (Tuple (close? (record-ref corrected statistic) 1.4559963788146838) (record-ref corrected df)
+                 (close? (record-ref corrected p-value) 0.22756821457580981) (record-ref corrected corrected?))
+          (Tuple #t 1L #t #t))
+  (def plain (ok (chi-squared-test two #:correct? #f)))
+  (expect "2 × 2, without"
+          (Tuple (close? (record-ref plain statistic) 2.4305755196815568) (close? (record-ref plain p-value) 0.11898920553214525))
+          (Tuple #t #t))
+  (def three (ok (chi-squared-test (csv "g,a,b,c\nx,10,20,30\ny,25,15,5\n"))))
+  (expect "2 × 3: no correction"
+          (Tuple (close? (record-ref three statistic) 23.333333333333333) (record-ref three df)
+                 (close? (record-ref three p-value) 8.574939102672292e-6) (record-ref three corrected?))
+          (Tuple #t 2L #t #f))
+  (expect "the expected counts"
+          (table->string (record-ref three expected) #:digits 2)
+          (str "g       a       b       c     \n"
+               "string  double  double  double\n"
+               "x       20      20      20    \n"
+               "y       15      15      15    \n"))
+  (expect "printed"
+          (chi-squared-test->string corrected)
+          (str "Pearson's Chi-squared test with Yates' continuity correction\n"
+               "X-squared = 1.456, df = 1, p-value = 0.2276\n"))
+  (expect "one column of counts"
+          (error-of (chi-squared-test (csv "g,a\nx,1\ny,2\n")))
+          "the table has 2 rows and 1 columns of counts: a test needs at least 2 of each.")
+  (expect "a column that is not of counts"
+          (error-of (chi-squared-test (csv "g,a,b\nx,1,0.5\ny,2,1.5\n")))
+          "'b' is not a column of counts, which are longs.")
+  0)

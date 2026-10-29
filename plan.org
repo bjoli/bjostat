@@ -321,6 +321,15 @@ and statistics. Done so far:
   The standard errors are of the weights at the estimates, one pass more;
   R's are of the weights of the last step, a step behind, and differ by
   about 1e-4 (R prints 1.436 for 1.43653).
+- *Intervals and categories in models:* ~model-intervals~ (R's ~confint~)
+  and ~glm-intervals~ (Wald's, R's ~confint.default~); ~indicators~ and
+  ~indicator-names~ make a category the predictors of R's treatment
+  contrasts.
+- *Tests:* ~(bjostat hypothesis)~: one-sample, paired, Welch and pooled
+  t-tests as collectors, with the p-values of the three alternatives and
+  the interval of any level, and the chi-squared test of a crosstab with
+  Yates's correction of 2 × 2, as R's. Checked against R's ~sleep~ and
+  against mpmath at 50 digits, to 1e-11.
 
 Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
 
@@ -357,10 +366,10 @@ because the vector adds in another order.
 
 In the order that lets an analysis be done from start to end:
 
-1. *Models:* categories as predictors
-   (a column of 0 and 1 for each level but the first), residuals and
-   confidence intervals. A formula macro later.
-2. *Tests:* t-tests and the χ² test of a crosstab.
+1. *Models:* a formula macro, as R's ~y ~ x + z~, over the loop; the
+   residuals and fitted values of a model as columns.
+2. *More tests:* Wilcoxon's and Fisher's exact test, the correlation test,
+   and an analysis of variance of a model.
 3. *Statistics:* a t-digest for quantiles in one pass with little memory.
 4. *Plots* as Vega-Lite or SVG, and *Parquet*.
 

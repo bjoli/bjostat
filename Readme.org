@@ -353,6 +353,11 @@ p-values, the deviance and the null deviance, the AIC, and whether the fit
 converged. It is fitted by iteratively reweighted least squares, as R's, so
 its collector keeps the rows.
 
+~(model-intervals m 0.95)~ is R's ~confint~, and ~(glm-intervals m 0.95)~ its
+~confint.default~, of Wald. A category is a predictor as R makes it, a 0 or
+1 for each level but the first: ~(indicators (vec-length levels) code)~ of
+its code, with the names ~(indicator-names "region" levels)~.
+
 A ~LinearModel~ has the terms, the estimates, standard errors, t values and
 p-values, sigma, the degrees of freedom, R², adjusted R², and the F
 statistic and its p-value, as ~summary.lm~. The rows are not kept: each one
@@ -360,6 +365,24 @@ goes into a QR decomposition by Givens rotations, so the memory is that of
 p² numbers, and the fit is as stable as R's QR. A model with no more rows
 than coefficients, or a predictor that is a linear combination of the
 others, is an ~Err~ where R gives NA.
+
+** The module (bjostat hypothesis)
+
+t-tests are collectors, and the chi-squared test takes a table that
+~table-crosstab~ makes, as R's ~t.test~ and ~chisq.test~:
+
+| Collector or function | What it tests |
+|------------------------+---------------|
+| ~(one-sample-t-test mu x)~ | Is the mean ~mu~? |
+| ~(paired-t-test mu (Tuple x y))~ | Is the mean of x - y ~mu~? |
+| ~(welch-t-test mu (Tuple first? x))~ | Is the difference of the means of two samples ~mu~? R's default |
+| ~(pooled-t-test mu (Tuple first? x))~ | The same, with equal variances, R's ~var.equal = TRUE~ |
+| ~(t-test-interval r level)~, ~(t-test->string r)~ | The confidence interval, and the test as text |
+| ~(chi-squared-test t #:correct? #t)~ | Are the rows and the columns of the counts independent? Yates's correction of a 2 × 2 table, as R |
+
+A ~TTest~ has the p-value of the two-sided alternative and ~p-less~ and
+~p-greater~ of the one-sided ones. A ~ChiSquaredTest~ has the statistic,
+the degrees of freedom, the p-value and the table of expected counts.
 
 ** Plans
 
@@ -379,5 +402,6 @@ bjo run tests/types.bjo
 bjo run tests/counts.bjo
 bjo run tests/distributions.bjo
 bjo run tests/models.bjo
+bjo run tests/hypothesis.bjo
 bjo bench bench/csv.bjo --all
 #+END_SRC

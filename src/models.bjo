@@ -33,7 +33,9 @@
   model->table model->string model-predict
   ;; Generalized linear models
   GeneralizedModel GeneralizedModelling logistic-model poisson-model
-  glm->table glm->string glm-predict)
+  glm->table glm->string glm-predict
+  ;; Intervals and predictors of categories
+  model-intervals glm-intervals indicators indicator-names)
 
 (import (std prelude))
 (import (bjostat table))
@@ -396,3 +398,63 @@
   (unless (record-ref m converged?)
     (stringbuilder-add-string! sb "The fit did not converge in 25 iterations.\n"))
   (stringbuilder->string sb))
+
+;; ===========================================================================
+;; Intervals
+;; ===========================================================================
+
+;; A table of term, lower and upper.
+(: (-> (Vec string) (Vec double) (Vec double) double Table))
+(defun (interval-table terms estimates errors q)
+  (match (make-table
+           [(named-strings "term" (array->string-column (vec->array terms)))
+            (named "lower" (array->column {arraying (- (vec-ref estimates i) (* q (vec-ref errors i)))
+                                                    (:for i (range 0 (vec-length terms)))}))
+            (named "upper" (array->column {arraying (+ (vec-ref estimates i) (* q (vec-ref errors i)))
+                                                    (:for i (range 0 (vec-length terms)))}))])
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))
+
+;; The interval of each coefficient at the level, as R's confint: the
+;; estimate plus and minus the t quantile of the residual degrees of freedom
+;; times the standard error.
+(: (-> LinearModel double Table))
+(defun (model-intervals m level)
+  (interval-table (record-ref m terms) (record-ref m estimates) (record-ref m standard-errors)
+                  (t-quantile (/ (- 1.0 level) 2.0) (cast double (record-ref m df)) #:lower? #f)))
+
+;; The same of a generalized model, with the normal quantile: Wald's
+;; intervals, as R's confint.default. R's confint of a glm profiles the
+;; likelihood instead, which gives other intervals of small samples.
+(: (-> GeneralizedModel double Table))
+(defun (glm-intervals m level)
+  (interval-table (record-ref m terms) (record-ref m estimates) (record-ref m standard-errors)
+                  (normal-quantile (/ (- 1.0 level) 2.0) #:lower? #f)))
+
+;; ===========================================================================
+;; Categories as predictors
+;; ===========================================================================
+;;
+;; A category is a predictor of k levels as k - 1 predictors of 0 and 1, one
+;; for each level but the first, as R's treatment contrasts: the first level
+;; is in the intercept, and the coefficient of each other level is its
+;; difference from the first.
+;;
+;;     (def (Ok levels) (category-levels t "region"))
+;;     (def (Ok codes) (category-codes t "region"))
+;;     (loop (:for c* codes) (:for y* sales)
+;;           (:when-let (Some c) c*) (:when-let (Some y) y*)
+;;           (:acc (linear-model (indicator-names "region" levels)
+;;                               (Tuple y (indicators (vec-length levels) c)))))
+
+;; The k - 1 predictors of the level whose code is `code`, of `count` levels:
+;; 1 at the place of its level, and all 0 for the first level.
+(: (-> int int (Vec double)))
+(defun (indicators count code)
+  {vecing (if (= code (+ i 1)) 1.0 0.0) (:for i (range 0 (- count 1)))})
+
+;; The names of those predictors, as R's: the name and the level, for each
+;; level but the first.
+(: (-> string (Vec string) (Vec string)))
+(defun (indicator-names name levels)
+  (vec-map (fun (l) (str name l)) (vec-drop levels 1)))

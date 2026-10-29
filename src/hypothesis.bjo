@@ -1,0 +1,272 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/src/hypothesis.bjo — the module (bjostat hypothesis): t-tests as
+;; collectors, and the chi-squared test of a table of counts, as R's t.test
+;; and chisq.test.
+;;
+;;     (loop (:for x* weight) (:when-let (Some x) x*) (:acc (one-sample-t-test 70.0 x)))
+;;     (loop (:for g* group) (:for x* weight)
+;;           (:when-let (Some g) g*) (:when-let (Some x) x*)
+;;           (:acc (welch-t-test 0.0 (Tuple (= g "treated") x))))
+;;     (chi-squared-test (ok (table-crosstab survey "smoker" "sex")))
+;;
+;; A t-test gives the p-values of the three alternatives: `p-value` of the
+;; two-sided one, R's default, and `p-less` and `p-greater` of the
+;; one-sided ones, R's alternative = "less" and "greater". Its confidence
+;; interval of any level is t-test-interval.
+
+(export
+  TTest TestError ChiSquaredTest
+  OneSampleTTest one-sample-t-test PairedTTest paired-t-test
+  TwoSampleTTest welch-t-test pooled-t-test
+  t-test-interval t-test->string
+  chi-squared-test chi-squared-test->string)
+
+(import (std prelude))
+(import (bjostat table))
+(import (bjostat stats))
+(import (only (bjostat query) table-with ColumnBuilding))
+(import (bjostat distributions))
+(import (only (std maths) nan?))
+
+(import/extern
+  (significant (: Bjostat.Regression.Significant (-> double int string))))
+
+;; Why a test cannot be made.
+(type (: TestError (Record (: message string))))
+
+(impl (Displayed TestError)
+  (defun (displayed e) (record-ref e message))
+  (defun (display-into e b) (stringbuilder-add-string! b (record-ref e message))))
+
+(: (-> string (Result TestError %a)))
+(defun (refuse message) (Err (TestError (message message))))
+
+;; ===========================================================================
+;; t-tests
+;; ===========================================================================
+
+;; A t-test. `estimate` is the mean, the mean of the differences, or the
+;; difference of the two means, and `means` the mean of each sample; `null`
+;; is the value the hypothesis gives it. `df` is a double: Welch's degrees of
+;; freedom are not whole.
+(type (: TTest
+         (Record (: method string)
+                 (: estimate double)
+                 (: means (Vec double))
+                 (: counts (Vec long))
+                 (: null double)
+                 (: standard-error double)
+                 (: statistic double)
+                 (: df double)
+                 (: p-value double)
+                 (: p-less double)
+                 (: p-greater double))))
+
+(: (-> string double (Vec double) (Vec long) double double double TTest))
+(defun (t-test-of method estimate means counts null se df)
+  (def t (/ (- estimate null) se))
+  (def less (t-cdf t df))
+  (def greater (t-cdf t df #:lower? #f))
+  (TTest (method method) (estimate estimate) (means means) (counts counts) (null null)
+         (standard-error se) (statistic t) (df df)
+         (p-value (min 1.0 (* 2.0 (min less greater)))) (p-less less) (p-greater greater)))
+
+;; The interval of the level, as R's conf.int: the estimate plus and minus
+;; the t quantile times the standard error.
+(: (-> TTest double (Tuple double double)))
+(defun (t-test-interval r level)
+  (def q (* (t-quantile (/ (- 1.0 level) 2.0) (record-ref r df) #:lower? #f) (record-ref r standard-error)))
+  (Tuple (- (record-ref r estimate) q) (+ (record-ref r estimate) q)))
+
+;; A test of one sample, or None of fewer than two values or of values that
+;; are all the same, which R refuses too.
+(: (-> string Moments double (Result TestError TTest)))
+(defun (one-sample method m null)
+  (def n (moments-count m))
+  (match (moments-variance m)
+    ((Some v)
+     (if (> v 0.0)
+         (Ok (t-test-of method (moments-mean m) [(moments-mean m)] [n] null
+                        (sqrt (/ v (cast double n))) (cast double (- n 1L))))
+         (refuse "the values are all the same, so the t statistic is not a number.")))
+    (None (refuse (str (long->string n) " values are too few: a t-test needs at least 2.")))))
+
+;; R's t.test(x, mu = null): is the mean of the values `null`?
+(type (: OneSampleTTest #:opaque (Struct (: null double))))
+
+(: (-> double OneSampleTTest))
+(defun (one-sample-t-test null) (OneSampleTTest (null null)))
+
+(impl (Collector OneSampleTTest)
+  (type %elem double)
+  (type %acc Moments)
+  (type %out (Result TestError TTest))
+  (defun (collector-init c) no-moments)
+  (defun (collector-step c m x) (moments-add m x))
+  (defun (collector-finish c m) (one-sample "One Sample t-test" m (record-ref c null))))
+
+;; R's t.test(x, y, paired = TRUE, mu = null): is the mean of x - y `null`?
+;; Each element is a pair of x and y.
+(type (: PairedTTest #:opaque (Struct (: null double))))
+
+(: (-> double PairedTTest))
+(defun (paired-t-test null) (PairedTTest (null null)))
+
+(impl (Collector PairedTTest)
+  (type %elem (Tuple double double))
+  (type %acc Moments)
+  (type %out (Result TestError TTest))
+  (defun (collector-init c) no-moments)
+  (defun (collector-step c m p) (match p ((Tuple x y) (moments-add m (- x y)))))
+  (defun (collector-finish c m) (one-sample "Paired t-test" m (record-ref c null))))
+
+;; Two samples: is the mean of the first less that of the second `null`?
+;; Each element is #t for a value of the first sample and #f for one of the
+;; second, and the value. Welch's test, R's default, does not take the
+;; variances to be equal; the pooled one, R's var.equal = TRUE, does.
+(type (: TwoSampleTTest #:opaque (Struct (: null double) (: pooled bool))))
+
+(: (-> double TwoSampleTTest))
+(defun (welch-t-test null) (TwoSampleTTest (null null) (pooled #f)))
+
+(: (-> double TwoSampleTTest))
+(defun (pooled-t-test null) (TwoSampleTTest (null null) (pooled #t)))
+
+(impl (Collector TwoSampleTTest)
+  (type %elem (Tuple bool double))
+  (type %acc (Tuple Moments Moments))
+  (type %out (Result TestError TTest))
+  (defun (collector-init c) (Tuple no-moments no-moments))
+  (defun (collector-step c acc e)
+    (match (Tuple acc e)
+      ((Tuple (Tuple a b) (Tuple first? x))
+       (if first? (Tuple (moments-add a x) b) (Tuple a (moments-add b x))))))
+  (defun (collector-finish c acc)
+    (match acc ((Tuple a b) (two-samples a b (record-ref c null) (record-ref c pooled))))))
+
+(: (-> Moments Moments double bool (Result TestError TTest)))
+(defun (two-samples a b null pooled?)
+  (match (Tuple (moments-variance a) (moments-variance b))
+    ((Tuple (Some va) (Some vb))
+     (def na (cast double (moments-count a)))
+     (def nb (cast double (moments-count b)))
+     (def means [(moments-mean a) (moments-mean b)])
+     (def counts [(moments-count a) (moments-count b)])
+     (def estimate (- (moments-mean a) (moments-mean b)))
+     (if pooled?
+         (let ((df (+ na nb -2.0)))
+           (def pooled-variance (/ (+ (* (- na 1.0) va) (* (- nb 1.0) vb)) df))
+           (if (> pooled-variance 0.0)
+               (Ok (t-test-of " Two Sample t-test" estimate means counts null
+                              (sqrt (* pooled-variance (+ (/ 1.0 na) (/ 1.0 nb)))) df))
+               (refuse "the values are all the same, so the t statistic is not a number.")))
+         (let ((ea (/ va na)) (eb (/ vb nb)))
+           (def se2 (+ ea eb))
+           (if (> se2 0.0)
+               (Ok (t-test-of "Welch Two Sample t-test" estimate means counts null (sqrt se2)
+                              (/ (* se2 se2) (+ (/ (* ea ea) (- na 1.0)) (/ (* eb eb) (- nb 1.0))))))
+               (refuse "the values are all the same, so the t statistic is not a number.")))))
+    (_ (refuse (str "the samples have " (long->string (moments-count a)) " and "
+                    (long->string (moments-count b)) " values: a t-test needs at least 2 in each.")))))
+
+;; The test as R prints it, in short.
+(: (-> TTest string))
+(defun (t-test->string r)
+  (def (Tuple low high) (t-test-interval r 0.95))
+  (str (record-ref r method) "\n"
+       "t = " (significant (record-ref r statistic) 4)
+       ", df = " (significant (record-ref r df) 5)
+       ", p-value = " (significant (record-ref r p-value) 4) "\n"
+       "95 percent confidence interval: " (significant low 6) " " (significant high 6) "\n"
+       "estimate: " (significant (record-ref r estimate) 6) "\n"))
+
+;; ===========================================================================
+;; The chi-squared test of a table of counts
+;; ===========================================================================
+
+;; A chi-squared test of independence: `expected` has the counts that rows
+;; and columns that do not depend on each other would give, in the shape of
+;; the table.
+(type (: ChiSquaredTest
+         (Record (: statistic double)
+                 (: df long)
+                 (: p-value double)
+                 (: corrected? bool)
+                 (: expected Table))))
+
+;; R's chisq.test of a table as table-crosstab makes it: the first column
+;; names the rows, and each other column is a column of counts. Of a table of
+;; two rows and two columns, Yates's correction is made, as R does, unless
+;; `#:correct? #f`. An Err for a table of fewer than two rows or columns of
+;; counts, a column that is not of counts, a null, or a negative count.
+(: (-> Table (#:correct? bool) (Result TestError ChiSquaredTest)))
+(defun (chi-squared-test t #:correct? #t)
+  (def names (vec-drop (table-names t) 1))
+  (def cols (vec-length names))
+  (def rows (table-row-count t))
+  (def columns
+    (loop (:for name names)
+          (:acc (vecing (: (column-as t name) (Result TableError (Cells long)))))))
+  (def bad (find (fun (i) (err? (vec-ref columns i))) (range 0 cols)))
+  (cond
+    ((or (< rows 2) (< cols 2))
+     (refuse (str "the table has " (int->string rows) " rows and " (int->string cols)
+                  " columns of counts: a test needs at least 2 of each.")))
+    ((some? bad)
+     (refuse (str "'" (vec-ref names (option-value bad 0)) "' is not a column of counts, which are longs.")))
+    (else
+     (def counts
+       {vecing {vecing (match (cells-get (column-of (vec-ref columns c)) r)
+                         ((Some k) (cast double k))
+                         (None -1.0))
+                       (:for r (range 0 rows))}
+               (:for c (range 0 cols))})
+     (if (some? (find (fun (col) (some? (find (fun (k) (< k 0.0)) col))) counts))
+         (refuse "a count is null or below 0.")
+         (Ok (chi-squared-of t names counts rows cols correct?))))))
+
+(: (-> (Result TableError (Cells long)) (Cells long)))
+(defun (column-of r)
+  (match r ((Ok c) c) ((Err e) (panic! (displayed e)))))
+
+(: (-> Table (Vec string) (Vec (Vec double)) int int bool ChiSquaredTest))
+(defun (chi-squared-of t names counts rows cols correct?)
+  (def col-sums (vec-map (fun (col) (fold (fun (k s) (+ s k)) 0.0 col)) counts))
+  (def row-sums {vecing (loop (:for c (range 0 cols)) (:acc (summing (vec-ref (vec-ref counts c) r))))
+                        (:for r (range 0 rows))})
+  (def total (fold (fun (k s) (+ s k)) 0.0 col-sums))
+  (def expected {vecing {vecing (/ (* (vec-ref row-sums r) (vec-ref col-sums c)) total) (:for r (range 0 rows))}
+                        (:for c (range 0 cols))})
+  (def yates? (and correct? (= rows 2) (= cols 2)))
+  (def statistic
+    (loop (:for c (range 0 cols))
+          (:acc (summing
+                  (loop (:for r (range 0 rows))
+                        (:let o (vec-ref (vec-ref counts c) r))
+                        (:let e (vec-ref (vec-ref expected c) r))
+                        ;; Yates: |O - E| less 1/2, but not below 0, as R's.
+                        (:let d (if yates? (max 0.0 (- (abs (- o e)) 0.5)) (abs (- o e))))
+                        (:acc (summing (/ (* d d) e))))))))
+  (def df (cast long (* (- rows 1) (- cols 1))))
+  ;; The table with each column of counts in place of its expected one.
+  (def expected-table
+    (loop (:for c (range 0 cols))
+          (:acc tab (folding t
+                             (match (table-with tab (vec-ref names c)
+                                                {column-building e (:for e (vec-ref expected c))})
+                               ((Ok t2) t2) ((Err e) (panic! (displayed e))))))))
+  (ChiSquaredTest (statistic statistic) (df df)
+                  (p-value (chi-squared-cdf statistic (cast double df) #:lower? #f))
+                  (corrected? yates?) (expected expected-table)))
+
+(: (-> ChiSquaredTest string))
+(defun (chi-squared-test->string r)
+  (str (if (record-ref r corrected?)
+           "Pearson's Chi-squared test with Yates' continuity correction\n"
+           "Pearson's Chi-squared test\n")
+       "X-squared = " (significant (record-ref r statistic) 5)
+       ", df = " (long->string (record-ref r df))
+       ", p-value = " (significant (record-ref r p-value) 4) "\n"))
