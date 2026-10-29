@@ -600,14 +600,16 @@ loops before anything else, as they change the Collector trait:
    regions) and at a join by a long (133 ms, 137 MB; 250 with the ids in
    no order), and slow at a join by a string (67.1 ms). Its counts and
    categories already give each key an id without a hash of each row: a
-   count by a string takes 15.0 ms and a group by a category 2.35 ms. Use the ids for ~group-of!~ of strings and for joins by
-   strings, and for an integer key the distance from the least as an
-   index, as the counts do, when the keys are dense enough. Check also
-   whether both keys of a join are sorted and unique, as pandas does: its
-   join by ~id~ takes 2 ms.
+   count by a string takes 15.0 ms and a group by a category 2.35 ms.
+   Use the ids for ~group-of!~ of strings and for joins by strings, and
+   for an integer key the distance from the least as an index, as the
+   counts do, when the keys are dense enough. Check also whether both keys
+   of a join are sorted and unique, as pandas does: its join by ~id~ takes
+   2 ms.
 3. *CSV fields as spans.* bjostat reads the narrow file in 186 ms,
-   Polars in 71.6 and data.table in 121; the wide one in 485, 215 and 404: ~(text csv)~ makes a string of each field and an
-   array of each row.
+   Polars in 71.6 and data.table in 121; the wide one in 485, 215 and
+   404: ~(text csv)~ makes a string of each field and an array of each
+   row.
 4. *Loops over cells with nulls.* On the wide file the standard
    deviation, the correlation and a group by a long are 4.6, 14 and 7
    times slower than without nulls, where Polars's are at most 3 times.
