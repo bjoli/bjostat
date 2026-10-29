@@ -1,0 +1,178 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/distributions.bjo — the distributions against R's values
+;; and closed forms, quantiles against their distribution functions, and the
+;; moments of samples from a seeded source.
+;;
+;;     bjo run tests/distributions.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (only (std maths) exp loge pi nan?))
+(import (only (std random) make-random/seed64))
+(import (bjostat distributions))
+(import (bjostat stats))
+
+;; Within `rel` of `want`, relative to it, or absolute below 1.
+(: (-> double double double bool))
+(defun (close? got want rel)
+  (<= (abs (- got want)) (* rel (max 1.0 (abs want)))))
+
+;; Within a relative 1e-12, for values far below 1 too.
+(: (-> double double bool))
+(defun (exact? got want)
+  (<= (abs (- got want)) (* 1e-12 (abs want))))
+
+(: (-> string double double void))
+(defun (near name got want)
+  (expect name (if (exact? got want) "ok" (str (double->string got) " is not " (double->string want))) "ok"))
+
+(: (-> (Option double) double))
+(defun (some-of o) (match o ((Some x) x) (None (/ 0.0 0.0))))
+
+(defun (main)
+  ;; Normal, against R
+  (near "dnorm(0)" (normal-density 0.0) (/ 1.0 (sqrt (* 2.0 pi))))
+  (near "pnorm(1.96)" (normal-cdf 1.96) 0.9750021048517795)
+  (near "pnorm(-1.96)" (normal-cdf -1.96) 0.024997895148220435)
+  (near "pnorm(1)" (normal-cdf 1.0) 0.8413447460685429)
+  (near "pnorm(-10), far in the tail" (normal-cdf -10.0) 7.619853024160527e-24)
+  (near "pnorm(10, lower.tail = FALSE)" (normal-cdf 10.0 #:lower? #f) 7.619853024160527e-24)
+  (near "pnorm with a mean and sd" (normal-cdf 13.92 #:mean 10.0 #:sd 2.0) 0.9750021048517795)
+  (near "qnorm(0.975)" (normal-quantile 0.975) 1.959963984540054)
+  (near "qnorm(0.95)" (normal-quantile 0.95) 1.6448536269514722)
+  (near "qnorm(1e-10)" (normal-quantile 1e-10) -6.361340902404056)
+  (near "qnorm(1e-300), by mpmath" (normal-quantile 1e-300) -37.04709629936120)
+  (near "qnorm of a tiny upper tail" (normal-quantile 7.619853024160527e-24 #:lower? #f) 10.0)
+  (expect "pnorm of sd 0 is NaN" (nan? (normal-cdf 1.0 #:sd 0.0)) #t)
+  (expect "qnorm(0) and qnorm(1)"
+          (Tuple (normal-quantile 0.0) (normal-quantile 1.0))
+          (Tuple (/ -1.0 0.0) (/ 1.0 0.0)))
+
+  ;; t: closed forms of 1 and 2 degrees of freedom, and R
+  (near "pt(1, 1), the Cauchy" (t-cdf 1.0 1.0) 0.75)
+  (near "pt(-1, 1)" (t-cdf -1.0 1.0) 0.25)
+  (near "pt(1, 2)" (t-cdf 1.0 2.0) (+ 0.5 (/ 1.0 (* 2.0 (sqrt 3.0)))))
+  (near "pt(-3, 2)" (t-cdf -3.0 2.0) (- 0.5 (/ 3.0 (* 2.0 (sqrt 11.0)))))
+  (near "pt(3, 2, lower.tail = FALSE)" (t-cdf 3.0 2.0 #:lower? #f) (- 0.5 (/ 3.0 (* 2.0 (sqrt 11.0)))))
+  (near "dt(0, 1)" (t-density 0.0 1.0) (/ 1.0 pi))
+  (near "qt(0.975, 10)" (t-quantile 0.975 10.0) 2.228138851986274)
+  (near "qt(0.975, 1)" (t-quantile 0.975 1.0) 12.706204736174705)
+  (near "qt(0.95, 10)" (t-quantile 0.95 10.0) 1.8124611228116764)
+  (near "qt(0.025, 10)" (t-quantile 0.025 10.0) -2.228138851986274)
+  (near "pt(1.96, 1e9), by mpmath" (t-cdf 1.96 1e9) 0.9750021047131352)
+  ;; Above 4e5 degrees of freedom, R's corrected normal: 10 digits here.
+  (expect "pt(3, 1e6, lower.tail = FALSE), by mpmath, to a relative 1e-10"
+          (<= (abs (- (t-cdf 3.0 1e6 #:lower? #f) 0.0013499312707108985)) (* 1e-10 0.0013499312707108985)) #t)
+  ;; Of 1e5 degrees of freedom, the continued fraction keeps 11 digits.
+  (expect "pchisq(1e5 + 300, 1e5), by mpmath, to 1e-10"
+          (close? (chi-squared-cdf 100300.0 100000.0 #:lower? #f) 0.25090610814341875 1e-10) #t)
+
+  ;; Chi-squared: the closed form of 2 degrees of freedom, and R
+  (near "pchisq(3, 2)" (chi-squared-cdf 3.0 2.0) (- 1.0 (exp -1.5)))
+  (near "pchisq(30, 2, lower.tail = FALSE)" (chi-squared-cdf 30.0 2.0 #:lower? #f) (exp -15.0))
+  (near "qchisq(0.95, 2)" (chi-squared-quantile 0.95 2.0) (* -2.0 (loge 0.05)))
+  (near "qchisq(0.95, 1)" (chi-squared-quantile 0.95 1.0) 3.841458820694124)
+  (near "qchisq(0.95, 10)" (chi-squared-quantile 0.95 10.0) 18.307038053275146)
+  (near "pchisq of 1 df is a normal squared" (chi-squared-cdf 3.841458820694124 1.0) 0.95)
+  (near "dchisq(1, 2)" (chi-squared-density 1.0 2.0) (* 0.5 (exp -0.5)))
+
+  ;; F: the closed form of 2 and 2, and its tie to t
+  (near "pf(3, 2, 2)" (f-cdf 3.0 2.0 2.0) 0.75)
+  (near "pf(3, 2, 2, lower.tail = FALSE)" (f-cdf 3.0 2.0 2.0 #:lower? #f) 0.25)
+  (near "pf(x, 1, d) is a t squared" (f-cdf 4.0 1.0 7.0 #:lower? #f) (* 2.0 (t-cdf -2.0 7.0)))
+  (near "qf(0.95, 3, 10)" (f-quantile 0.95 3.0 10.0) 3.7082648190468445)
+  (near "df(1, 2, 2)" (f-density 1.0 2.0 2.0) 0.25)
+
+  ;; Binomial
+  (near "dbinom(3, 10, 0.5)" (binomial-probability 3L 10L 0.5) 0.1171875)
+  (near "dbinom(0, 5, 0.2)" (binomial-probability 0L 5L 0.2) 0.32768)
+  (near "pbinom(3, 10, 0.5)" (binomial-cdf 3L 10L 0.5) 0.171875)
+  (near "pbinom(3, 10, 0.5, lower.tail = FALSE)" (binomial-cdf 3L 10L 0.5 #:lower? #f) 0.828125)
+  (expect "pbinom of all" (binomial-cdf 10L 10L 0.3) 1.0)
+  (expect "qbinom(0.5, 10, 0.5)" (binomial-quantile 0.5 10L 0.5) 5L)
+  (expect "qbinom(0.171875, 10, 0.5): exactly the cdf of 3" (binomial-quantile 0.171875 10L 0.5) 3L)
+  (expect "qbinom(0.1, 1000, 0.3, lower.tail = FALSE)" (binomial-quantile 0.1 1000L 0.3 #:lower? #f) 319L)
+
+  ;; Poisson
+  (near "dpois(2, 3)" (poisson-probability 2L 3.0) (* 4.5 (exp -3.0)))
+  (near "ppois(2, 3)" (poisson-cdf 2L 3.0) (* 8.5 (exp -3.0)))
+  (near "ppois(2, 3, lower.tail = FALSE)" (poisson-cdf 2L 3.0 #:lower? #f) (- 1.0 (* 8.5 (exp -3.0))))
+  (expect "qpois(0.5, 3)" (poisson-quantile 0.5 3.0) 3L)
+  (expect "qpois(0.99, 100)" (poisson-quantile 0.99 100.0) 124L)
+
+  ;; Log gamma
+  (near "lgamma(0.5)" (log-gamma 0.5) (* 0.5 (loge pi)))
+  (near "lgamma(10)" (log-gamma 10.0) (loge 362880.0))
+  (near "lgamma(100.5)" (log-gamma 100.5) 361.4355404677776)
+
+  ;; Quantiles undo distribution functions
+  (expect "t quantiles undo t-cdf"
+          (loop (:for x [-30.0 -4.0 -1.0 -0.1 0.0 0.3 2.0 7.0])
+                (:when (not (close? (t-quantile (t-cdf x 7.0) 7.0) x 1e-10))) (:acc (counting 1)))
+          0)
+  (expect "t quantiles of the upper tail"
+          (loop (:for x [0.5 3.0 20.0 200.0])
+                (:when (not (close? (t-quantile (t-cdf x 3.0 #:lower? #f) 3.0 #:lower? #f) x 1e-10))) (:acc (counting 1)))
+          0)
+  (expect "chi-squared quantiles undo chi-squared-cdf"
+          (loop (:for x [0.001 0.5 3.0 12.0 80.0 400.0])
+                (:for df [0.5 1.0 4.0 10.0 50.0 300.0])
+                (:when (not (close? (chi-squared-quantile (chi-squared-cdf x df) df) x 1e-9))) (:acc (counting 1)))
+          0)
+  (expect "F quantiles undo f-cdf"
+          (loop (:for x [0.01 0.4 1.0 3.0 25.0])
+                (:when (not (close? (f-quantile (f-cdf x 4.0 9.0) 4.0 9.0) x 1e-9))) (:acc (counting 1)))
+          0)
+  (expect "a binomial cdf is the sum of its probabilities"
+          (close? (binomial-cdf 40L 100L 0.37) (loop (:for k (range 0 41)) (:acc (summing (binomial-probability (cast long k) 100L 0.37)))) 1e-12)
+          #t)
+  (expect "a Poisson cdf is the sum of its probabilities"
+          (close? (poisson-cdf 20L 17.5) (loop (:for k (range 0 21)) (:acc (summing (poisson-probability (cast long k) 17.5)))) 1e-12)
+          #t)
+
+  ;; Samples
+  (def rng (make-random/seed64 2025UL))
+  (def normals {vecing (normal-sample #:mean 3.0 #:sd 2.0 #:rng rng) (:for _ (range 0 200000))})
+  (expect "normal samples: the mean" (close? (some-of (loop (:for x normals) (:acc (mean x)))) 3.0 0.02) #t)
+  (expect "normal samples: the sd" (close? (some-of (loop (:for x normals) (:acc (standard-deviation x)))) 2.0 0.02) #t)
+  (expect "normal samples: 2.5% below the quantile"
+          (close? (/ (cast double (loop (:for x normals) (:when (< x (normal-quantile 0.025 #:mean 3.0 #:sd 2.0)))
+                                        (:acc (counting x))))
+                     200000.0)
+                  0.025 0.002)
+          #t)
+  (def gammas {vecing (gamma-sample 0.6 #:scale 2.0 #:rng rng) (:for _ (range 0 200000))})
+  (expect "gamma samples of a shape below 1: the mean" (close? (some-of (loop (:for x gammas) (:acc (mean x)))) 1.2 0.02) #t)
+  (expect "gamma samples: the variance" (close? (some-of (loop (:for x gammas) (:acc (variance x)))) 2.4 0.05) #t)
+  (def chis {vecing (chi-squared-sample 5.0 #:rng rng) (:for _ (range 0 200000))})
+  (expect "chi-squared samples: the mean" (close? (some-of (loop (:for x chis) (:acc (mean x)))) 5.0 0.02) #t)
+  (expect "chi-squared samples: the variance" (close? (some-of (loop (:for x chis) (:acc (variance x)))) 10.0 0.02) #t)
+  (def ts {vecing (t-sample 6.0 #:rng rng) (:for _ (range 0 200000))})
+  (expect "t samples: the variance" (close? (some-of (loop (:for x ts) (:acc (variance x)))) 1.5 0.03) #t)
+  (def fs {vecing (f-sample 4.0 10.0 #:rng rng) (:for _ (range 0 200000))})
+  (expect "F samples: the mean" (close? (some-of (loop (:for x fs) (:acc (mean x)))) 1.25 0.02) #t)
+  (: (-> (Vec long) (Option double)))
+  (defun (long-mean v) (loop (:for k v) (:acc (mean (cast double k)))))
+  (: (-> (Vec long) (Option double)))
+  (defun (long-variance v) (loop (:for k v) (:acc (variance (cast double k)))))
+  (def small-poisson {vecing (poisson-sample 4.0 #:rng rng) (:for _ (range 0 200000))})
+  (expect "Poisson samples, inversion: the mean" (close? (some-of (long-mean small-poisson)) 4.0 0.01) #t)
+  (expect "Poisson samples, inversion: the variance" (close? (some-of (long-variance small-poisson)) 4.0 0.02) #t)
+  (def large-poisson {vecing (poisson-sample 250.0 #:rng rng) (:for _ (range 0 200000))})
+  (expect "Poisson samples, PTRS: the mean" (close? (some-of (long-mean large-poisson)) 250.0 0.0005) #t)
+  (expect "Poisson samples, PTRS: the variance" (close? (some-of (long-variance large-poisson)) 250.0 0.02) #t)
+  (def small-binomial {vecing (binomial-sample 20L 0.3 #:rng rng) (:for _ (range 0 200000))})
+  (expect "binomial samples, inversion: the mean" (close? (some-of (long-mean small-binomial)) 6.0 0.01) #t)
+  (expect "binomial samples, inversion: the variance" (close? (some-of (long-variance small-binomial)) 4.2 0.02) #t)
+  (def large-binomial {vecing (binomial-sample 5000L 0.7 #:rng rng) (:for _ (range 0 200000))})
+  (expect "binomial samples, beta splits: the mean" (close? (some-of (long-mean large-binomial)) 3500.0 0.0002) #t)
+  (expect "binomial samples, beta splits: the variance" (close? (some-of (long-variance large-binomial)) 1050.0 0.02) #t)
+  (expect "a seed gives the same samples"
+          (Tuple (normal-sample #:rng (make-random/seed64 7UL)) (poisson-sample 30.0 #:rng (make-random/seed64 7UL)))
+          (Tuple (normal-sample #:rng (make-random/seed64 7UL)) (poisson-sample 30.0 #:rng (make-random/seed64 7UL))))
+  0)

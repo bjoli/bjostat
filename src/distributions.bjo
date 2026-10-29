@@ -1,0 +1,326 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/src/distributions.bjo — the module (bjostat distributions): the
+;; density, the distribution function, the quantile function and samples of
+;; the normal, t, chi-squared, F, binomial and Poisson distributions, as R's
+;; dnorm, pnorm, qnorm, rnorm and the others.
+;;
+;;     (normal-cdf 1.96)                        ; 0.975, R's pnorm(1.96)
+;;     (t-cdf 2.5 10.0 #:lower? #f)             ; P(T > 2.5), R's pt(2.5, 10, lower.tail = FALSE)
+;;     (chi-squared-quantile 0.95 3.0)          ; 7.81, R's qchisq(0.95, 3)
+;;     (binomial-probability 3L 10L 0.5)        ; 0.117, R's dbinom(3, 10, 0.5)
+;;     (normal-sample #:rng (make-random/seed64 42UL))
+;;
+;; The arguments are in R's order: the value, then the parameters. A
+;; distribution function and a quantile function take `#:lower?`, #t by
+;; default; with #f they are of the upper tail, P(X > x), which keeps the
+;; digits of a small p-value that 1 minus the lower tail would lose.
+;;
+;; A continuous distribution with a parameter out of its range, as a
+;; standard deviation of 0, gives NaN, as R does. A binomial or Poisson
+;; quantile or sample, which is a long, panics then, as the call is wrong.
+;;
+;; A sample takes `#:rng`, a RandomSource of (std random), as every function
+;; there does: a source made with a seed gives the same samples each run.
+;; The samples are exact methods, not approximations: the normal by Box and
+;; Muller, the gamma (and the chi-squared, t and F made of it) by Marsaglia
+;; and Tsang, the Poisson by inversion below a mean of 10 and by Hörmann's
+;; transformed rejection above, the binomial by inversion when n p is small
+;; and by splits at beta-distributed order statistics otherwise.
+
+(export
+  ;; Normal
+  normal-density normal-cdf normal-quantile normal-sample
+  ;; Student's t
+  t-density t-cdf t-quantile t-sample
+  ;; Chi-squared
+  chi-squared-density chi-squared-cdf chi-squared-quantile chi-squared-sample
+  ;; F
+  f-density f-cdf f-quantile f-sample
+  ;; Binomial
+  binomial-probability binomial-cdf binomial-quantile binomial-sample
+  ;; Poisson
+  poisson-probability poisson-cdf poisson-quantile poisson-sample
+  ;; Others
+  uniform-sample gamma-sample log-gamma)
+
+(import (std prelude))
+(import (only (std maths) loge exp pow floor cos pi quotient))
+(import (only (std random) RandomSource current-random random-double))
+
+(import/extern
+  (log-gamma (: Bjostat.Distributions.LogGamma (-> double double)))
+  (clr-normal-density (: Bjostat.Distributions.NormalDensity (-> double double double double)))
+  (clr-normal-cdf (: Bjostat.Distributions.NormalCdf (-> double double double bool double)))
+  (clr-normal-quantile (: Bjostat.Distributions.NormalQuantile (-> double double double bool double)))
+  (clr-t-density (: Bjostat.Distributions.TDensity (-> double double double)))
+  (clr-t-cdf (: Bjostat.Distributions.TCdf (-> double double bool double)))
+  (clr-t-quantile (: Bjostat.Distributions.TQuantile (-> double double bool double)))
+  (clr-chi-squared-density (: Bjostat.Distributions.ChiSquaredDensity (-> double double double)))
+  (clr-chi-squared-cdf (: Bjostat.Distributions.ChiSquaredCdf (-> double double bool double)))
+  (clr-chi-squared-quantile (: Bjostat.Distributions.ChiSquaredQuantile (-> double double bool double)))
+  (clr-f-density (: Bjostat.Distributions.FDensity (-> double double double double)))
+  (clr-f-cdf (: Bjostat.Distributions.FCdf (-> double double double bool double)))
+  (clr-f-quantile (: Bjostat.Distributions.FQuantile (-> double double double bool double)))
+  (clr-binomial-probability (: Bjostat.Distributions.BinomialProbability (-> long long double double)))
+  (clr-binomial-cdf (: Bjostat.Distributions.BinomialCdf (-> long long double bool double)))
+  (clr-binomial-quantile (: Bjostat.Distributions.BinomialQuantile (-> double long double bool long)))
+  (clr-poisson-probability (: Bjostat.Distributions.PoissonProbability (-> long double double)))
+  (clr-poisson-cdf (: Bjostat.Distributions.PoissonCdf (-> long double bool double)))
+  (clr-poisson-quantile (: Bjostat.Distributions.PoissonQuantile (-> double double bool long))))
+
+;; ===========================================================================
+;; Normal
+;; ===========================================================================
+
+(: (-> double (#:mean double) (#:sd double) double))
+(defun (normal-density x #:mean 0.0 #:sd 1.0) (clr-normal-density x mean sd))
+
+;; P(X ≤ x), or P(X > x) with `#:lower? #f`.
+(: (-> double (#:mean double) (#:sd double) (#:lower? bool) double))
+(defun (normal-cdf x #:mean 0.0 #:sd 1.0 #:lower? #t) (clr-normal-cdf x mean sd lower?))
+
+;; The x where normal-cdf is p.
+(: (-> double (#:mean double) (#:sd double) (#:lower? bool) double))
+(defun (normal-quantile p #:mean 0.0 #:sd 1.0 #:lower? #t) (clr-normal-quantile p mean sd lower?))
+
+(: (-> (#:mean double) (#:sd double) (#:rng RandomSource) double))
+(defun (normal-sample #:mean 0.0 #:sd 1.0 #:rng (parameter-ref current-random))
+  (+ mean (* sd (standard-normal rng))))
+
+;; A uniform in (0, 1): random-double can give 0, whose logarithm is not a
+;; number.
+(: (-> RandomSource double))
+(defun (open-uniform rng)
+  (def u (random-double #:rng rng))
+  (if (> u 0.0) u (open-uniform rng)))
+
+;; Box and Muller's transform, one of its two values.
+(: (-> RandomSource double))
+(defun (standard-normal rng)
+  (def u (open-uniform rng))
+  (def v (random-double #:rng rng))
+  (* (sqrt (* -2.0 (loge u))) (cos (* 2.0 pi v))))
+
+;; A uniform in [lo, hi).
+(: (-> (#:lo double) (#:hi double) (#:rng RandomSource) double))
+(defun (uniform-sample #:lo 0.0 #:hi 1.0 #:rng (parameter-ref current-random))
+  (+ lo (* (- hi lo) (random-double #:rng rng))))
+
+;; ===========================================================================
+;; Gamma, which the chi-squared, t and F samples are made of
+;; ===========================================================================
+
+;; A gamma of the shape and scale 1, by Marsaglia and Tsang's method; below a
+;; shape of 1, one of shape + 1 times U^(1/shape).
+(: (-> double RandomSource double))
+(defun (gamma-draw shape rng)
+  (if (< shape 1.0)
+      (* (gamma-draw (+ shape 1.0) rng) (pow (open-uniform rng) (/ 1.0 shape)))
+      (gamma-tries (- shape (/ 1.0 3.0)) rng)))
+
+(: (-> double RandomSource double))
+(defun (gamma-tries d rng)
+  (def c (/ 1.0 (sqrt (* 9.0 d))))
+  (def x (standard-normal rng))
+  (def w (+ 1.0 (* c x)))
+  (if (<= w 0.0)
+      (gamma-tries d rng)
+      (let ((v (* w w w))
+            (u (open-uniform rng)))
+        (if (or (< u (- 1.0 (* 0.0331 x x x x)))
+                (< (loge u) (+ (* 0.5 x x) (* d (+ (- 1.0 v) (loge v))))))
+            (* d v)
+            (gamma-tries d rng)))))
+
+;; A gamma of the shape and the scale; NaN for either not above 0.
+(: (-> double (#:scale double) (#:rng RandomSource) double))
+(defun (gamma-sample shape #:scale 1.0 #:rng (parameter-ref current-random))
+  (if (and (> shape 0.0) (> scale 0.0))
+      (* scale (gamma-draw shape rng))
+      (/ 0.0 0.0)))
+
+;; ===========================================================================
+;; Student's t
+;; ===========================================================================
+
+(: (-> double double double))
+(defun (t-density x df) (clr-t-density x df))
+
+(: (-> double double (#:lower? bool) double))
+(defun (t-cdf x df #:lower? #t) (clr-t-cdf x df lower?))
+
+(: (-> double double (#:lower? bool) double))
+(defun (t-quantile p df #:lower? #t) (clr-t-quantile p df lower?))
+
+;; A normal over the root of a chi-squared divided by its degrees of freedom.
+(: (-> double (#:rng RandomSource) double))
+(defun (t-sample df #:rng (parameter-ref current-random))
+  (if (> df 0.0)
+      (/ (standard-normal rng) (sqrt (/ (* 2.0 (gamma-draw (/ df 2.0) rng)) df)))
+      (/ 0.0 0.0)))
+
+;; ===========================================================================
+;; Chi-squared
+;; ===========================================================================
+
+(: (-> double double double))
+(defun (chi-squared-density x df) (clr-chi-squared-density x df))
+
+(: (-> double double (#:lower? bool) double))
+(defun (chi-squared-cdf x df #:lower? #t) (clr-chi-squared-cdf x df lower?))
+
+(: (-> double double (#:lower? bool) double))
+(defun (chi-squared-quantile p df #:lower? #t) (clr-chi-squared-quantile p df lower?))
+
+;; Twice a gamma of shape df / 2.
+(: (-> double (#:rng RandomSource) double))
+(defun (chi-squared-sample df #:rng (parameter-ref current-random))
+  (if (> df 0.0) (* 2.0 (gamma-draw (/ df 2.0) rng)) (/ 0.0 0.0)))
+
+;; ===========================================================================
+;; F
+;; ===========================================================================
+
+(: (-> double double double double))
+(defun (f-density x d1 d2) (clr-f-density x d1 d2))
+
+(: (-> double double double (#:lower? bool) double))
+(defun (f-cdf x d1 d2 #:lower? #t) (clr-f-cdf x d1 d2 lower?))
+
+(: (-> double double double (#:lower? bool) double))
+(defun (f-quantile p d1 d2 #:lower? #t) (clr-f-quantile p d1 d2 lower?))
+
+;; Two chi-squareds, each over its degrees of freedom, one over the other.
+(: (-> double double (#:rng RandomSource) double))
+(defun (f-sample d1 d2 #:rng (parameter-ref current-random))
+  (if (and (> d1 0.0) (> d2 0.0))
+      (/ (/ (gamma-draw (/ d1 2.0) rng) d1) (/ (gamma-draw (/ d2 2.0) rng) d2))
+      (/ 0.0 0.0)))
+
+;; ===========================================================================
+;; Binomial
+;; ===========================================================================
+
+;; P(X = k) of n trials of probability p each.
+(: (-> long long double double))
+(defun (binomial-probability k n p) (clr-binomial-probability k n p))
+
+(: (-> long long double (#:lower? bool) double))
+(defun (binomial-cdf k n p #:lower? #t) (clr-binomial-cdf k n p lower?))
+
+(: (-> long double string void))
+(defun (check-binomial n p name)
+  (unless (and (>= n 0L) (>= p 0.0) (<= p 1.0))
+    (panic! (str name ": n is " (long->string n) " and p " (double->string p)
+                 "; n has to be at least 0 and p from 0 to 1."))))
+
+;; The least k whose binomial-cdf reaches q, as R's qbinom.
+(: (-> double long double (#:lower? bool) long))
+(defun (binomial-quantile q n p #:lower? #t)
+  (check-binomial n p "binomial-quantile")
+  (unless (and (>= q 0.0) (<= q 1.0))
+    (panic! (str "binomial-quantile: the probability is " (double->string q) ", not from 0 to 1.")))
+  (clr-binomial-quantile q n p lower?))
+
+(: (-> long double (#:rng RandomSource) long))
+(defun (binomial-sample n p #:rng (parameter-ref current-random))
+  (check-binomial n p "binomial-sample")
+  (binomial-draw n p rng))
+
+(: (-> long double RandomSource long))
+(defun (binomial-draw n p rng)
+  (cond
+    ((or (= n 0L) (= p 0.0)) 0L)
+    ((= p 1.0) n)
+    ;; By symmetry, so that the probability is at most 1/2.
+    ((> p 0.5) (- n (binomial-draw n (- 1.0 p) rng)))
+    ((< (* (cast double n) p) 30.0) (binomial-inversion n p rng))
+    (else
+     ;; The a-th least of n uniforms is beta(a, n + 1 - a). When it is at
+     ;; least p, the uniforms below p are among the a - 1 below it, each
+     ;; below p with p / x; otherwise they are the a, and those of the n - a
+     ;; above it that are below p, each with (p - x) / (1 - x).
+     (def a (+ 1L (quotient n 2L)))
+     (def b (- (+ n 1L) a))
+     (def ga (gamma-draw (cast double a) rng))
+     (def x (/ ga (+ ga (gamma-draw (cast double b) rng))))
+     (if (>= x p)
+         (binomial-draw (- a 1L) (/ p x) rng)
+         (+ a (binomial-draw (- b 1L) (/ (- p x) (- 1.0 x)) rng))))))
+
+;; The least k whose cumulative probability passes a uniform, from 0 up.
+(: (-> long double RandomSource long))
+(defun (binomial-inversion n p rng)
+  (def u (random-double #:rng rng))
+  (def q (- 1.0 p))
+  (def ratio (/ p q))
+  (let walk ((k 0L) (pk (pow q (cast double n))) (sum (pow q (cast double n))))
+    (if (or (<= u sum) (>= k n))
+        k
+        (let ((next (* pk ratio (/ (cast double (- n k)) (cast double (+ k 1L))))))
+          (walk (+ k 1L) next (+ sum next))))))
+
+;; ===========================================================================
+;; Poisson
+;; ===========================================================================
+
+(: (-> long double double))
+(defun (poisson-probability k lambda) (clr-poisson-probability k lambda))
+
+(: (-> long double (#:lower? bool) double))
+(defun (poisson-cdf k lambda #:lower? #t) (clr-poisson-cdf k lambda lower?))
+
+(: (-> double string void))
+(defun (check-poisson lambda name)
+  (unless (>= lambda 0.0)
+    (panic! (str name ": the mean is " (double->string lambda) "; it has to be at least 0."))))
+
+(: (-> double double (#:lower? bool) long))
+(defun (poisson-quantile q lambda #:lower? #t)
+  (check-poisson lambda "poisson-quantile")
+  (unless (and (>= q 0.0) (<= q 1.0))
+    (panic! (str "poisson-quantile: the probability is " (double->string q) ", not from 0 to 1.")))
+  (clr-poisson-quantile q lambda lower?))
+
+(: (-> double (#:rng RandomSource) long))
+(defun (poisson-sample lambda #:rng (parameter-ref current-random))
+  (check-poisson lambda "poisson-sample")
+  (cond
+    ((= lambda 0.0) 0L)
+    ((< lambda 10.0) (poisson-inversion lambda rng))
+    (else (poisson-ptrs lambda rng))))
+
+(: (-> double RandomSource long))
+(defun (poisson-inversion lambda rng)
+  (def u (random-double #:rng rng))
+  (let walk ((k 0L) (pk (exp (- 0.0 lambda))) (sum (exp (- 0.0 lambda))))
+    (if (or (<= u sum) (>= k 1000L))
+        k
+        (let ((next (/ (* pk lambda) (cast double (+ k 1L)))))
+          (walk (+ k 1L) next (+ sum next))))))
+
+;; Hörmann's transformed rejection with squeeze (PTRS), for a mean of 10 or
+;; more.
+(: (-> double RandomSource long))
+(defun (poisson-ptrs lambda rng)
+  (def slam (sqrt lambda))
+  (def loglam (loge lambda))
+  (def b (+ 0.931 (* 2.53 slam)))
+  (def a (+ -0.059 (* 0.02483 b)))
+  (def invalpha (+ 1.1239 (/ 1.1328 (- b 3.4))))
+  (def vr (- 0.9277 (/ 3.6224 (- b 2.0))))
+  (let draw ()
+    (def u (- (random-double #:rng rng) 0.5))
+    (def v (random-double #:rng rng))
+    (def us (- 0.5 (abs u)))
+    (def k (cast long (floor (+ (* (+ (/ (* 2.0 a) us) b) u) lambda 0.43))))
+    (cond
+      ((and (>= us 0.07) (<= v vr)) k)
+      ((or (< k 0L) (and (< us 0.013) (> v us))) (draw))
+      ((<= (- (+ (loge v) (loge invalpha)) (loge (+ (/ a (* us us)) b)))
+           (- (* (cast double k) loglam) lambda (log-gamma (+ (cast double k) 1.0))))
+       k)
+      (else (draw)))))

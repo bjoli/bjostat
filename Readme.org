@@ -277,6 +277,43 @@ out by the loop, where R needs ~na.rm = TRUE~:
 Each is None of too few values: the mean of none, the variance of fewer than
 two. A quantile of values with a NaN is NaN.
 
+** The module (bjostat distributions)
+
+The density, the distribution function, the quantile function and samples
+of the normal, t, chi-squared, F, binomial and Poisson distributions, as R's
+~dnorm~, ~pnorm~, ~qnorm~, ~rnorm~ and the others. The arguments are in R's
+order: the value, then the parameters.
+
+#+BEGIN_SRC scheme
+(normal-cdf 1.96)                         ; 0.975, R's pnorm(1.96)
+(t-cdf 2.5 10.0 #:lower? #f)              ; P(T > 2.5), R's pt(2.5, 10, lower.tail = FALSE)
+(chi-squared-quantile 0.95 3.0)           ; 7.81, R's qchisq(0.95, 3)
+(binomial-probability 3L 10L 0.5)         ; 0.117, R's dbinom(3, 10, 0.5)
+(normal-sample #:mean 10.0 #:rng (make-random/seed64 42UL))
+#+END_SRC
+
+| Distribution | Functions |
+|--------------+-----------|
+| Normal | ~normal-density~, ~normal-cdf~, ~normal-quantile~, ~normal-sample~, with ~#:mean~ and ~#:sd~ |
+| Student's t | ~t-density~, ~t-cdf~, ~t-quantile~, ~t-sample~ |
+| Chi-squared | ~chi-squared-density~, ~-cdf~, ~-quantile~, ~-sample~ |
+| F | ~f-density~, ~f-cdf~, ~f-quantile~, ~f-sample~ |
+| Binomial | ~binomial-probability~, ~-cdf~, ~-quantile~, ~-sample~ |
+| Poisson | ~poisson-probability~, ~-cdf~, ~-quantile~, ~-sample~ |
+| Others | ~uniform-sample~, ~gamma-sample~, ~log-gamma~ |
+
+A distribution function or a quantile function takes ~#:lower?~ (~#t~);
+with ~#f~ it is of the upper tail, which keeps the digits of a small
+p-value. A continuous distribution with a parameter out of its range gives
+NaN, as R does; a binomial or Poisson quantile or sample panics. A sample
+takes ~#:rng~, a ~RandomSource~ of ~(std random)~: one made with a seed
+gives the same samples each run.
+
+*Accuracy.* Checked against mpmath at 50 digits on a grid of values and
+parameters: a relative error below 1e-12 almost everywhere, also of p-values
+of 1e-130 and quantiles of 1e-300. Above 4e5 degrees of freedom the t is
+R's corrected normal, of about 10 digits.
+
 ** Plans
 
 What comes next is in [[file:plan.org][plan.org]].
@@ -293,5 +330,6 @@ bjo run tests/stats.bjo
 bjo run tests/reshape.bjo
 bjo run tests/types.bjo
 bjo run tests/counts.bjo
+bjo run tests/distributions.bjo
 bjo bench bench/csv.bjo --all
 #+END_SRC

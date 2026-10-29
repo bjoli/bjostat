@@ -291,6 +291,16 @@ and statistics. Done so far:
   of its own, the other columns are not read. A count by a string and a
   long became 15 ms from 60, a distinct by them 14.5 ms from 60, and a pivot
   to wider rows 75 ms from 151.
+- *Distributions:* ~(bjostat distributions)~ has the density, the
+  distribution function, the quantile function and samples of the normal,
+  t, chi-squared, F, binomial and Poisson distributions, with ~#:lower?~
+  for upper tails as R's ~lower.tail~. The functions are made of the log
+  gamma function and the regularized incomplete gamma and beta functions,
+  with Stirling's series where large terms would cancel; a quantile is
+  Newton's method on the logarithm of the tail, kept in a bracket. Checked
+  against mpmath: below 1e-12 relative almost everywhere. The samples are
+  exact methods on ~(std random)~'s seeded sources: Box and Muller,
+  Marsaglia and Tsang, Hörmann's PTRS, and beta splits of the binomial.
 
 Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
 
@@ -327,15 +337,11 @@ because the vector adds in another order.
 
 In the order that lets an analysis be done from start to end:
 
-1. *Distributions and random numbers:* density, distribution, quantile and
-   samples of the normal, t, χ², F, binomial and Poisson distributions, and
-   a generator with a seed. Before models, as their p-values need the t and
-   F distributions.
-2. *Models:* ~lm~ as a collector of a QR decomposition, with coefficients,
+1. *Models:* ~lm~ as a collector of a QR decomposition, with coefficients,
    standard errors, R² and p-values; then ~glm~. A formula macro later.
-3. *Tests:* t-tests and the χ² test of a crosstab.
-4. *Statistics:* a t-digest for quantiles in one pass with little memory.
-5. *Plots* as Vega-Lite or SVG, and *Parquet*.
+2. *Tests:* t-tests and the χ² test of a crosstab.
+3. *Statistics:* a t-digest for quantiles in one pass with little memory.
+4. *Plots* as Vega-Lite or SVG, and *Parquet*.
 
 Not from R: the recycling of short vectors, silent conversions between
 types, NA that spreads through a sum unless the collector says so, and
