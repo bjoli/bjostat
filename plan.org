@@ -670,12 +670,30 @@ loops before anything else, as they change the Collector trait:
    chunks on the workers (186 on one thread), Polars in 71.6 on one thread
    and in 16.9 on 24; the wide one in 178, 215 and 34.8. ~(text csv)~ makes
    a string of each field and an array of each row, on each worker.
-4. *Loops over cells with nulls.* On the wide file the standard
-   deviation, the correlation and a group by a long are 4.6, 14 and 7
-   times slower than without nulls, where Polars's are at most 3 times.
-   Find out first where the time goes: the vector loop, the jump of each
-   null. Then a loop that reads the valid bitmap as a mask, as Polars's
-   kernels do, without a jump for each row.
+4. *Loops over cells with nulls.* Measured (bench/null-cost.bjo): the
+   cost was not the processor guessing the test of each null wrong. Nulls
+   in one run at the start cost as much as random ones, and one in a
+   thousand as much as one in twenty: a column with any null took another
+   path, about 3 ns a cell. ~Cells.IsValid~ asked Arrow's ~IsValid~, an
+   interface call that made a span of the buffer for each cell. In
+   bench/compare.bjo it was three times slower again, though the C# of the
+   loop was the same as in a small file: a ~table-categorize~ elsewhere in
+   the program, of a column in native memory, made .NET's profile of that
+   shared code see two kinds of memory, and the code it made for one went.
+
+   Done: ~Cells~ finds the valid bitmap once, as it does the values, and
+   tests the bit itself; the loop is unchanged. With nulls, a sum and a
+   standard deviation are now as fast as without (2.44 and 2.46 ms against
+   5.63 and 6.01), a correlation of two columns 4.36 ms against 12.4, and
+   ~skip-nulls~ 4.11 against 6.28. On the wide file: the standard deviation
+   13.1 to 2.51 ms, the correlation 40.6 to 4.77, a group by a long 48.8 to
+   9.28, the median 28.2 to 10.8, a new column 4.83 to 1.66.
+
+   Left: a correlation with nulls in two columns is 1.7 times one without
+   (4.36 against 2.58 ms), and ~skip-nulls~ and ~complete-rows~ cost more
+   than ~:when-let~. And the statistics without nulls are 5 times Polars's
+   (a standard deviation 2.49 ms against 0.49), as their sums are not
+   vector sums; that is item 6 of what the comparison taught, a decision.
 5. *Statistics:* a t-digest for quantiles in one pass with little memory.
 6. *Parquet*.
 7. *Nulls of dates and times.* ~skip-nulls~ and ~complete-rows~ take

@@ -60,12 +60,35 @@ public sealed unsafe class Cells<T>
     public readonly int Length;
     public readonly int NullCount;
 
+    // The valid bitmap, read directly: its bytes when they are a managed
+    // array, or its address in Arrow's native memory, which does not move,
+    // and the bit of cell 0. Through Arrow's IsValid each cell was an
+    // interface call and a span of the buffer.
+    private readonly byte[]? _validBytes;
+    private readonly int _validStart;
+    private readonly byte* _validPointer;
+
     internal Cells(IArrowArray array)
     {
         _array = array;
         Length = array.Length;
         NullCount = array.NullCount;
         _offset = array.Data.Offset;
+        if (NullCount != 0 && array.Data.Buffers.Length > 0 && !array.Data.Buffers[0].IsEmpty)
+        {
+            var bits = array.Data.Buffers[0].Memory;
+            if (MemoryMarshal.TryGetArray(bits, out var bitSegment))
+            {
+                _validBytes = bitSegment.Array;
+                _validStart = bitSegment.Offset * 8 + _offset;
+            }
+            else if (MemoryMarshal.TryGetMemoryManager(bits, out MemoryManager<byte>? bitManager)
+                     && bitManager.GetType().FullName == "Apache.Arrow.Memory.NativeMemoryManager")
+            {
+                _validPointer = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(bits.Span));
+                _validStart = _offset;
+            }
+        }
         if (array is StringArray strings)
         {
             // The strings end to end, checked once as one string; a cell is
@@ -162,7 +185,14 @@ public sealed unsafe class Cells<T>
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool IsValid(int i) => NullCount == 0 || _array.IsValid(i);
+    public bool IsValid(int i)
+    {
+        if (NullCount == 0) return true;
+        int bit = _validStart + i;
+        if (_validBytes != null) return (_validBytes[bit >> 3] & (1 << (bit & 7))) != 0;
+        if (_validPointer != null) return (_validPointer[bit >> 3] & (1 << (bit & 7))) != 0;
+        return _array.IsValid(i);
+    }
 
     /// <summary>
     /// Whether <see cref="Values"/> and <see cref="Valid"/> give all the

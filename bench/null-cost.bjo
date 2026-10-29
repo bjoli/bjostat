@@ -1,0 +1,71 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/null-cost.bjo — where the time of a loop over cells with
+;; nulls goes. The same loops over 1 000 000 doubles with no nulls, with one
+;; in twenty at random rows, with as many in one run at the start, and with
+;; one in a thousand at random rows. If the run is as fast as no nulls, the
+;; cost of the random nulls is the processor guessing the test of each null
+;; wrong; if it is as slow as the random ones, it is the loop itself.
+;;
+;;     bjo bench bench/null-cost.bjo --all
+
+(import (std prelude))
+(import (std bench))
+(import (bjostat table))
+(import (bjostat stats))
+
+(: int) (def rows 1000000)
+
+;; The values, the same in each column, and a null where `null?` says.
+(: (-> (-> int bool) (Cells double)))
+(defun (column null?)
+  (def t (match (make-table [(named "x" (array->column {arraying (cast double (% (* (cast long i) 7919L) 1000L)) (:for i (range 0 rows))}
+                                                       #:valid {arraying (not (null? i)) (:for i (range 0 rows))}))])
+           ((Ok t) t)
+           ((Err e) (panic! (displayed e)))))
+  (match (column-as t "x") ((Ok c) c) ((Err e) (panic! (displayed e)))))
+
+;; A pseudo-random one in `n` rows, the same each run.
+(: (-> int int bool))
+(defun (one-in n i) (= (% (cast int (% (* (cast long i) 2654435761L) 4294967296L)) n) 0))
+
+(: (Cells double)) (def none (column (fun (_) #f)))
+(: (Cells double)) (def random (column (fun (i) (one-in 20 i))))
+(: (Cells double)) (def run (column (fun (i) (< i (/ rows 20)))))
+(: (Cells double)) (def few (column (fun (i) (one-in 1000 i))))
+;; A second column for the correlation, with nulls at other rows.
+(: (Cells double)) (def none2 (column (fun (_) #f)))
+(: (Cells double)) (def random2 (column (fun (i) (one-in 20 (+ i 7)))))
+(: (Cells double)) (def run2 (column (fun (i) (< i (/ rows 20)))))
+
+(: (-> (Cells double) double))
+(defun (sum c) (loop (:for x* c) (:when-let (Some x) x*) (:acc (summing x))))
+(: (-> (Cells double) (Option double)))
+(defun (sd c) (loop (:for x* c) (:when-let (Some x) x*) (:acc (standard-deviation x))))
+(: (-> (Cells double) (Cells double) (Option double)))
+(defun (cor a b)
+  (loop (:for x* a) (:for y* b) (:when-let (Some x) x*) (:when-let (Some y) y*)
+        (:acc (correlation (Tuple x y)))))
+(: (-> (Cells double) double))
+(defun (sum-skip c) (loop (:for x (skip-nulls c)) (:acc (summing x))))
+(: (-> (Cells double) (Cells double) (Option double)))
+(defun (cor-complete a b)
+  (loop (:for (Tuple x y) (complete-rows (Tuple a b))) (:acc (correlation (Tuple x y)))))
+
+(def/bench "sum, no nulls" (sum none))
+(def/bench "sum, 5% random" (sum random))
+(def/bench "sum, 5% in a run" (sum run))
+(def/bench "sum, 0.1% random" (sum few))
+(def/bench "sum, skip-nulls, 5% random" (sum-skip random))
+(def/bench "sd, no nulls" (sd none))
+(def/bench "sd, 5% random" (sd random))
+(def/bench "sd, 5% in a run" (sd run))
+(def/bench "sd, 0.1% random" (sd few))
+(def/bench "cor, no nulls" (cor none none2))
+(def/bench "cor, 5% random" (cor random random2))
+(def/bench "cor, 5% in a run" (cor run run2))
+(def/bench "cor, complete-rows, 5% random" (cor-complete random random2))
+
+(run-benches)
