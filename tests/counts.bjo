@@ -1,0 +1,112 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/counts.bjo — counts by key, as dplyr's count, and tables of
+;; two keys, as R's table(x, y).
+;;
+;;     bjo run tests/counts.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjostat table))
+(import (bjostat csv))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result TableError %a) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+(: (-> string Table))
+(defun (csv text) (ok (csv->table text)))
+
+(: (-> Table string))
+(defun (shown t) (table->string t #:rows 100))
+
+(: (-> (Vec string) string))
+(defun (lines ls) (string-join ls "\n"))
+
+(defun (main)
+  (def survey (csv "sex,smoker,age\nf,yes,30\nm,no,41\nf,no,30\n,yes,52\nm,no,30\nf,yes,41\n"))
+
+  ;; Counts
+  (expect "count by one key: in order, a null last"
+          (shown (ok (table-count survey ["sex"])))
+          (lines ["sex     n   "
+                  "string  long"
+                  "f       3   "
+                  "m       2   "
+                  "null    1   "
+                  ""]))
+  (expect "count by two keys"
+          (shown (ok (table-count survey ["sex" "smoker"] #:name "people")))
+          (lines ["sex     smoker  people"
+                  "string  string  long  "
+                  "f       no      1     "
+                  "f       yes     2     "
+                  "m       no      2     "
+                  "null    yes     1     "
+                  ""]))
+  (expect "count by a number"
+          (shown (ok (table-count survey ["age"])))
+          (lines ["age   n   "
+                  "long  long"
+                  "30    3   "
+                  "41    2   "
+                  "52    1   "
+                  ""]))
+  (expect "count by no key: the rows"
+          (shown (ok (table-count survey [])))
+          (lines ["n   " "long" "6   " ""]))
+  (expect "count of no rows" (table-row-count (ok (table-count (table-slice survey #:to 0) ["sex"]))) 0)
+  (expect "count by a category, in the order of its levels"
+          (shown (ok (table-count (ok (table-categorize survey "smoker" #:levels ["yes" "no"])) ["smoker"])))
+          (lines ["smoker    n   "
+                  "category  long"
+                  "yes       3   "
+                  "no        3   "
+                  ""]))
+  (expect "count named as a key"
+          (error-of (table-count survey ["sex"] #:name "sex"))
+          "the count and a key are both named 'sex'.")
+  (expect "count by a column that is not there"
+          (error-of (table-count survey ["sex" "town"]))
+          "the table has no column 'town'. Its columns are: sex, smoker, age.")
+
+  ;; Tables of two keys
+  (expect "crosstab: a row for each value, a column for each value, 0 for none, nulls left out"
+          (shown (ok (table-crosstab survey "sex" "smoker")))
+          (lines ["sex     no    yes "
+                  "string  long  long"
+                  "f       1     2   "
+                  "m       2     0   "
+                  ""]))
+  (expect "crosstab: columns of numbers, named by their text"
+          (shown (ok (table-crosstab survey "smoker" "age")))
+          (lines ["smoker  30    41    52  "
+                  "string  long  long  long"
+                  "no      2     1     0   "
+                  "yes     1     1     1   "
+                  ""]))
+  (expect "crosstab: the columns of a category in the order of its levels"
+          (table-names (ok (table-crosstab (ok (table-categorize survey "smoker" #:levels ["yes" "no"])) "sex" "smoker")))
+          ["sex" "yes" "no"])
+  (expect "crosstab of no rows"
+          (shown (ok (table-crosstab (table-slice survey #:to 0) "sex" "smoker")))
+          (lines ["sex   " "string" ""]))
+  (expect "crosstab of one key twice"
+          (error-of (table-crosstab survey "sex" "sex"))
+          "the rows and the columns are both of 'sex'.")
+  (expect "crosstab: a value named as the row key"
+          (error-of (table-crosstab (csv "a,b\nx,a\n") "a" "b"))
+          "'b' has the value 'a', and the table has a column of that name already.")
+  0)

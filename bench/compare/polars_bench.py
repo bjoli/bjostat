@@ -59,6 +59,7 @@ with pl.StringCache():
     bench("group by category, sum", lambda: by_codes.group_by("region").agg(pl.col("price").sum()).height)
     bench("sort by a category, then a number",
           lambda: by_codes.sort(["region", "price"], descending=[False, True], maintain_order=True).height)
+    bench("count by a category", lambda: by_codes.group_by("region").len().sort("region").height)
     bench("join by a category to 4 rows",
           lambda: by_codes.join(rates_codes, on="region", how="inner", maintain_order="left").height)
 bench("distinct by a string and a long",
@@ -69,3 +70,6 @@ bench("pivot longer, two columns",
       lambda: two_prices.unpivot(["price", "price2"], index="id", variable_name="name", value_name="value").height)
 bench("pivot wider, two columns",
       lambda: prices_long.pivot(on="name", index="id", values="value", maintain_order=True).height)
+bench("count by a string and a long", lambda: df.group_by(["region", "qty"]).len().sort(["region", "qty"]).height)
+bench("crosstab of a string and a long",
+      lambda: df.group_by(["region", "qty"]).len().pivot(on="qty", index="region", values="len").height)

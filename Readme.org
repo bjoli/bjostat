@@ -52,6 +52,8 @@ a copy.
 | ~(table-append [t …])~                                         | The rows of the tables one after the other, columns by name, nulls where a table has no column, as ~bind_rows~ |
 | ~(pivot-longer t cols #:names-to n #:values-to v)~             | Columns to rows, as tidyr's ~pivot_longer~ |
 | ~(pivot-wider t #:names-from n #:values-from v)~               | Rows to columns, as tidyr's ~pivot_wider~: a null where no row gives a cell |
+| ~(table-count t keys #:name "n")~                             | A row for each distinct key and its number of rows, as dplyr's ~count~ |
+| ~(table-crosstab t row-key col-key)~                           | R's ~table(x, y)~: a row for each value of one key, a column of counts for each of the other |
 | ~(table-categorize t name #:levels ls)~                        | The column a category; levels sorted, or those given, a string not in them an ~Err~ |
 | ~(category-levels t name)~, ~(category-codes t name)~          | A category's levels in order, and its codes as ~(Cells int)~ |
 | ~(read-arrow path)~, ~(write-arrow t path)~ | Arrow IPC files |
@@ -290,5 +292,6 @@ bjo run tests/dates.bjo
 bjo run tests/stats.bjo
 bjo run tests/reshape.bjo
 bjo run tests/types.bjo
+bjo run tests/counts.bjo
 bjo bench bench/csv.bjo --all
 #+END_SRC

@@ -280,6 +280,17 @@ and statistics. Done so far:
   value Arrow keeps under it, which a left join could make differ before.
   The distinct strings of a column are found by open addressing over its
   bytes, which made a sort by a string 72 ms from 110.
+- *Counts:* ~table-count~ (dplyr's ~count~: a row for each distinct key,
+  sorted, a null a value) and ~table-crosstab~ (R's ~table(x, y)~: a column
+  of counts for each value of the second key, 0 for a pair no row has, rows
+  with a null left out). Rows of equal keys are now found without a hash of
+  each row: each key column gives its values ids (a category its codes, a
+  string the open addressing of its bytes, an integer its distance from the
+  least), and the ids of the columns are put together as the digits of one
+  number, numbered again from 0 after each column. When each row is a group
+  of its own, the other columns are not read. A count by a string and a
+  long became 15 ms from 60, a distinct by them 14.5 ms from 60, and a pivot
+  to wider rows 75 ms from 151.
 
 Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
 
@@ -293,11 +304,14 @@ Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
 | median                          | 16.4 ms    | 11.5 ms   | 3.0 ms     |
 | correlation                     | 2.91 ms    | 1.08 ms   | 1.31 ms    |
 | summary of the table            | 95–100 ms  | 46.8 ms   | 26.2 ms    |
-| distinct by a string and a long | 60.2 ms    | 24.8 ms   | 14.5 ms    |
-| distinct rows (all distinct)    | 126 ms     | 113 ms    | 82.3 ms    |
+| distinct by a string and a long | 14.5 ms    | 24.8 ms   | 14.5 ms    |
+| distinct rows (all distinct)    | 6.05 ms    | 113 ms    | 82.3 ms    |
 | append of two tables            | 21.0 ms    | 11.3 ms   | 9.31 ms    |
 | pivot longer, two columns       | 21.8 ms    | 4.78 ms   | 4.79 ms    |
-| pivot wider, two columns        | 151 ms     | 208 ms    | 106 ms     |
+| pivot wider, two columns        | 74.9 ms    | 208 ms    | 106 ms     |
+| count by a string and a long    | 15.0 ms    | 7.88 ms   | 3.07 ms    |
+| count by a category             | 1.79 ms    | 5.80 ms   | 1.43 ms    |
+| crosstab of a string and a long | 15.6 ms    | 8.30 ms   | 3.36 ms    |
 | categorize a string column      | 12.6 ms    | 13.5 ms   | 2.37 ms    |
 | group by a category, sum        | 2.20 ms    | 5.98 ms   | 1.47 ms    |
 | sort by a category, then a number | 58.4 ms  | 271 ms    | 39.0 ms    |
@@ -313,14 +327,15 @@ because the vector adds in another order.
 
 In the order that lets an analysis be done from start to end:
 
-1. *Statistics:* counts by one or two keys (R's ~table~), and a t-digest for
-   quantiles in one pass with little memory.
+1. *Distributions and random numbers:* density, distribution, quantile and
+   samples of the normal, t, χ², F, binomial and Poisson distributions, and
+   a generator with a seed. Before models, as their p-values need the t and
+   F distributions.
 2. *Models:* ~lm~ as a collector of a QR decomposition, with coefficients,
    standard errors, R² and p-values; then ~glm~. A formula macro later.
-3. *Distributions and random numbers:* density, distribution, quantile and
-   samples of the normal, t, χ², F, binomial and Poisson distributions, and
-   a generator with a seed.
-4. *Plots* as Vega-Lite or SVG, and *Parquet*.
+3. *Tests:* t-tests and the χ² test of a crosstab.
+4. *Statistics:* a t-digest for quantiles in one pass with little memory.
+5. *Plots* as Vega-Lite or SVG, and *Parquet*.
 
 Not from R: the recycling of short vectors, silent conversions between
 types, NA that spreads through a sum unless the collector says so, and

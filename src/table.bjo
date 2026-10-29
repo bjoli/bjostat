@@ -48,6 +48,7 @@
   SortKey table-sort
   inner-join left-join semi-join anti-join
   table-distinct table-append pivot-longer pivot-wider
+  table-count table-crosstab
 
   ;; Categories
   table-categorize category-levels category-codes
@@ -139,6 +140,8 @@
   (clr-pivot-longer (: Bjostat.Reshape.PivotLonger (-> Table (Array string) string string Table)
                        #:exceptions (Bjostat.TableProblem)))
   (clr-pivot-wider (: Bjostat.Reshape.PivotWider (-> Table string string Table) #:exceptions (Bjostat.TableProblem)))
+  (clr-count (: Bjostat.Counts.Count (-> Table (Array string) string Table) #:exceptions (Bjostat.TableProblem)))
+  (clr-crosstab (: Bjostat.Counts.Crosstab (-> Table string string Table) #:exceptions (Bjostat.TableProblem)))
   (clr-categorize (: Bjostat.Categories.Categorize (-> Table string (Array string) Table)
                      #:exceptions (Bjostat.TableProblem)))
   (clr-levels (: Bjostat.Categories.Levels (-> AnyColumn (Array string))))
@@ -635,6 +638,32 @@
 (: (-> Table (#:names-from string) (#:values-from string) (Result TableError Table)))
 (defun (pivot-wider t #:names-from "name" #:values-from "value")
   (problem-or (clr-pivot-wider t names-from values-from)))
+
+;; ===========================================================================
+;; Counts
+;; ===========================================================================
+
+;; How many rows have each value of the columns `keys`, as dplyr's count: a
+;; row for each distinct value, with the count in the column `#:name`, in the
+;; order of the keys as table-sort gives it. A null is a value. With no keys,
+;; one row of the number of rows.
+;;
+;;     (table-count sales ["region" "product"])
+(: (-> Table (Vec string) (#:name string) (Result TableError Table)))
+(defun (table-count t keys #:name "n")
+  (problem-or (clr-count t (vec->array keys) name)))
+
+;; How many rows have each pair of values of two columns, as R's table(x, y):
+;; a row for each value of `row-key`, and a column for each value of
+;; `col-key`, named by its text as table->string prints it, with 0 for a
+;; pair that no row has. Both are in the order of table-sort, so the levels
+;; of a category keep their order. A row with a null in either key is left
+;; out, as R does.
+;;
+;;     (table-crosstab survey "smoker" "sex")
+(: (-> Table string string (Result TableError Table)))
+(defun (table-crosstab t row-key col-key)
+  (problem-or (clr-crosstab t row-key col-key)))
 
 ;; ===========================================================================
 ;; Categories

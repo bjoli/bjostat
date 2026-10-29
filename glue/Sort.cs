@@ -44,14 +44,20 @@ public static class Sorting
     /// <paramref name="columns"/>, each in the direction that
     /// <paramref name="descending"/> says.
     /// </summary>
-    public static RecordBatch SortBy(RecordBatch t, int[] columns, bool[] descending)
+    public static RecordBatch SortBy(RecordBatch t, int[] columns, bool[] descending) =>
+        Query.Take(t, Order(columns.Select(t.Column).ToArray(), descending, t.Length), t.Length);
+
+    /// <summary>
+    /// The rows, 0 to n - 1, in the order of the columns, each in the
+    /// direction that <paramref name="descending"/> says.
+    /// </summary>
+    internal static int[] Order(IArrowArray[] columns, bool[] descending, int n)
     {
-        int n = t.Length;
         var order = new int[n];
         for (int i = 0; i < n; i++) order[i] = i;
         for (int k = columns.Length - 1; k >= 0 && n > 1; k--)
-            Pass(order, t.Column(columns[k]), descending[k]);
-        return Query.Take(t, order, n);
+            Pass(order, columns[k], descending[k]);
+        return order;
     }
 
     // One stable pass: `order` in the order of the column, and among equal

@@ -180,4 +180,8 @@
 (def/bench "join by a category to 4 rows"
   (table-row-count (ok (inner-join by-codes region-rates-codes ["region"]))))
 
+(def/bench "count by a string and a long" (table-row-count (ok (table-count t ["region" "qty"]))))
+(def/bench "count by a category" (table-row-count (ok (table-count by-codes ["region"]))))
+(def/bench "crosstab of a string and a long" (table-row-count (ok (table-crosstab t "region" "qty"))))
+
 (run-benches)
