@@ -478,9 +478,10 @@ loops before anything else, as they change the Collector trait:
      collectors combined, needs no change in Bjolang; a ~:parallel~
      clause of the loop would be shorter and needs the compiler. Try the
      function first.
-   - *What runs it.* Fibers of the pool, as the prototype. The glue's
-     copies of columns use C# threads of their own now; they should go to
-     the same pool.
+   - *What runs it.* Fibers of the pool, as the prototype. The copy of
+     the kept columns of a filter runs on .NET's ~Parallel.For~
+     (glue/Query.cs), outside Bjolang's scheduler; it should go through
+     the same parts.
 2. *Ids instead of hashes for strings and integers.* bjostat is the
    slowest of five at a group by a string (29.4 ms) and at a join by a
    long (136 ms, 137 MB), and slow at a join by a string (82.5 ms). Its
