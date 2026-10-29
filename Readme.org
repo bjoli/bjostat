@@ -159,8 +159,7 @@ and keeps four aggregates, each its own ~:acc~:
       ((Ok babies) (column-as t "total_fer") :propagate))
 
 (def groups (group-index))
-(loop (:for i* income) (:for l* life) (:for b* babies)
-      (:when-let (Some i) i*) (:when-let (Some l) l*) (:when-let (Some b) b*)
+(loop (:for (Tuple i l b) (complete-rows (Tuple income life babies)))
       (:let g (group-of! groups (bracket (: i long))))
       (:acc n (counting-by groups (Tuple g l)))
       (:acc years (mean-by groups (Tuple g l)))
@@ -188,7 +187,9 @@ person is high and shared by few. The shortest of all is Haiti's 32.1, most
 likely the figure for 2010, the year of its earthquake.
 
 *Long lives on a small budget*: the countries over 75 years on under $12 000
-a year, by a ~:when~ and ~selecting~:
+a year, by a ~:when~ and ~selecting~. ~selecting~ needs the number of each
+row, so this loop walks all the rows and leaves out the nulls with
+~:when-let~, not with ~complete-rows~:
 
 #+BEGIN_SRC scheme
 (loop (:for row (range 0 (table-row-count t)))
@@ -302,10 +303,9 @@ Statistics are collectors of doubles, so they are loops too. A null is left
 out by the loop, where R needs ~na.rm = TRUE~:
 
 #+BEGIN_SRC scheme
-(loop (:for p* price) (:when-let (Some p) p*) (:acc (summarizing p)))
+(loop (:for p (skip-nulls price)) (:acc (summarizing p)))
 ;; Some summary: n, min, q1, median, mean, q3, max, sd
-(loop (:for p* price) (:for q* qty)
-      (:when-let (Some p) p*) (:when-let (Some q) q*)
+(loop (:for (Tuple p q) (complete-rows (Tuple price qty)))
       (:acc (correlation (Tuple p (cast double q)))))
 #+END_SRC
 
@@ -364,11 +364,10 @@ gives the response and its predictors.
 
 #+BEGIN_SRC scheme
 ;; R's lm(dist ~ speed)
-(loop (:for s* speed) (:for d* dist) (:when-let (Some s) s*) (:when-let (Some d) d*)
+(loop (:for (Tuple s d) (complete-rows (Tuple speed dist)))
       (:acc (simple-linear-model "speed" (Tuple d s))))
 ;; R's lm(price ~ area + rooms)
-(loop (:for p* price) (:for a* area) (:for r* rooms)
-      (:when-let (Some p) p*) (:when-let (Some a) a*) (:when-let (Some r) r*)
+(loop (:for (Tuple p a r) (complete-rows (Tuple price area rooms)))
       (:acc (linear-model ["area" "rooms"] (Tuple p [a (cast double r)]))))
 #+END_SRC
 
@@ -404,7 +403,7 @@ over them: ~(model-residual m y xs)~, ~(model-leverage m xs)~ (R's
 ~glm-residual~ of a generalized model.
 
 #+BEGIN_SRC scheme
-(loop (:for s* speed) (:for d* dist) (:when-let (Some s) s*) (:when-let (Some d) d*)
+(loop (:for (Tuple s d) (complete-rows (Tuple speed dist)))
       (:acc (column-building (model-residual m d [s]))))
 #+END_SRC
 

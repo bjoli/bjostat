@@ -390,6 +390,17 @@ In the order that lets an analysis be done from start to end:
 2. *Parquet*. Plots are in a package of their own, ~(bjostat plot)~ in the
    repository bjostat-plot: Vega-Lite specifications of tables, and images
    by vl-convert.
+3. *Nulls of dates and times.* ~skip-nulls~ and ~complete-rows~ take
+   ~Cells~ only, not ~DateCells~, ~DateTimeCells~ or ~InstantCells~. A
+   trait of a column with nulls (its length, its null count, whether a row
+   is valid, the value at a row), with an implementation for each of the
+   four, lets both be generic over it: ~(Tuple %a %b)~ where each is such a
+   column, so that a date and a double go in one ~complete-rows~. Tests of
+   dates, timestamps and a mixed tuple, and ~bench/nulls.bjo~ again to see
+   that ~Cells~ is not slower.
+   Also the number of each complete row, so that ~selecting~ can go with
+   ~complete-rows~: a filter of rows now walks all of them with
+   ~:when-let~, as examples/countries.bjo does.
 
 Not from R: the recycling of short vectors, silent conversions between
 types, NA that spreads through a sum unless the collector says so, and
@@ -442,6 +453,12 @@ Still open, checked again on the vectorise branch:
   declarations: a Bjolang struct with a field ~(Column %a)~ is refused by C#,
   as Arrow's ~PrimitiveArray<T>~ needs ~where T : struct~. The glue's
   ~Cells<T>~ has no constraint for that reason.
+- ~array->column~ is generic over any ~%a~, so an array of strings
+  compiles and is then an exception of Arrow at run time: Bjolang's string
+  is a struct, which meets ~where T : struct~, but holds a reference, which
+  Arrow's buffers cannot. Strings go to ~array->string-column~. A
+  constraint on ~array->column~ of the types Arrow stores would make it a
+  Bjolang error.
 - A number that only ~summing~ uses is an ~int~, as Bjolang reads a literal,
   so ~(:acc (summing x))~ over cells asks for a column of ints, and a column
   of doubles is an Err at run time. Such a value needs its type written.

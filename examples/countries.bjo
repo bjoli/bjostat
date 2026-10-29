@@ -61,8 +61,7 @@
   ;; 1. Does money buy years? Grouped by income, one pass, one hash a row.
   (def groups (group-index))
   (def by-income
-    (ok (loop (:for i* income) (:for l* life) (:for b* babies)
-              (:when-let (Some i) i*) (:when-let (Some l) l*) (:when-let (Some b) b*)
+    (ok (loop (:for (Tuple i l b) (complete-rows (Tuple income life babies)))
               (:let g (group-of! groups (bracket (: i long))))
               (:acc n (counting-by groups (Tuple g l)))
               (:acc years (mean-by groups (Tuple g l)))
@@ -75,6 +74,8 @@
   (println (table->string by-income #:digits 1))
 
   ;; 2. Long lives on a small budget: over 75 years on under $12 000 a year.
+  ;; `selecting` needs the number of each row, so the loop walks all of them
+  ;; and leaves out the nulls with :when-let, not with complete-rows.
   (def thrifty
     (loop (:for row (range 0 (table-row-count t)))
           (:for i* income) (:for l* life)
@@ -86,12 +87,10 @@
 
   ;; 3. Prices: the country where they rise fastest, and the one where they fall.
   (def* ((Tuple hottest heat)
-         (loop (:for c* country) (:for f* inflation)
-               (:when-let (Some c) c*) (:when-let (Some f) f*)
+         (loop (:for (Tuple c f) (complete-rows (Tuple country inflation)))
                (:acc best (folding (Tuple "" -1000.0) (if (> f (snd best)) (Tuple c f) best)))))
         ((Tuple coolest cold)
-         (loop (:for c* country) (:for f* inflation)
-               (:when-let (Some c) c*) (:when-let (Some f) f*)
+         (loop (:for (Tuple c f) (complete-rows (Tuple country inflation)))
                (:acc best (folding (Tuple "" 1000.0) (if (< f (snd best)) (Tuple c f) best))))))
   (println (str "Prices rise fastest in " hottest ", " (double->string heat) "% a year, "
                 "and fall in " coolest ", " (double->string cold) "%.\n"))
@@ -99,8 +98,7 @@
   ;; 4. Trade: how many countries buy more than they sell, and by how much the
   ;; most such country does, in points of GDP.
   (def* ((Tuple buyers (Tuple deepest gap))
-         (loop (:for c* country) (:for x* exports) (:for m* imports)
-               (:when-let (Some c) c*) (:when-let (Some x) x*) (:when-let (Some m) m*)
+         (loop (:for (Tuple c x m) (complete-rows (Tuple country exports imports)))
                (:when (> m x))
                (:acc n (counting c))
                (:acc best (folding (Tuple "" 0.0) (if (> (- m x) (snd best)) (Tuple c (- m x)) best)))
