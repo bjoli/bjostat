@@ -54,7 +54,7 @@
 (def no-moments (Moments (n 0L) (k 0.0) (s1 0.0) (s2 0.0)))
 
 (: (-> Moments double Moments))
-(defun (moments-add m x)
+(defun (moments-add m x) #:inline
   (def k (if (= (record-ref m n) 0L) x (record-ref m k)))
   (def d (- x k))
   (Moments (n (+ (record-ref m n) 1L)) (k k)
@@ -121,8 +121,11 @@
 (: CoMoments)
 (def no-co-moments (CoMoments (n 0L) (kx 0.0) (ky 0.0) (sx 0.0) (sy 0.0) (sxx 0.0) (syy 0.0) (sxy 0.0)))
 
+;; Written #:inline, as moments-add is, so that a loop of a collector of
+;; another module has the step in it and not a call: with a call, .NET
+;; inlined the step only with its dynamic profile (bench/null-cost.bjo).
 (: (-> CoMoments (Tuple double double) CoMoments))
-(defun (co-moments-add m xy)
+(defun (co-moments-add m xy) #:inline
   (def (x y) xy)
   (def first? (= (record-ref m n) 0L))
   (def kx (if first? x (record-ref m kx)))

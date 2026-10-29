@@ -704,9 +704,13 @@ loops before anything else, as they change the Collector trait:
      correlation takes 10 ms, nulls or not.
    - .NET makes the code of a function from its first calls, so a
      function first run on cells without nulls is laid out for them.
-   - ~#:inline~ on ~co-moments-add~ changed nothing: Bjolang copies the
-     collector's step into the loop, but not the ~#:inline~ function the
-     step calls from its module (in Bjolang's Todo).
+   - ~#:inline~ on ~co-moments-add~ changed nothing at first: Bjolang
+     copied the collector's step into the loop, but not the ~#:inline~
+     function the step calls from its module, whose body was not published.
+     Fixed in Bjolang: such a helper's body is published with the body that
+     names it. Now ~moments-add~ and ~co-moments-add~ are ~#:inline~, and
+     with ~DOTNET_TieredPGO=0~ the correlation takes 3.75 ms instead of
+     10.4; with the profile, as before.
    What would end the rest of the cost of nulls is in the loop, and is
    for a decision: the valid bits of all the loop's columns taken 64 at a
    time, as one word, and a word whose rows are all valid run with no test
