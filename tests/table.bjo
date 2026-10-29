@@ -203,6 +203,32 @@
 
 
   ;; Sorted
+  ;; A sort of many rows is made in parts on the workers: 300 000 rows of
+  ;; 1 000 values each and a null in every 97, in order and stable, the
+  ;; nulls last, both ways.
+  (def many (ok (make-table [(named "v" (array->column {arraying (cast double (% (* i 7919) 1000)) (:for i (range 0 300000))}
+                                                      #:valid {arraying (not (= (% i 97) 5)) (:for i (range 0 300000))}))
+                             (named "i" (array->column {arraying i (:for i (range 0 300000))}))])))
+  (: (-> Table bool bool))
+  (defun (sorted-stably? u up?)
+    (def v (: (ok (column-as u "v")) (Cells double)))
+    (def ix (: (ok (column-as u "i")) (Cells int)))
+    (loop (:for r (range 1 (table-row-count u)))
+          (:acc ok (folding #t
+                            (and ok
+                                 (match (Tuple (cells-get v (- r 1)) (cells-get v r))
+                                   ((Tuple (Some a) (Some b))
+                                    (if (= a b) (< (cells-ref ix (- r 1)) (cells-ref ix r)) (if up? (< a b) (> a b))))
+                                   ((Tuple (Some _) None) #t)
+                                   ((Tuple None None) (< (cells-ref ix (- r 1)) (cells-ref ix r)))
+                                   ((Tuple None (Some _)) #f)))))))
+  (expect "a sort in parts: ascending, stable, nulls last"
+          (sorted-stably? (ok (table-sort many [(ascending "v")])) #t) #t)
+  (expect "a sort in parts: descending, stable, nulls last"
+          (sorted-stably? (ok (table-sort many [(descending "v")])) #f) #t)
+  (expect "a sort in parts keeps every row"
+          (column-sum (ok (ints (ok (table-sort many [(ascending "v")])) "i")))
+          (column-sum (ok (ints many "i"))))
   (def nan (/ 0.0 0.0))
   (def u (ok (make-table
                [(named-strings "name" (array->string-column (vec->array ["b" "a" "c" "a" "b" "é" "ab"])
@@ -248,6 +274,28 @@
           #t)
 
   ;; Joins
+  ;; A join of many rows is made in parts on the workers: 200 000 left rows
+  ;; with keys of 0 to 69 999, and a right row for each key below 60 000,
+  ;; two for those that ten divides.
+  (def lefts (ok (make-table [(named "k" (array->column {arraying (cast long (% (* i 7919) 70000)) (:for i (range 0 200000))}))
+                              (named "i" (array->column {arraying i (:for i (range 0 200000))}))])))
+  (def rights (ok (make-table [(named "k" (array->column {arraying (cast long (if (< r 60000) r (* (- r 60000) 10)))
+                                                                (:for r (range 0 66000))}))])))
+  (: (-> long int))
+  (defun (matches k) (cond ((>= k 60000L) 0) ((= (% k 10L) 0L) 2) (else 1)))
+  (def left-keys (: (ok (column-as lefts "k")) (Cells long)))
+  (expect "a join in parts: the rows of an inner, a left, a semi and an anti join"
+          (vec-map table-row-count [(ok (inner-join lefts rights ["k"])) (ok (left-join lefts rights ["k"]))
+                                    (ok (semi-join lefts rights ["k"])) (ok (anti-join lefts rights ["k"]))])
+          [(loop (:for k (skip-nulls left-keys)) (:acc (summing (matches k))))
+           (loop (:for k (skip-nulls left-keys)) (:acc (summing (max 1 (matches k)))))
+           (loop (:for k (skip-nulls left-keys)) (:when (> (matches k) 0)) (:acc (counting k)))
+           (loop (:for k (skip-nulls left-keys)) (:when (= (matches k) 0)) (:acc (counting k)))])
+  (expect "a join in parts keeps the order of the left rows"
+          (let ((ix (: (ok (column-as (ok (left-join lefts rights ["k"])) "i")) (Cells int))))
+            (loop (:for r (range 1 (cells-length ix)))
+                  (:acc ok (folding #t (and ok (<= (cells-ref ix (- r 1)) (cells-ref ix r)))))))
+          #t)
   (def orders (ok (make-table
                     [(named-strings "region" (array->string-column (vec->array ["north" "south" "west" "north" "x"])
                                                                     #:valid (vec->array [#t #t #t #t #f])))

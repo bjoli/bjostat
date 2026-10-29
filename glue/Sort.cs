@@ -200,8 +200,87 @@ public static class Sorting
 
     // A least significant digit first radix sort, 8 bits a pass, of the keys
     // with the rows beside them. It is stable. A digit that is the same in
-    // every key needs no pass.
+    // every key needs no pass. Many keys are sorted in parts on bjostat's
+    // workers.
     private static void RadixSort(ulong[] keys, Span<int> rows)
+    {
+        int parts = Math.Min(keys.Length / PartKeys, Workers.Count);
+        if (parts >= 2) RadixSortParts(keys, rows, parts);
+        else RadixSortOne(keys, rows);
+    }
+
+    // The fewest keys of a part of a sort.
+    private const int PartKeys = 1 << 16;
+
+    // The sort in parts, each pass in three steps: each part counts the
+    // digits of its keys; the counts give each part where each of its digits
+    // goes, after the keys of the smaller digits and after the same digit's
+    // keys of the parts before it, so that the sort stays stable; then each
+    // part moves its keys there. The counts are taken again at each pass, as
+    // a pass moves the keys between the parts.
+    private static void RadixSortParts(ulong[] keys, Span<int> rows, int parts)
+    {
+        int n = keys.Length;
+        int size = (n + parts - 1) / parts;
+        // Whether a digit tells the keys apart: the counts of all the keys.
+        var all = new int[parts][];
+        Workers.For(parts, p =>
+        {
+            var c = new int[8 * 256];
+            for (int i = p * size, to = Math.Min(n, i + size); i < to; i++)
+            {
+                ulong k = keys[i];
+                for (int d = 0; d < 8; d++) c[d * 256 + (int)((k >> (8 * d)) & 0xFF)]++;
+            }
+            all[p] = c;
+        });
+        var keys2 = new ulong[n];
+        var rows1 = rows.ToArray();
+        var rows2 = new int[n];
+        ulong[] fromKeys = keys, toKeys = keys2;
+        int[] fromRows = rows1, toRows = rows2;
+        var counts = new int[parts][];
+        for (int p = 0; p < parts; p++) counts[p] = new int[256];
+        for (int d = 0; d < 8; d++)
+        {
+            int first = (int)((keys[0] >> (8 * d)) & 0xFF), same = 0;
+            for (int p = 0; p < parts; p++) same += all[p][d * 256 + first];
+            if (same == n) continue;
+            int shift = 8 * d;
+            var from = fromKeys;
+            Workers.For(parts, p =>
+            {
+                var c = counts[p];
+                System.Array.Clear(c);
+                for (int i = p * size, to = Math.Min(n, i + size); i < to; i++) c[(int)((from[i] >> shift) & 0xFF)]++;
+            });
+            int sum = 0;
+            for (int b = 0; b < 256; b++)
+                for (int p = 0; p < parts; p++)
+                {
+                    int c = counts[p][b];
+                    counts[p][b] = sum;
+                    sum += c;
+                }
+            var (fk, tk, fr, tr) = (fromKeys, toKeys, fromRows, toRows);
+            Workers.For(parts, p =>
+            {
+                var at = counts[p];
+                for (int i = p * size, to = Math.Min(n, i + size); i < to; i++)
+                {
+                    ulong k = fk[i];
+                    int j = at[(int)((k >> shift) & 0xFF)]++;
+                    tk[j] = k;
+                    tr[j] = fr[i];
+                }
+            });
+            (fromKeys, toKeys) = (toKeys, fromKeys);
+            (fromRows, toRows) = (toRows, fromRows);
+        }
+        fromRows.CopyTo(rows);
+    }
+
+    private static void RadixSortOne(ulong[] keys, Span<int> rows)
     {
         int n = keys.Length;
         var counts = new int[8 * 256];

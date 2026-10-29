@@ -86,14 +86,28 @@ public static class Joins
     {
         int rn = rk[0].Length;
         var next = new int[rn];
-        var heads = new Dictionary<ulong, int>();
-        var rh = Hashes(rk, rn);
-        for (int r = rn - 1; r >= 0; r--)
+        var rh = HashesInParts(rk, rn);
+        // The hash table in parts by the top bits of the hash, each built on
+        // a worker: a part has the rows of its hashes, from the last, so each
+        // chain is still in the order of the rows. A row is in one part, so
+        // the parts write `next` at other rows.
+        var byPart = new List<int>[HashParts];
+        for (int q = 0; q < HashParts; q++) byPart[q] = new List<int>();
+        for (int r = 0; r < rn; r++) byPart[(int)(rh[r] >> HashPartShift)].Add(r);
+        var tables = new Dictionary<ulong, int>[HashParts];
+        Workers.For(HashParts, q =>
         {
-            ref int head = ref CollectionsMarshal.GetValueRefOrAddDefault(heads, rh[r], out bool there);
-            next[r] = there ? head : -1;
-            head = r;
-        }
+            var rows = byPart[q];
+            var heads = new Dictionary<ulong, int>(rows.Count);
+            for (int i = rows.Count - 1; i >= 0; i--)
+            {
+                int r = rows[i];
+                ref int head = ref CollectionsMarshal.GetValueRefOrAddDefault(heads, rh[r], out bool there);
+                next[r] = there ? head : -1;
+                head = r;
+            }
+            tables[q] = heads;
+        });
         var same = lk.Select((a, k) => Equality(a, rk[k])).ToArray();
 
         // The left rows in parts on bjostat's workers, each with lists of
@@ -113,7 +127,8 @@ public static class Joins
             for (int l = from; l < to; l++)
             {
                 bool found = false;
-                if (heads.TryGetValue(lh[l - from], out int r))
+                ulong h = lh[l - from];
+                if (tables[(int)(h >> HashPartShift)].TryGetValue(h, out int r))
                 {
                     for (; r >= 0; r = next[r])
                     {
@@ -138,6 +153,25 @@ public static class Joins
 
     // The rows of a part of a join's left table.
     private const int PartRows = 1 << 16;
+
+    // The parts of a join's hash table: 64, by the top 6 bits of the hash.
+    private const int HashParts = 64;
+    private const int HashPartShift = 58;
+
+    // The hashes of the rows, in parts on the workers.
+    private static ulong[] HashesInParts(IArrowArray[] keys, int n)
+    {
+        if (n < 2 * PartRows) return Hashes(keys, n);
+        var h = new ulong[n];
+        int parts = (n + PartRows - 1) / PartRows;
+        Workers.For(parts, p =>
+        {
+            int from = p * PartRows, to = Math.Min(n, from + PartRows);
+            Hashes(keys.Select(a => ArrowArrayFactory.Slice(a, from, to - from)).ToArray(), to - from)
+                .CopyTo(h, from);
+        });
+        return h;
+    }
 
     // The rows that match, by one key that is a category in both tables:
     // each right level is given the left code of the same string once, and
