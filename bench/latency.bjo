@@ -9,10 +9,10 @@
 ;;
 ;; - nothing: no loop, the latency of the timer itself;
 ;; - fibers that compute, which hold the pumps of Bjolang's run queues;
-;; - computing, Tasks of .NET's pool as events;
+;; - blocking, Tasks of .NET's pool as events;
 ;; - spawn/thread, a thread of its own for each part;
-;; - workers, threads of bjostat's own made once (glue/Workers.cs), as many
-;;   as BJOSTAT_WORKERS says, the logical cores by default.
+;; - computing, bjostat's workers, threads made once (glue/Workers.cs), as
+;;   many as BJOSTAT_WORKERS says, the logical cores by default.
 ;;
 ;;     bjo run bench/latency.bjo [parts] [cpu]
 ;;
@@ -26,8 +26,6 @@
 (import (bjostat table))
 (import (bjostat query))
 (import (bjostat stats))
-
-(import/extern (worker-run (: Bjostat.Workers.Run (-> (-> Unit) void) #:async)))
 
 (: int) (def rows 4000000)
 
@@ -73,9 +71,9 @@
     (loop (:for p ps) (:acc (summing (joined p))))))
 
 (: (-> (-> Table double) int double))
-(defun (on-computing work parts)
+(defun (on-blocking work parts)
   (with-scope
-    (def ps {vecing (bjo (sync (computing (fun () (work (part parts k)))))) (:for k (range 0 parts))})
+    (def ps {vecing (bjo (sync (blocking (fun () (work (part parts k)))))) (:for k (range 0 parts))})
     (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
 
 (: (-> (-> Table double) int double))
@@ -84,16 +82,10 @@
     (def ps {vecing (bjo (sync (spawn/thread (fun () (work (part parts k)))))) (:for k (range 0 parts))})
     (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
 
-;; Each part on a thread of bjostat's own workers, made once; the part keeps
-;; its value in an array, and its end is an event.
+;; Each part on bjostat's workers, all of them one event.
 (: (-> (-> Table double) int double))
 (defun (on-workers work parts)
-  (def sums {arraying 0.0 (:for _ (range 0 parts))})
-  (with-scope
-    (def ps {vecing (bjo (sync (task->event (worker-run (fun () (array-set! sums k (work (part parts k))) unit)))))
-                    (:for k (range 0 parts))})
-    (loop (:for p ps) (:do (match (joined p) ((Ok _) unit) ((Err e) (raise e))))))
-  (loop (:for x sums) (:acc (summing x))))
+  (loop (:for x (computed (computing-each parts (fun (k) (work (part parts k)))))) (:acc (summing x))))
 
 ;; How late each of `n` wakes after 1 ms was, in microseconds.
 (: ticker (-bjo-> int (Vec double)))
@@ -135,8 +127,8 @@
                 (double->string (work t))))
   (scenario "nothing" None)
   (scenario "fibers that compute" (Some (fun () (on-fibers work parts))))
-  (scenario "computing" (Some (fun () (on-computing work parts))))
+  (scenario "blocking" (Some (fun () (on-blocking work parts))))
   (scenario "spawn/thread" (Some (fun () (on-threads work parts))))
-  (scenario "workers" (Some (fun () (on-workers work parts))))
+  (scenario "computing" (Some (fun () (on-workers work parts))))
   (scenario "nothing, again" None)
   0)

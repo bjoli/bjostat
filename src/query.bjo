@@ -36,7 +36,7 @@
   GroupIndex group-index group-of! group-count group-keys category-groups
 
   ;; Work on several cores
-  computing
+  computing computing-each computed worker-count
   SummingBy summing-by CountingBy counting-by MinBy min-by MaxBy max-by
   MeanBy mean-by groups->table)
 
@@ -50,6 +50,10 @@
 (import/class
   ((Builder %a) (: Bjostat.Builder))
   (Selection (: Bjostat.Selection)))
+
+(import/extern
+  (workers-run-all (: Bjostat.Workers.RunAll (-> int (-> int Unit) void) #:async))
+  (workers-count (: Bjostat.Workers.CountOf (-> int))))
 
 (import/extern
   (clr-take (: Bjostat.Query.Take (-> Table (Array int) int Table)))
@@ -572,22 +576,55 @@
 ;; Work on several cores
 ;; ===========================================================================
 
-;; An event that runs `thunk`, work that uses a core, on a thread of .NET's
-;; pool, and whose value is (Ok v), or (Err e) when the thunk raised e:
-;;
-;;     (sync (computing (fun () (revenue part))))           ; in a bjoroutine
-;;     (sync/blocking (computing (fun () (revenue part))))  ; in ordinary code
-;;
-;; It is for the parts of a parallel loop, each a few milliseconds of work.
-;; A fiber must not do such work itself: fibers run on Bjolang's run queues,
+;; Work that uses a core runs on bjostat's workers: threads made once, one
+;; for each logical core, or as many as the environment variable
+;; BJOSTAT_WORKERS says. Not on fibers: they run on Bjolang's run queues,
 ;; one pump for each core, and a fiber that computes holds its pump while
-;; the fibers behind it wait. A fiber that syncs on this event is suspended
-;; instead, and holds nothing. spawn/thread makes a thread for each call,
-;; which takes longer than a short part (bench/parallel.bjo).
+;; the fibers behind it wait. Not on .NET's pool either, whose threads carry
+;; the pumps. A fiber that syncs on the event of a part is suspended and
+;; holds nothing; ordinary code that syncs parks its thread.
 ;;
-;; It is the prelude's `blocking`, which runs a call that parks a thread the
-;; same way, under a name that says what it is for here. The thunk sees the
-;; caller's dynamic environment. It cannot be stopped once it runs: a
-;; cancelled scope stops the wait, and the thunk goes on to its end.
+;;     (sync (computing (fun () (revenue part))))     ; (Ok v), or (Err e)
+;;     (computed (computing-each 8 (fun (k) (revenue (part k)))))
+;;
+;; A part sees the dynamic environment of the code that synced. Once a part
+;; runs it cannot be stopped; a part whose scope was cancelled before it
+;; started does not run. bench/latency.bjo measures how late fibers wake
+;; while the workers are busy: with as many workers as cores, up to the
+;; length of a part; with fewer, not at all, and the work takes longer.
+
+;; How many workers there are.
+(: (-> int))
+(defun (worker-count) (workers-count))
+
+;; An event that runs `thunk` on a worker, and whose value is (Ok v), or
+;; (Err e) when the thunk raised e.
 (: (-> (-> %a) (Event (Result Exception %a))))
-(defun (computing thunk) (blocking thunk))
+(defun (computing thunk)
+  (wrap (computing-each 1 (fun (_) (thunk)))
+        (fun (r) (match r ((Ok vs) (Ok (vec-ref vs 0))) ((Err e) (Err e))))))
+
+;; An event that runs `(work k)` for each k from 0 to n - 1 on the workers,
+;; at most one part on each, and whose value is (Ok values), in the order of
+;; k, or (Err e) of the first part that raised; the parts not started then
+;; do not run. Each sync runs the parts again.
+(: (-> int (-> int %a) (Event (Result Exception (Vec %a)))))
+(defun (computing-each n work)
+  (guard
+   (fun ()
+     (def values {arraying (: None (Option %a)) (:for _ (range 0 n))})
+     (wrap (task->event (workers-run-all n (fun (k) (array-set! values k (Some (work k))) unit)))
+           (fun (r)
+             (match r
+               ((Ok _) (Ok {vecing (match v ((Some x) x) (None (panic! "(bjostat query): a part has no value")))
+                                   (:for v values)}))
+               ((Err e) (Err e))))))))
+
+;; The value of the event of work on the workers: suspended for in a
+;; bjoroutine, parked for in ordinary code. The exception of an Err is
+;; raised.
+(: (-> (Event (Result Exception %a)) %a))
+(defun (computed ev)
+  (match (by-colour (#:sync (sync/blocking ev)) (#:bjo (sync ev)))
+    ((Ok v) v)
+    ((Err e) (raise e))))

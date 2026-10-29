@@ -15,8 +15,9 @@
 ;;   the fibers queued behind it wait.
 ;; - B, spawn/thread: a thread of its own for each part, which costs more to
 ;;   make than a part of a millisecond takes.
-;; - C, computing: a Task of .NET's pool, as an event. A fiber for each part
-;;   waits for its event, suspended, so no pump is held. This is the way.
+;; - C, computing-each: bjostat's workers, threads made once, all the parts
+;;   one event, which the caller waits for by colour. No pump is held. This
+;;   is the way; bench/latency.bjo measures how it treats other fibers.
 ;;
 ;; Do not start the parts from a module-level def: they read the module's
 ;; values while the module is set up, and wait for it, as it waits for them.
@@ -72,14 +73,10 @@
     (def ps {vecing (bjo (sync (spawn/thread (fun () (revenue (part parts k)))))) (:for k (range 0 parts))})
     (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
 
-;; C: each part a Task of .NET's pool, by computing, which is an event; a
-;; fiber for each waits for it, suspended. No pump is held.
+;; C: the parts on bjostat's workers, all of them one event.
 (: (-> int double))
 (defun (on-pool parts)
-  (with-scope
-    (def ps {vecing (bjo (sync (computing (fun () (revenue (part parts k))))))
-                    (:for k (range 0 parts))})
-    (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
+  (loop (:for x (computed (computing-each parts (fun (k) (revenue (part parts k)))))) (:acc (summing x))))
 
 (def/bench "1 thread" (revenue t))
 (def/bench "fibers, 8 parts" (on-fibers 8))

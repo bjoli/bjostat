@@ -16,6 +16,9 @@
 (import (bjostat query))
 (import/class (InvalidOperationException (: System.InvalidOperationException)))
 
+(: (Param int))
+(def test-parameter (make-parameter 0))
+
 (: (-> (Result TableError %a) %a))
 (defun (ok r)
   (match r
@@ -257,4 +260,26 @@
             (loop (:for p parts)
                   (:acc (summing (match (promise-join/sync p) ((Ok v) v) ((Err _) -1))))))
           (loop (:for i (range 0 8000)) (:acc (summing i))))
+  (expect "computing-each: the values in the order of the parts"
+          (computed (computing-each 8 (fun (k) (* k k))))
+          [0 1 4 9 16 25 36 49])
+  (expect "computing-each: more parts than workers"
+          (vec-length (computed (computing-each (* 3 (worker-count)) (fun (k) k))))
+          (* 3 (worker-count)))
+  (expect "computing-each: none"
+          (vec-length (computed (computing-each 0 (fun (k) k))))
+          0)
+  (expect "computing-each: a part that raises makes it an Err"
+          (match (sync/blocking (computing-each 4 (fun (k) (if (= k 2) (: (raise (cast Exception (InvalidOperationException. "no"))) int) k))))
+            ((Ok _) "no Err") ((Err _) "Err"))
+          "Err")
+  (expect "computed: raises the Err's exception"
+          (match (try (computed (computing (fun () (: (raise (cast Exception (InvalidOperationException. "no"))) int))))
+                      #:catch (System.InvalidOperationException))
+            ((Ok _) "no exception") ((Err e) (.-Message e)))
+          "no")
+  (expect "computing: a part sees the dynamic environment of the sync"
+          (parameterize ((test-parameter 7))
+            (computed (computing (fun () (parameter-ref test-parameter)))))
+          7)
   0)

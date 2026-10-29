@@ -271,7 +271,14 @@ The columns are found first, where a misspelt name is an ~Err~:
 | ~(category-groups t name)~ | The groups of a category's levels, so that a row's code is its group, with no hash |
 | ~(grouping c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |
 | ~(table-with t name c)~ | The table with a column more, or one replaced |
-| ~(computing thunk)~ | An event of the value of work that uses a core, run on .NET's pool: for the parts of a loop on several cores, so that a fiber waits for them suspended |
+| ~(computing thunk)~, ~(computing-each n work)~ | An event of work that uses a core, run on bjostat's workers: one part, or ~(work k)~ for k from 0 to n - 1, the values in order |
+| ~(computed ev)~, ~(worker-count)~ | The value of such an event, waited for by colour; how many workers there are |
+
+*Several cores.* bjostat's workers are threads made once, one for each
+logical core, or as many as the environment variable ~BJOSTAT_WORKERS~ says.
+Work on them is an event: a fiber waits for it suspended, ordinary code
+parks. Fewer workers than cores keep the other fibers of a program on time
+while the workers are busy (bench/latency.bjo).
 
 The loop is the one way to make a column, a filter or a group. Bjolang is to
 make vector code of simple loops (Docs/Vectorisation-design.org in Bjolang),

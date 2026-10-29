@@ -28,22 +28,14 @@ public static class Query
     {
         CheckRows(rows.AsSpan(0, count), t.Length);
         var columns = new IArrowArray[t.ColumnCount];
-        // The columns are copied on several threads when there is enough to
+        // The columns are copied on bjostat's workers when there is enough to
         // copy. Most of the time of a copy is spent to get new memory: the
         // operating system gives each page of a new array when it is first
-        // written. The threads get their pages at the same time.
+        // written. The threads get their pages at the same time. A column's
+        // exception is thrown as one thread would throw it.
         if (columns.Length > 1 && (long)count * columns.Length >= ParallelRows)
         {
-            try
-            {
-                Parallel.For(0, columns.Length, c => columns[c] = TakeColumn(t.Column(c), rows.AsSpan(0, count)));
-            }
-            catch (AggregateException e) when (e.InnerExceptions.Count > 0)
-            {
-                // The exception of a column, as one thread would throw it,
-                // not wrapped in the AggregateException of the threads.
-                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(e.InnerExceptions[0]).Throw();
-            }
+            Workers.For(columns.Length, c => columns[c] = TakeColumn(t.Column(c), rows.AsSpan(0, count)));
         }
         else
             for (int c = 0; c < columns.Length; c++)

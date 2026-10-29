@@ -555,15 +555,25 @@ loops before anything else, as they change the Collector trait:
      start, once.
    - A lower priority of the workers changes nothing on Linux.
 
-   So the parts go to workers of bjostat's own, fewer than the cores. What
-   is to decide is how many: for a script that has no other fibers all the
-   cores are best; for a server, about three in four of them. A setting
-   with a default, and a keyword of the parallel loop, would let a program
-   say. The workers are reached through ~task->event~ of a method that
-   returns a plain ~Task~, and the part keeps its value itself: a generic
-   ~Task<T>~ cannot be imported yet (see the findings). ~computing~ is to
-   become that, and to skip a part whose scope was cancelled while it
-   waited, which the workers already do.
+   So the parts go to workers of bjostat's own. Decided: as many as the
+   logical cores, which is best for a script; ~BJOSTAT_WORKERS~ sets fewer,
+   which a server wants (three in four kept fibers on time here).
+
+   Done (phase 0): glue/Workers.cs is the one place where bjostat's work
+   runs on several cores. ~computing~ and ~computing-each~ give the work as
+   an event, through ~task->event~ of a method that returns a plain ~Task~,
+   the parts keeping their values themselves (a generic ~Task<T>~ cannot be
+   imported yet, see the findings); ~computed~ waits for it by colour. A
+   part runs in the dynamic environment of the sync, and a part whose scope
+   was cancelled before it started does not run. The copy of a filter's
+   columns runs on the workers too (~Workers.For~, in which the calling
+   thread takes parts as well). All the parts as one event did more than a
+   fiber for each: 263 loops of the square roots against 213 to 225.
+
+   Next (phase 1): bjostat's own operations in parts on the workers, one at
+   a time, each measured against Polars on 24 threads. Later (phase 2), the
+   parallel loops of a program, as a clause of the loop in Bjolang's
+   compiler: not yet.
 
    What is to decide:
    - *Combining.* A part gives the accumulator of its collectors, and two
