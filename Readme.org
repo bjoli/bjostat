@@ -314,6 +314,38 @@ parameters: a relative error below 1e-12 almost everywhere, also of p-values
 of 1e-130 and quantiles of 1e-300. Above 4e5 degrees of freedom the t is
 R's corrected normal, of about 10 digits.
 
+** The module (bjostat models)
+
+A linear model of least squares, as R's ~lm~, is a collector too: each row
+gives the response and its predictors.
+
+#+BEGIN_SRC scheme
+;; R's lm(dist ~ speed)
+(loop (:for s* speed) (:for d* dist) (:when-let (Some s) s*) (:when-let (Some d) d*)
+      (:acc (simple-linear-model "speed" (Tuple d s))))
+;; R's lm(price ~ area + rooms)
+(loop (:for p* price) (:for a* area) (:for r* rooms)
+      (:when-let (Some p) p*) (:when-let (Some a) a*) (:when-let (Some r) r*)
+      (:acc (linear-model ["area" "rooms"] (Tuple p [a (cast double r)]))))
+#+END_SRC
+
+| Collector or function | What it makes |
+|------------------------+---------------|
+| ~(linear-model names (Tuple y xs))~ | A ~LinearModel~ with an intercept, or a ~ModelError~ |
+| ~(linear-model/origin names (Tuple y xs))~ | The same with no intercept, as R's ~- 1~ |
+| ~(simple-linear-model name (Tuple y x))~ | The model of one predictor |
+| ~(model->string m)~ | The model as R's ~summary.lm~ prints it |
+| ~(model->table m)~ | The coefficients as a table, as broom's ~tidy~ |
+| ~(model-predict m xs)~ | The response the model gives |
+
+A ~LinearModel~ has the terms, the estimates, standard errors, t values and
+p-values, sigma, the degrees of freedom, R², adjusted R², and the F
+statistic and its p-value, as ~summary.lm~. The rows are not kept: each one
+goes into a QR decomposition by Givens rotations, so the memory is that of
+p² numbers, and the fit is as stable as R's QR. A model with no more rows
+than coefficients, or a predictor that is a linear combination of the
+others, is an ~Err~ where R gives NA.
+
 ** Plans
 
 What comes next is in [[file:plan.org][plan.org]].
@@ -331,5 +363,6 @@ bjo run tests/reshape.bjo
 bjo run tests/types.bjo
 bjo run tests/counts.bjo
 bjo run tests/distributions.bjo
+bjo run tests/models.bjo
 bjo bench bench/csv.bjo --all
 #+END_SRC

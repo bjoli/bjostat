@@ -1,0 +1,234 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/src/models.bjo — the module (bjostat models): linear models of
+;; least squares, as R's lm, fitted by a collector.
+;;
+;; A model is a loop like any other statistic. Each row gives the response
+;; and its predictors; a null is left out by the loop:
+;;
+;;     (loop (:for p* price) (:for a* area) (:for r* rooms)
+;;           (:when-let (Some p) p*) (:when-let (Some a) a*) (:when-let (Some r) r*)
+;;           (:acc (linear-model ["area" "rooms"] (Tuple p [a (cast double r)]))))
+;;
+;; is R's lm(price ~ area + rooms). The model has an intercept, as in R;
+;; linear-model/origin has none, as R's `- 1`. simple-linear-model is the
+;; model of one predictor, with no Vec for each row.
+;;
+;; The rows are not kept: each one is put into a QR decomposition by Givens
+;; rotations, so the memory is that of p² numbers for p coefficients, and
+;; the fit is as stable as R's QR. The result is an Err when the model
+;; cannot be fitted: no more rows than coefficients, or a predictor that is
+;; a linear combination of the others, where R gives NA.
+;;
+;; The standard errors, t values and p-values are those of R's summary.lm,
+;; from the t distribution of n - p degrees of freedom; the F statistic tests
+;; all predictors but the intercept at once.
+
+(export
+  LinearModel ModelError
+  LinearModelling linear-model linear-model/origin
+  SimpleModelling simple-linear-model
+  model->table model->string model-predict)
+
+(import (std prelude))
+(import (bjostat table))
+(import (bjostat distributions))
+(import (only (std maths) nan?))
+
+(import/class (Regression (: Bjostat.Regression)))
+
+(import/extern
+  (clr-make (: Bjostat.Regression.Make (-> bool Regression)))
+  (clr-add (: Bjostat.Regression.Add (-> Regression double (Vec double) Regression)))
+  (clr-add-one (: Bjostat.Regression.AddOne (-> Regression double double Regression)))
+  (clr-problem (: Bjostat.Regression.Problem (-> Regression (Array string) string)))
+  (clr-rows (: Bjostat.Regression.Rows (-> Regression long)))
+  (clr-coefficients (: Bjostat.Regression.Coefficients (-> Regression int)))
+  (clr-intercept? (: Bjostat.Regression.Intercept (-> Regression bool)))
+  (clr-estimates (: Bjostat.Regression.Estimates (-> Regression (Array double))))
+  (clr-rss (: Bjostat.Regression.ResidualSquares (-> Regression double)))
+  (clr-tss (: Bjostat.Regression.TotalSquares (-> Regression double)))
+  (clr-unscaled-errors (: Bjostat.Regression.UnscaledErrors (-> Regression (Array double))))
+  (significant (: Bjostat.Regression.Significant (-> double int string))))
+
+;; ===========================================================================
+;; The model
+;; ===========================================================================
+
+;; A fitted model. The terms are "(Intercept)", when the model has one, and
+;; the names of the predictors; the estimates and the others are in their
+;; order. `df` is that of the residuals, n - p. The F statistic and its
+;; p-value test all predictors but the intercept, and are NaN for a model of
+;; the intercept alone.
+(type (: LinearModel
+         (Record (: terms (Vec string))
+                 (: estimates (Vec double))
+                 (: standard-errors (Vec double))
+                 (: t-values (Vec double))
+                 (: p-values (Vec double))
+                 (: sigma double)
+                 (: df long)
+                 (: rows long)
+                 (: r-squared double)
+                 (: adjusted-r-squared double)
+                 (: f-statistic double)
+                 (: f-p-value double)
+                 (: intercept? bool))))
+
+;; Why a model cannot be fitted.
+(type (: ModelError (Record (: message string))))
+
+(impl (Displayed ModelError)
+  (defun (displayed e) (record-ref e message))
+  (defun (display-into e b) (stringbuilder-add-string! b (record-ref e message))))
+
+(: (-> Regression (Vec string) (Result ModelError LinearModel)))
+(defun (fit m names)
+  (def problem (clr-problem m (vec->array names)))
+  (def predictors (- (clr-coefficients m) (if (clr-intercept? m) 1 0)))
+  (cond
+    ((not (= problem "")) (Err (ModelError (message problem))))
+    ((not (= (vec-length names) predictors))
+     (Err (ModelError (message (str "the rows have " (int->string predictors) (if (= predictors 1) " predictor" " predictors")
+                                    ", and there are "
+                                    (int->string (vec-length names)) " names.")))))
+    (else (Ok (fitted m names)))))
+
+(: (-> Regression (Vec string) LinearModel))
+(defun (fitted m names)
+  (def p (clr-coefficients m))
+  (def intercept? (clr-intercept? m))
+  (def n (clr-rows m))
+  (def df (- n (cast long p)))
+  (def dfd (cast double df))
+  (def b (array->vec (clr-estimates m)))
+  (def rss (clr-rss m))
+  (def tss (clr-tss m))
+  (def sigma (sqrt (/ rss dfd)))
+  (def se (vec-map (fun (e) (* sigma e)) (array->vec (clr-unscaled-errors m))))
+  (def ts {vecing (/ (vec-ref b i) (vec-ref se i)) (:for i (range 0 p))})
+  (def ps (vec-map (fun (t) (* 2.0 (t-cdf (- 0.0 (abs t)) dfd))) ts))
+  (def free (if intercept? (- p 1) p))
+  (def r2 (- 1.0 (/ rss tss)))
+  (def f (/ (/ (- tss rss) (cast double free)) (/ rss dfd)))
+  (LinearModel (terms (if intercept? (vec-add-first names "(Intercept)") names))
+               (estimates b) (standard-errors se) (t-values ts) (p-values ps)
+               (sigma sigma) (df df) (rows n)
+               (r-squared r2)
+               (adjusted-r-squared (- 1.0 (* (- 1.0 r2)
+                                              (/ (cast double (- n (if intercept? 1L 0L))) dfd))))
+               (f-statistic (if (> free 0) f (/ 0.0 0.0)))
+               (f-p-value (if (> free 0) (f-cdf f (cast double free) dfd #:lower? #f) (/ 0.0 0.0)))
+               (intercept? intercept?)))
+
+;; ===========================================================================
+;; The collectors
+;; ===========================================================================
+
+;; A model of the response on the predictors named `names`, with an
+;; intercept: each element is the response and a Vec of the predictors.
+(type (: LinearModelling #:opaque (Struct (: names (Vec string)) (: intercept bool))))
+
+(: (-> (Vec string) LinearModelling))
+(defun (linear-model names) (LinearModelling (names names) (intercept #t)))
+
+;; The same, with no intercept: the model goes through the origin.
+(: (-> (Vec string) LinearModelling))
+(defun (linear-model/origin names) (LinearModelling (names names) (intercept #f)))
+
+(impl (Collector LinearModelling)
+  (type %elem (Tuple double (Vec double)))
+  (type %acc Regression)
+  (type %out (Result ModelError LinearModel))
+  (defun (collector-init c) (clr-make (record-ref c intercept)))
+  (defun (collector-step c acc e)
+    (match e ((Tuple y xs) (clr-add acc y xs))))
+  (defun (collector-finish c acc) (fit acc (record-ref c names))))
+
+;; A model of one predictor, with an intercept: each element is the response
+;; and the predictor.
+(type (: SimpleModelling #:opaque (Struct (: name string))))
+
+(: (-> string SimpleModelling))
+(defun (simple-linear-model name) (SimpleModelling (name name)))
+
+(impl (Collector SimpleModelling)
+  (type %elem (Tuple double double))
+  (type %acc Regression)
+  (type %out (Result ModelError LinearModel))
+  (defun (collector-init c) (clr-make #t))
+  (defun (collector-step c acc e)
+    (match e ((Tuple y x) (clr-add-one acc y x))))
+  (defun (collector-finish c acc) (fit acc [(record-ref c name)])))
+
+;; ===========================================================================
+;; What a model tells
+;; ===========================================================================
+
+;; The coefficients as a table, as broom's tidy: term, estimate, std.error,
+;; statistic (the t value) and p.value.
+(: (-> LinearModel Table))
+(defun (model->table m)
+  (match (make-table
+           [(named-strings "term" (array->string-column (vec->array (record-ref m terms))))
+            (named "estimate" (array->column (vec->array (record-ref m estimates))))
+            (named "std.error" (array->column (vec->array (record-ref m standard-errors))))
+            (named "statistic" (array->column (vec->array (record-ref m t-values))))
+            (named "p.value" (array->column (vec->array (record-ref m p-values))))])
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))
+
+;; The response the model gives for the predictors, in the order of its
+;; names.
+(: (-> LinearModel (Vec double) double))
+(defun (model-predict m xs)
+  (def b (record-ref m estimates))
+  (def start (if (record-ref m intercept?) 1 0))
+  (loop (:for i (range 0 (vec-length xs)))
+        (:acc sum (summing (* (vec-ref b (+ i start)) (vec-ref xs i))))
+        => (+ (if (record-ref m intercept?) (vec-ref b 0) 0.0) sum)))
+
+;; A p-value as R prints it: below 2.2e-16 as "< 2.2e-16".
+(: (-> double string))
+(defun (p-value-text p)
+  (if (< p 2.2e-16) "<2e-16" (significant p 3)))
+
+;; The model as R's summary.lm prints it.
+(: (-> LinearModel string))
+(defun (model->string m)
+  (def terms (record-ref m terms))
+  (def rows
+    {vecing [(vec-ref terms i)
+             (significant (vec-ref (record-ref m estimates) i) 4)
+             (significant (vec-ref (record-ref m standard-errors) i) 4)
+             (significant (vec-ref (record-ref m t-values) i) 4)
+             (p-value-text (vec-ref (record-ref m p-values) i))]
+            (:for i (range 0 (vec-length terms)))})
+  (def header ["" "Estimate" "Std. Error" "t value" "Pr(>|t|)"])
+  (def all (vec-add-first rows header))
+  (def widths {vecing (loop (:for r all) (:acc w (folding 0 (max w (string-length (vec-ref r c))))))
+                      (:for c (range 0 5))})
+  (def sb (stringbuilder-empty))
+  (stringbuilder-add-string! sb "Coefficients:\n")
+  (loop (:for r all)
+        (:do (loop (:for c (range 0 5))
+                   (:do (when (> c 0) (stringbuilder-add-string! sb " "))
+                        (stringbuilder-add-string!
+                          sb (if (= c 0)
+                                 (string-pad-right (vec-ref r c) (vec-ref widths c))
+                                 (string-pad-left (vec-ref r c) (vec-ref widths c))))))
+             (stringbuilder-add-string! sb "\n")))
+  (stringbuilder-add-string!
+    sb (str "\nResidual standard error: " (significant (record-ref m sigma) 4)
+            " on " (long->string (record-ref m df)) " degrees of freedom\n"
+            "Multiple R-squared: " (significant (record-ref m r-squared) 4)
+            ", Adjusted R-squared: " (significant (record-ref m adjusted-r-squared) 4) "\n"))
+  (unless (nan? (record-ref m f-statistic))
+    (stringbuilder-add-string!
+      sb (str "F-statistic: " (significant (record-ref m f-statistic) 4)
+              " on " (int->string (- (vec-length terms) (if (record-ref m intercept?) 1 0)))
+              " and " (long->string (record-ref m df)) " DF, p-value: "
+              (p-value-text (record-ref m f-p-value)) "\n")))
+  (stringbuilder->string sb))

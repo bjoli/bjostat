@@ -301,6 +301,17 @@ and statistics. Done so far:
   against mpmath: below 1e-12 relative almost everywhere. The samples are
   exact methods on ~(std random)~'s seeded sources: Box and Muller,
   Marsaglia and Tsang, Hörmann's PTRS, and beta splits of the binomial.
+- *Linear models:* ~(bjostat models)~: ~linear-model~,
+  ~linear-model/origin~ and ~simple-linear-model~ are collectors that fit
+  R's ~lm~ in one pass, by Givens rotations into the R of a QR
+  decomposition and Q'y; the residual sum of squares is what is left of y.
+  The model has R's ~summary.lm~: estimates, standard errors, t values,
+  p-values, sigma, R², adjusted R² and F, printed as R prints them, and a
+  table as broom's ~tidy~. Checked against R's ~cars~ and against mpmath
+  at 50 digits to 1e-12; on x and x² near 10 000 the estimates are within
+  1.1e-8, where the normal equations in doubles are within 6e-3. Measured
+  on 1M rows: 17.7 ms for one predictor, 62.6 ms for three, which allocate
+  a Vec for each row.
 
 Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
 
@@ -337,8 +348,10 @@ because the vector adds in another order.
 
 In the order that lets an analysis be done from start to end:
 
-1. *Models:* ~lm~ as a collector of a QR decomposition, with coefficients,
-   standard errors, R² and p-values; then ~glm~. A formula macro later.
+1. *Models:* ~glm~ (logistic and Poisson regression, by iteratively
+   reweighted least squares over the rows kept), categories as predictors
+   (a column of 0 and 1 for each level but the first), residuals and
+   confidence intervals. A formula macro later.
 2. *Tests:* t-tests and the χ² test of a crosstab.
 3. *Statistics:* a t-digest for quantiles in one pass with little memory.
 4. *Plots* as Vega-Lite or SVG, and *Parquet*.

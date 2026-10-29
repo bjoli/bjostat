@@ -15,6 +15,7 @@
 (import (bjostat csv))
 (import (bjostat query))
 (import (bjostat stats))
+(import (bjostat models))
 
 
 (: (-> (Result TableError %a) %a))
@@ -183,5 +184,18 @@
 (def/bench "count by a string and a long" (table-row-count (ok (table-count t ["region" "qty"]))))
 (def/bench "count by a category" (table-row-count (ok (table-count by-codes ["region"]))))
 (def/bench "crosstab of a string and a long" (table-row-count (ok (table-crosstab t "region" "qty"))))
+
+(def/bench "linear model, one predictor"
+  (match (loop (:for p* price) (:for q* qty) (:when-let (Some p) p*) (:when-let (Some q) q*)
+               (:acc (simple-linear-model "qty" (Tuple p (cast double q)))))
+    ((Ok m) (record-ref m r-squared))
+    ((Err _) 0.0)))
+(def/bench "linear model, three predictors"
+  (match (loop (:for p* price) (:for q* qty) (:for i* (: (ok (column-as t "id")) (Cells long)))
+               (:when-let (Some p) p*) (:when-let (Some q) q*) (:when-let (Some i) i*)
+               (:let x (cast double q))
+               (:acc (linear-model ["qty" "qty2" "id"] (Tuple p [x (* x x) (cast double i)]))))
+    ((Ok m) (record-ref m r-squared))
+    ((Err _) 0.0)))
 
 (run-benches)

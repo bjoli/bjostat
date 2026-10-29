@@ -1,0 +1,161 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/models.bjo — linear models against R's lm and against the
+;; normal equations solved at 50 digits by mpmath (scratch/lm_ref.py made
+;; the values).
+;;
+;;     bjo run tests/models.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (bjostat table))
+(import (bjostat models))
+
+(: (-> double double double bool))
+(defun (close? got want rel)
+  (<= (abs (- got want)) (* rel (abs want))))
+
+(: (-> (Vec double) (Vec double) double bool))
+(defun (all-close? got want rel)
+  (and (= (vec-length got) (vec-length want))
+       (= 0 (loop (:for i (range 0 (vec-length got)))
+                  (:when (not (close? (vec-ref got i) (vec-ref want i) rel)))
+                  (:acc (counting i))))))
+
+(: (-> (Result ModelError LinearModel) LinearModel))
+(defun (ok r)
+  (match r
+    ((Ok m) m)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result ModelError LinearModel) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+;; Checks every number of a model against the reference, to `rel`.
+(: (-> string LinearModel (Vec (Vec double)) (Vec double) double void))
+(defun (check name m vecs scalars rel)
+  (expect (str name ": estimates") (all-close? (record-ref m estimates) (vec-ref vecs 0) rel) #t)
+  (expect (str name ": standard errors") (all-close? (record-ref m standard-errors) (vec-ref vecs 1) rel) #t)
+  (expect (str name ": t values") (all-close? (record-ref m t-values) (vec-ref vecs 2) rel) #t)
+  (expect (str name ": p-values") (all-close? (record-ref m p-values) (vec-ref vecs 3) (* 100.0 rel)) #t)
+  (expect (str name ": sigma, R², adjusted R², F")
+          (all-close? [(record-ref m sigma) (record-ref m r-squared) (record-ref m adjusted-r-squared)
+                       (record-ref m f-statistic)]
+                      [(vec-ref scalars 0) (vec-ref scalars 1) (vec-ref scalars 2) (vec-ref scalars 3)] rel)
+          #t)
+  (expect (str name ": the p-value of F") (close? (record-ref m f-p-value) (vec-ref scalars 4) (* 100.0 rel)) #t))
+
+(: (Vec double))
+(def speed [4.0 4.0 7.0 7.0 8.0 9.0 10.0 10.0 10.0 11.0 11.0 12.0 12.0 12.0 12.0 13.0 13.0 13.0 13.0 14.0 14.0
+            14.0 14.0 15.0 15.0 15.0 16.0 16.0 17.0 17.0 17.0 18.0 18.0 18.0 18.0 19.0 19.0 19.0 20.0 20.0 20.0
+            20.0 20.0 22.0 23.0 24.0 24.0 24.0 24.0 25.0])
+(: (Vec double))
+(def dist [2.0 10.0 4.0 22.0 16.0 10.0 18.0 26.0 34.0 17.0 28.0 14.0 20.0 24.0 28.0 26.0 34.0 34.0 46.0 26.0
+           36.0 60.0 80.0 20.0 26.0 54.0 32.0 40.0 32.0 40.0 50.0 42.0 56.0 76.0 84.0 36.0 46.0 68.0 32.0 48.0
+           52.0 56.0 64.0 66.0 54.0 70.0 92.0 93.0 120.0 85.0])
+
+;; The rows of the model of three predictors, as scratch/lm_ref.py makes them.
+(: (Vec (Tuple double (Vec double))))
+(def three
+  {vecing (Tuple (+ 1.5 (* 2.0 a) (* -0.7 b) (* 0.3 c) (/ (cast double (- (% (* i 29) 17) 8)) 10.0)) [a b c])
+          (:for i (range 0 40))
+          (:let a (- (* (cast double i) 0.37) (* 5.0 (floor-of (/ (* (cast double i) 0.37) 5.0)))))
+          (:let b (cast double (- (% (* i i) 7) 3)))
+          (:let c (/ (cast double (% (* i 13) 11)) 3.0))})
+
+(: (-> double double))
+(defun (floor-of x) (cast double (cast long x)))
+
+(defun (main)
+  ;; R's cars: lm(dist ~ speed)
+  (def cars (ok (loop (:for s speed) (:for d dist) (:acc (simple-linear-model "speed" (Tuple d s))))))
+  (check "cars" cars
+         [[-17.579094890510949 3.9324087591240876]
+          [6.758440169379236 0.4155127766571223]
+          [-2.6010580030222554 9.4639899902983699]
+          [0.012318816153808809 1.4898364962950851e-12]]
+         [15.379586748819907 0.65107938075825086 0.64381020119071442 89.56710653646774 1.4898364962950851e-12]
+         1e-12)
+  (expect "cars: the terms" (record-ref cars terms) ["(Intercept)" "speed"])
+  (expect "cars: the degrees of freedom and rows" (Tuple (record-ref cars df) (record-ref cars rows)) (Tuple 48L 50L))
+  (expect "cars: the same model of a Vec of one predictor"
+          (all-close? (record-ref (ok (loop (:for s speed) (:for d dist) (:acc (linear-model ["speed"] (Tuple d [s])))))
+                                  estimates)
+                      (record-ref cars estimates) 1e-14)
+          #t)
+  (expect "cars: printed as R's summary.lm"
+          (model->string cars)
+          (str "Coefficients:\n"
+               "            Estimate Std. Error t value Pr(>|t|)\n"
+               "(Intercept)   -17.58      6.758  -2.601   0.0123\n"
+               "speed          3.932     0.4155   9.464 1.49e-12\n"
+               "\n"
+               "Residual standard error: 15.38 on 48 degrees of freedom\n"
+               "Multiple R-squared: 0.6511, Adjusted R-squared: 0.6438\n"
+               "F-statistic: 89.57 on 1 and 48 DF, p-value: 1.49e-12\n"))
+  (expect "cars: as a table, as broom's tidy"
+          (table-names (model->table cars)) ["term" "estimate" "std.error" "statistic" "p.value"])
+  (expect "cars: a prediction" (close? (model-predict cars [21.0]) (+ -17.579094890510949 (* 21.0 3.9324087591240876)) 1e-14) #t)
+
+  ;; Three predictors
+  (def m3 (ok (loop (:for row three) (:acc (linear-model ["a" "b" "c"] row)))))
+  (check "three predictors" m3
+         [[1.3307893128697275 1.9905831552011209 -0.80024801193391588 0.34877693713913009]
+          [0.21283832723048266 0.055769814776844405 0.057471322908126266 0.074573511277472224]
+          [6.2525830295058444 35.69284142624784 -13.924301224337456 4.6769547412271504]
+          [3.1989385985190386e-7 1.0695210515039143e-29 4.5906276256784247e-16 4.0143842989443597e-5]]
+         [0.49646717441142477 0.97472721757947619 0.97262115237776587 462.81910777876602 8.5401917363822694e-29]
+         1e-12)
+  (def m0 (ok (loop (:for row three) (:acc (linear-model/origin ["a" "b" "c"] row)))))
+  (check "through the origin" m0
+         [[2.2131572379822566 -0.96889376129251948 0.61097728808102708]
+          [0.061161814433892005 0.072298789430813447 0.087851537804019633]
+          [36.185277668215562 -13.401244597874013 6.9546567237559718]
+          [1.7490661369487047e-30 9.0284500039085246e-16 3.2580830882897857e-8]]
+         [0.70728523759548148 0.99308901742897102 0.99252866749077948 1772.2657749085224 5.3057471879262156e-40]
+         1e-12)
+  (expect "through the origin: no intercept" (record-ref m0 terms) ["a" "b" "c"])
+
+  ;; Ill-conditioned: x and x² with x near 10 000. Measured: the estimates
+  ;; of the QR are within 1.1e-8 of those of 50 digits, and those of the
+  ;; normal equations in doubles within 6e-3.
+  (def ill (ok (loop (:for i (range 0 30))
+                     (:let x (+ 10000.0 (* 0.5 (cast double i))))
+                     (:acc (linear-model ["x" "x2"]
+                                         (Tuple (+ 3.0 (* 0.002 x) (* 1e-6 x x) (/ (cast double (- (% (* i 7) 5) 2)) 100.0))
+                                                [x (* x x)]))))))
+  (expect "ill-conditioned: sigma and R² to 1e-6"
+          (all-close? [(record-ref ill sigma) (record-ref ill r-squared)] [0.014856455285293264 0.97908364471082577] 1e-6)
+          #t)
+  (expect "ill-conditioned: the estimates to 1e-7"
+          (all-close? (record-ref ill estimates) [-894.8182636503428 0.18116663356194449 -7.938503098723279e-6] 1e-7)
+          #t)
+
+  ;; What cannot be fitted
+  (expect "two rows for two coefficients"
+          (error-of (loop (:for i (range 0 2)) (:acc (simple-linear-model "x" (Tuple 1.0 (cast double i))))))
+          "2 rows are too few for 2 coefficients: a model needs more rows than coefficients.")
+  (expect "no rows"
+          (error-of (loop (:for i (range 0 0)) (:acc (simple-linear-model "x" (Tuple 1.0 (cast double i))))))
+          "there are no rows.")
+  (expect "a predictor that is twice another"
+          (error-of (loop (:for s speed) (:for d dist) (:acc (linear-model ["speed" "double"] (Tuple d [s (* 2.0 s)])))))
+          "'double' is a linear combination of the predictors before it and the intercept.")
+  (expect "a predictor that does not change"
+          (error-of (loop (:for s speed) (:for d dist) (:acc (linear-model ["speed" "one"] (Tuple d [s 1.0])))))
+          "'one' is a linear combination of the predictors before it and the intercept.")
+  (expect "rows of other numbers of predictors"
+          (error-of (loop (:for i (range 0 5))
+                          (:acc (linear-model ["x"] (Tuple 1.0 (if (= i 3) [1.0 2.0] [(cast double i)]))))))
+          "row 3 has 2 predictors, and the first row has 1.")
+  (expect "names for other predictors"
+          (error-of (loop (:for s speed) (:for d dist) (:acc (linear-model ["speed" "more"] (Tuple d [s])))))
+          "the rows have 1 predictor, and there are 2 names.")
+  0)
