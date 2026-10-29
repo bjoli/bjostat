@@ -22,17 +22,27 @@
   OneSampleTTest one-sample-t-test PairedTTest paired-t-test
   TwoSampleTTest welch-t-test pooled-t-test
   t-test-interval t-test->string
-  chi-squared-test chi-squared-test->string)
+  chi-squared-test chi-squared-test->string
+  ;; Correlation, ranks and Fisher
+  CorrelationTest CorrelationTesting
+  RankTest RankSumTest SignedRankTest signed-rank-test PairedSignedRankTest
+  FisherTest fisher-test
+  ;; The accumulators, opaque
+  CoSums)
 
 (import (std prelude))
 (import (bjostat table))
 (import (bjostat stats))
 (import (only (bjostat query) table-with ColumnBuilding))
 (import (bjostat distributions))
-(import (only (std maths) nan?))
+(import (only (std maths) nan? atanh tanh))
+(import (std mutable vec))
 
 (import/extern
-  (significant (: Bjostat.Regression.Significant (-> double int string))))
+  (significant (: Bjostat.Regression.Significant (-> double int string)))
+  (clr-rank-sum (: Bjostat.Ranks.RankSum (-> (Array double) (Array double) bool (Array double))))
+  (clr-signed-rank (: Bjostat.Ranks.SignedRank (-> (Array double) bool (Array double))))
+  (clr-fisher (: Bjostat.Ranks.Fisher (-> long long long long (Array double)))))
 
 ;; Why a test cannot be made.
 (type (: TestError (Record (: message string))))
@@ -270,3 +280,179 @@
        "X-squared = " (significant (record-ref r statistic) 5)
        ", df = " (long->string (record-ref r df))
        ", p-value = " (significant (record-ref r p-value) 4) "\n"))
+
+;; ===========================================================================
+;; The correlation test
+;; ===========================================================================
+
+;; R's cor.test of Pearson's correlation: `estimate` is r, `statistic` its t
+;; of n - 2 degrees of freedom, and the interval is of Fisher's z, NaN of
+;; fewer than 4 pairs.
+(type (: CorrelationTest
+         (Record (: estimate double)
+                 (: statistic double)
+                 (: df long)
+                 (: p-value double)
+                 (: p-less double)
+                 (: p-greater double)
+                 (: lower double)
+                 (: upper double))))
+
+;; The sums of the pairs, each less the first pair's values.
+(type (: CoSums #:opaque (Struct (: n long) (: kx double) (: ky double) (: sx double) (: sy double)
+                                 (: sxx double) (: syy double) (: sxy double))))
+
+;; Is the correlation of x and y 0? Each element is a pair; the interval is
+;; of the level 0.95, as R's default.
+(type (: CorrelationTesting (Union correlation-test)))
+
+(impl (Collector CorrelationTesting)
+  (type %elem (Tuple double double))
+  (type %acc CoSums)
+  (type %out (Result TestError CorrelationTest))
+  (defun (collector-init c) (CoSums (n 0L) (kx 0.0) (ky 0.0) (sx 0.0) (sy 0.0) (sxx 0.0) (syy 0.0) (sxy 0.0)))
+  (defun (collector-step c acc e)
+    (match e
+      ((Tuple x y)
+       (def first? (= (record-ref acc n) 0L))
+       (def kx (if first? x (record-ref acc kx)))
+       (def ky (if first? y (record-ref acc ky)))
+       (def dx (- x kx))
+       (def dy (- y ky))
+       (CoSums (n (+ (record-ref acc n) 1L)) (kx kx) (ky ky)
+               (sx (+ (record-ref acc sx) dx)) (sy (+ (record-ref acc sy) dy))
+               (sxx (+ (record-ref acc sxx) (* dx dx))) (syy (+ (record-ref acc syy) (* dy dy)))
+               (sxy (+ (record-ref acc sxy) (* dx dy)))))))
+  (defun (collector-finish c acc) (correlation-of acc)))
+
+(: (-> CoSums (Result TestError CorrelationTest)))
+(defun (correlation-of acc)
+  (def n (cast double (record-ref acc n)))
+  (def cxx (- (record-ref acc sxx) (/ (* (record-ref acc sx) (record-ref acc sx)) n)))
+  (def cyy (- (record-ref acc syy) (/ (* (record-ref acc sy) (record-ref acc sy)) n)))
+  (def cxy (- (record-ref acc sxy) (/ (* (record-ref acc sx) (record-ref acc sy)) n)))
+  (cond
+    ((< n 3.0) (refuse (str (long->string (record-ref acc n)) " pairs are too few: a correlation test needs at least 3.")))
+    ((or (<= cxx 0.0) (<= cyy 0.0)) (refuse "the values of x or of y are all the same, so the correlation is not a number."))
+    (else
+     (def r (/ cxy (sqrt (* cxx cyy))))
+     (def df (- n 2.0))
+     (def t (* r (sqrt (/ df (- 1.0 (* r r))))))
+     (def less (t-cdf t df))
+     (def greater (t-cdf t df #:lower? #f))
+     (def half (if (> n 3.0) (/ (normal-quantile 0.025 #:lower? #f) (sqrt (- n 3.0))) (/ 0.0 0.0)))
+     (def z (atanh r))
+     (Ok (CorrelationTest (estimate r) (statistic t) (df (cast long df))
+                          (p-value (min 1.0 (* 2.0 (min less greater)))) (p-less less) (p-greater greater)
+                          (lower (tanh (- z half))) (upper (tanh (+ z half))))))))
+
+;; ===========================================================================
+;; Wilcoxon's tests
+;; ===========================================================================
+
+;; Wilcoxon's rank-sum or signed-rank test: the statistic, W or V as R's, the
+;; p-values of the three alternatives, and whether they are exact. As R, they
+;; are exact when each sample has fewer than 50 values and none is tied (or 0
+;; of a signed-rank test), and otherwise of the normal approximation with
+;; the correction of 1/2.
+(type (: RankTest
+         (Record (: method string)
+                 (: statistic double)
+                 (: p-value double)
+                 (: p-less double)
+                 (: p-greater double)
+                 (: exact? bool))))
+
+(: (-> string (Array double) RankTest))
+(defun (rank-test-of method r)
+  (RankTest (method method) (statistic (array-ref r 0)) (p-value (array-ref r 1))
+            (p-less (array-ref r 2)) (p-greater (array-ref r 3)) (exact? (= (array-ref r 4) 1.0))))
+
+;; R's wilcox.test(x, y): do the values of the first sample tend to be above
+;; or below those of the second? Each element is #t for a value of the first
+;; sample and #f for one of the second, and the value.
+(type (: RankSumTest (Union rank-sum-test)))
+
+(impl (Collector RankSumTest)
+  (type %elem (Tuple bool double))
+  (type %acc (Tuple (MutableVec double) (MutableVec double)))
+  (type %out (Result TestError RankTest))
+  (defun (collector-init c) (Tuple (mutablevec) (mutablevec)))
+  (defun (collector-step c acc e)
+    (match (Tuple acc e)
+      ((Tuple (Tuple a b) (Tuple first? x))
+       (if first? (mutablevec-add! a x) (mutablevec-add! b x))
+       acc)))
+  (defun (collector-finish c acc)
+    (match acc
+      ((Tuple a b)
+       (if (or (= (mutablevec-length a) 0) (= (mutablevec-length b) 0))
+           (refuse "a rank-sum test needs a value in each sample.")
+           (Ok (rank-test-of "Wilcoxon rank sum test"
+                             (clr-rank-sum (mutablevec->array a) (mutablevec->array b) #t))))))))
+
+;; R's wilcox.test(x, mu = null): are the values symmetric about `null`?
+(type (: SignedRankTest #:opaque (Struct (: null double) (: paired bool))))
+
+(: (-> double SignedRankTest))
+(defun (signed-rank-test null) (SignedRankTest (null null) (paired #f)))
+
+(impl (Collector SignedRankTest)
+  (type %elem double)
+  (type %acc (MutableVec double))
+  (type %out (Result TestError RankTest))
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc x) (mutablevec-add! acc (- x (record-ref c null))) acc)
+  (defun (collector-finish c acc) (signed-rank-of acc "Wilcoxon signed rank test")))
+
+;; R's wilcox.test(x, y, paired = TRUE): the signed-rank test of x - y.
+(type (: PairedSignedRankTest (Union paired-signed-rank-test)))
+
+(impl (Collector PairedSignedRankTest)
+  (type %elem (Tuple double double))
+  (type %acc (MutableVec double))
+  (type %out (Result TestError RankTest))
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc p) (match p ((Tuple x y) (mutablevec-add! acc (- x y)) acc)))
+  (defun (collector-finish c acc) (signed-rank-of acc "Wilcoxon signed rank test, paired")))
+
+(: (-> (MutableVec double) string (Result TestError RankTest)))
+(defun (signed-rank-of d method)
+  (def values (mutablevec->array d))
+  (if (= 0 (loop (:for i (range 0 (array-length values))) (:when (not (= (array-ref values i) 0.0))) (:acc (counting i))))
+      (refuse "a signed-rank test needs a value that is not its null.")
+      (Ok (rank-test-of method (clr-signed-rank values #t)))))
+
+;; ===========================================================================
+;; Fisher's exact test
+;; ===========================================================================
+
+;; R's fisher.test of a 2 × 2 table: the p-values of the three alternatives,
+;; of the hypergeometric distribution, and the conditional maximum
+;; likelihood estimate of the odds ratio, as R gives it.
+(type (: FisherTest
+         (Record (: p-value double)
+                 (: p-less double)
+                 (: p-greater double)
+                 (: odds-ratio double))))
+
+;; Of a table as table-crosstab makes it, of two rows and two columns of
+;; counts.
+(: (-> Table (Result TestError FisherTest)))
+(defun (fisher-test t)
+  (def names (vec-drop (table-names t) 1))
+  (def columns {vecing (: (column-as t name) (Result TableError (Cells long))) (:for name names)})
+  (cond
+    ((or (not (= (vec-length names) 2)) (not (= (table-row-count t) 2)))
+     (refuse (str "Fisher's test here is of a table of 2 rows and 2 columns of counts, and this has "
+                  (int->string (table-row-count t)) " and " (int->string (vec-length names)) ".")))
+    ((some? (find (fun (c) (err? c)) columns)) (refuse "the columns are not of counts, which are longs."))
+    (else
+     (: (-> int int long))
+     (defun (count c r) (option-value (cells-get (column-of (vec-ref columns c)) r) -1L))
+     (def a (count 0 0)) (def b (count 1 0)) (def c (count 0 1)) (def d (count 1 1))
+     (if (or (< a 0L) (< b 0L) (< c 0L) (< d 0L))
+         (refuse "a count is null or below 0.")
+         (let ((r (clr-fisher a b c d)))
+           (Ok (FisherTest (p-value (array-ref r 0)) (p-less (array-ref r 1)) (p-greater (array-ref r 2))
+                           (odds-ratio (array-ref r 3)))))))))

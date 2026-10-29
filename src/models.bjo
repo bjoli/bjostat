@@ -37,6 +37,7 @@
   ;; Intervals and predictors of categories
   model-intervals glm-intervals indicators indicator-names
   WithCategories with-categories
+  model-anova anova-terms
   ;; Rows, after the fit
   model-residual model-leverage model-standardized-residual
   model-mean-interval model-prediction-interval glm-residual)
@@ -61,6 +62,7 @@
   (clr-tss (: Bjostat.Regression.TotalSquares (-> Regression double)))
   (clr-unscaled-errors (: Bjostat.Regression.UnscaledErrors (-> Regression (Array double))))
   (clr-unscaled-covariance (: Bjostat.Regression.UnscaledCovariance (-> Regression (Array double))))
+  (clr-effects (: Bjostat.Regression.Effects (-> Regression (Array double))))
   (significant (: Bjostat.Regression.Significant (-> double int string)))
   (glm-make (: Bjostat.Glm.Make (-> int bool Glm)))
   (glm-add (: Bjostat.Glm.Add (-> Glm double (Vec double) Glm)))
@@ -85,7 +87,8 @@
 ;; order. `df` is that of the residuals, n - p. The F statistic and its
 ;; p-value test all predictors but the intercept, and are NaN for a model of
 ;; the intercept alone. `unscaled-covariance` is (X'X)⁻¹, row by row, R's
-;; cov.unscaled: σ² times it is the covariance of the estimates.
+;; cov.unscaled: σ² times it is the covariance of the estimates. `effects`
+;; is Q'y, R's effects, of which model-anova makes its sums of squares.
 (type (: LinearModel
          (Record (: terms (Vec string))
                  (: estimates (Vec double))
@@ -100,6 +103,7 @@
                  (: f-statistic double)
                  (: f-p-value double)
                  (: unscaled-covariance (Vec double))
+                 (: effects (Vec double))
                  (: intercept? bool))))
 
 ;; Why a model cannot be fitted.
@@ -147,6 +151,7 @@
                (f-statistic (if (> free 0) f (/ 0.0 0.0)))
                (f-p-value (if (> free 0) (f-cdf f (cast double free) dfd #:lower? #f) (/ 0.0 0.0)))
                (unscaled-covariance (array->vec (clr-unscaled-covariance m)))
+               (effects (array->vec (clr-effects m)))
                (intercept? intercept?)))
 
 ;; ===========================================================================
@@ -574,3 +579,58 @@
       ((Tuple y xs codes)
        (collector-step (record-ref c inner) acc (Tuple y (with-indicators xs codes (record-ref c counts)))))))
   (defun (collector-finish c acc) (collector-finish (record-ref c inner) acc)))
+
+;; ===========================================================================
+;; The analysis of variance
+;; ===========================================================================
+
+;; The terms of model-anova of a model with-categories made: each predictor
+;; of numbers one column, and each category one for each level but the first.
+(: (-> (Vec string) (Vec (Tuple string (Vec string))) (Vec (Tuple string int))))
+(defun (anova-terms names categories)
+  (vec-append-all (vec-map (fun (n) (Tuple n 1)) names)
+                  [(vec-map (fun (c) (match c ((Tuple name levels) (Tuple name (- (vec-length levels) 1))))) categories)]))
+
+;; R's anova of a linear model: a row for each term, in order, with its
+;; degrees of freedom, its sequential sum of squares (what it adds to the
+;; terms before it), its mean square, F against the residuals' mean square,
+;; and the p-value of F; then the residuals. Each term is its name and how
+;; many of the model's columns it is, as anova-terms gives them; they cover
+;; the columns after the intercept.
+(: (-> LinearModel (Vec (Tuple string int)) (Result ModelError Table)))
+(defun (model-anova m terms)
+  (def start (if (record-ref m intercept?) 1 0))
+  (def columns (- (vec-length (record-ref m estimates)) start))
+  (def covered (loop (:for (Tuple _ k) terms) (:acc (summing k))))
+  (if (not (= covered columns))
+      (Err (ModelError (message (str "the terms are " (int->string covered) " columns, and the model has "
+                                     (int->string columns) " after the intercept."))))
+      (Ok (anova-table m terms start))))
+
+(: (-> LinearModel (Vec (Tuple string int)) int Table))
+(defun (anova-table m terms start)
+  (def effects (record-ref m effects))
+  (def df (cast double (record-ref m df)))
+  (def residual-ms (* (record-ref m sigma) (record-ref m sigma)))
+  ;; The first column of each term, after those before it.
+  (def firsts (loop (:for (Tuple _ k) terms) (:acc at (folding (vec-add [] start) (vec-add at (+ (vec-ref at (- (vec-length at) 1)) k))))))
+  (def squares {vecing (loop (:for j (range (vec-ref firsts i) (vec-ref firsts (+ i 1))))
+                             (:acc (summing (* (vec-ref effects j) (vec-ref effects j)))))
+                       (:for i (range 0 (vec-length terms)))})
+  (def dfs {vecing (cast double k) (:for (Tuple _ k) terms)})
+  (def ms {vecing (/ (vec-ref squares i) (vec-ref dfs i)) (:for i (range 0 (vec-length terms)))})
+  (def fs (vec-map (fun (x) (/ x residual-ms)) ms))
+  (def nan (/ 0.0 0.0))
+  (match (make-table
+           [(named-strings "term" (array->string-column (vec->array (vec-add (vec-map fst terms) "Residuals"))))
+            (named "df" (array->column (vec->array (vec-add dfs df))))
+            (named "sum.sq" (array->column (vec->array (vec-add squares (* residual-ms df)))))
+            (named "mean.sq" (array->column (vec->array (vec-add ms residual-ms))))
+            (named "statistic" (array->column (vec->array (vec-add fs nan))
+                                              #:valid (vec->array (vec-add (vec-map (fun (_) #t) fs) #f))))
+            (named "p.value" (array->column (vec->array (vec-add {vecing (f-cdf (vec-ref fs i) (vec-ref dfs i) df #:lower? #f)
+                                                                         (:for i (range 0 (vec-length terms)))}
+                                                                 nan))
+                                            #:valid (vec->array (vec-add (vec-map (fun (_) #t) fs) #f))))])
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))

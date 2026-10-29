@@ -178,6 +178,12 @@ public sealed class Regression
     public static double ResidualSquares(Regression m) => m._rss;
 
     /// <summary>
+    /// Q'y, R's effects: the square of each is the sum of squares its column
+    /// adds to the columns before it, R's sequential (type I) sums of squares.
+    /// </summary>
+    public static double[] Effects(Regression m) => (double[])m._z.Clone();
+
+    /// <summary>
     /// The total sum of squares of the response: about its mean with an
     /// intercept, and about 0 without one, as R's summary.lm.
     /// </summary>

@@ -254,9 +254,23 @@
   (expect "mtcars: a response residual"
           (close? (glm-residual logit 1.0 [2.62]) (- 1.0 (glm-predict logit [2.62])) 1e-15) #t)
 
-  ;; Intervals, as R's confint and confint.default
   (: (-> Table string (Vec double)))
   (defun (doubles-of t name) {vecing (option-value x 0.0) (:for x (: (match (column-as t name) ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells double)))})
+  ;; R's anova(lm(dist ~ speed, cars))
+  (def anova (match (model-anova cars [(Tuple "speed" 1)]) ((Ok t) t) ((Err e) (panic! (displayed e)))))
+  (expect "cars: anova, the sums of squares"
+          (all-close? (doubles-of anova "sum.sq") [21185.458948905109 11353.521051094891] 1e-12) #t)
+  (expect "cars: anova, F and its p"
+          (Tuple (close? (vec-ref (doubles-of anova "statistic") 0) 89.56710653646774 1e-12)
+                 (close? (vec-ref (doubles-of anova "p.value") 0) 1.4898364962950851e-12 1e-10))
+          (Tuple #t #t))
+  (expect "cars: anova, the terms" (vec-ref (doubles-of anova "df") 1) 48.0)
+  (expect "anova of terms that do not cover the model"
+          (match (model-anova cars [(Tuple "speed" 2)]) ((Ok _) "no error") ((Err e) (displayed e)))
+          "the terms are 2 columns, and the model has 1 after the intercept.")
+  (expect "anova-terms of a category" (anova-terms ["wt"] [(Tuple "cyl" ["4" "6" "8"])]) [(Tuple "wt" 1) (Tuple "cyl" 2)])
+
+  ;; Intervals, as R's confint and confint.default
   (def ci (model-intervals cars 0.95))
   (expect "cars: confint"
           (Tuple (all-close? (doubles-of ci "lower") [-31.167849602388644 3.0969643281403228] 1e-12)
