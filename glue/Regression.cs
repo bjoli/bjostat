@@ -209,7 +209,37 @@ public sealed class Regression
     public static double[] UnscaledErrors(Regression m)
     {
         int p = m._p;
-        // R⁻¹, upper triangular, column by column.
+        var inv = Inverse(m);
+        var e = new double[p];
+        for (int j = 0; j < p; j++)
+        {
+            double s = 0;
+            for (int c = j; c < p; c++) s += inv[j * p + c] * inv[j * p + c];
+            e[j] = Math.Sqrt(s);
+        }
+        return e;
+    }
+
+    /// <summary>(X'X)⁻¹ = R⁻¹ R⁻ᵀ, row-major p × p: R's cov.unscaled.</summary>
+    public static double[] UnscaledCovariance(Regression m)
+    {
+        int p = m._p;
+        var inv = Inverse(m);
+        var c = new double[p * p];
+        for (int i = 0; i < p; i++)
+            for (int j = 0; j < p; j++)
+            {
+                double s = 0;
+                for (int k = Math.Max(i, j); k < p; k++) s += inv[i * p + k] * inv[j * p + k];
+                c[i * p + j] = s;
+            }
+        return c;
+    }
+
+    // R⁻¹, upper triangular, column by column.
+    private static double[] Inverse(Regression m)
+    {
+        int p = m._p;
         var inv = new double[p * p];
         for (int c = 0; c < p; c++)
         {
@@ -221,13 +251,6 @@ public sealed class Regression
                 inv[j * p + c] = -s / m._r[j * p + j];
             }
         }
-        var e = new double[p];
-        for (int j = 0; j < p; j++)
-        {
-            double s = 0;
-            for (int c = j; c < p; c++) s += inv[j * p + c] * inv[j * p + c];
-            e[j] = Math.Sqrt(s);
-        }
-        return e;
+        return inv;
     }
 }

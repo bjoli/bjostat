@@ -35,7 +35,10 @@
   GeneralizedModel GeneralizedModelling logistic-model poisson-model
   glm->table glm->string glm-predict
   ;; Intervals and predictors of categories
-  model-intervals glm-intervals indicators indicator-names)
+  model-intervals glm-intervals indicators indicator-names
+  ;; Rows, after the fit
+  model-residual model-leverage model-standardized-residual
+  model-mean-interval model-prediction-interval glm-residual)
 
 (import (std prelude))
 (import (bjostat table))
@@ -56,6 +59,7 @@
   (clr-rss (: Bjostat.Regression.ResidualSquares (-> Regression double)))
   (clr-tss (: Bjostat.Regression.TotalSquares (-> Regression double)))
   (clr-unscaled-errors (: Bjostat.Regression.UnscaledErrors (-> Regression (Array double))))
+  (clr-unscaled-covariance (: Bjostat.Regression.UnscaledCovariance (-> Regression (Array double))))
   (significant (: Bjostat.Regression.Significant (-> double int string)))
   (glm-make (: Bjostat.Glm.Make (-> int bool Glm)))
   (glm-add (: Bjostat.Glm.Add (-> Glm double (Vec double) Glm)))
@@ -79,7 +83,8 @@
 ;; the names of the predictors; the estimates and the others are in their
 ;; order. `df` is that of the residuals, n - p. The F statistic and its
 ;; p-value test all predictors but the intercept, and are NaN for a model of
-;; the intercept alone.
+;; the intercept alone. `unscaled-covariance` is (X'X)⁻¹, row by row, R's
+;; cov.unscaled: σ² times it is the covariance of the estimates.
 (type (: LinearModel
          (Record (: terms (Vec string))
                  (: estimates (Vec double))
@@ -93,6 +98,7 @@
                  (: adjusted-r-squared double)
                  (: f-statistic double)
                  (: f-p-value double)
+                 (: unscaled-covariance (Vec double))
                  (: intercept? bool))))
 
 ;; Why a model cannot be fitted.
@@ -139,6 +145,7 @@
                                               (/ (cast double (- n (if intercept? 1L 0L))) dfd))))
                (f-statistic (if (> free 0) f (/ 0.0 0.0)))
                (f-p-value (if (> free 0) (f-cdf f (cast double free) dfd #:lower? #f) (/ 0.0 0.0)))
+               (unscaled-covariance (array->vec (clr-unscaled-covariance m)))
                (intercept? intercept?)))
 
 ;; ===========================================================================
@@ -458,3 +465,66 @@
 (: (-> string (Vec string) (Vec string)))
 (defun (indicator-names name levels)
   (vec-map (fun (l) (str name l)) (vec-drop levels 1)))
+
+;; ===========================================================================
+;; Rows, after the fit
+;; ===========================================================================
+;;
+;; A model does not keep its rows, so what it says of each row is made by a
+;; second loop over them, as a column or a statistic:
+;;
+;;     (loop (:for s* speed) (:for d* dist) (:when-let (Some s) s*) (:when-let (Some d) d*)
+;;           (:acc (column-building (model-residual m d [s]))))
+
+;; The predictors with the intercept's 1 first, when the model has one.
+(: (-> LinearModel (Vec double) (Vec double)))
+(defun (full-row m xs)
+  (if (record-ref m intercept?) (vec-add-first xs 1.0) xs))
+
+;; y less the response the model gives for the predictors, R's residuals.
+(: (-> LinearModel double (Vec double) double))
+(defun (model-residual m y xs) (- y (model-predict m xs)))
+
+;; The leverage of a row of the predictors, x' (X'X)⁻¹ x, R's hatvalues: how
+;; much the row's own response moves its fitted value, from 0 to 1.
+(: (-> LinearModel (Vec double) double))
+(defun (model-leverage m xs)
+  (def x (full-row m xs))
+  (def c (record-ref m unscaled-covariance))
+  (def p (vec-length x))
+  (loop (:for i (range 0 p))
+        (:acc (summing (* (vec-ref x i)
+                          (loop (:for j (range 0 p))
+                                (:acc (summing (* (vec-ref c (+ (* i p) j)) (vec-ref x j))))))))))
+
+;; The residual over its standard error, σ √(1 - h), R's rstandard. Of a row
+;; of the fit only: a new row has another error.
+(: (-> LinearModel double (Vec double) double))
+(defun (model-standardized-residual m y xs)
+  (/ (model-residual m y xs)
+     (* (record-ref m sigma) (sqrt (- 1.0 (model-leverage m xs))))))
+
+(: (-> LinearModel double double))
+(defun (t-of m level)
+  (t-quantile (/ (- 1.0 level) 2.0) (cast double (record-ref m df)) #:lower? #f))
+
+;; The interval of the mean response at the predictors, R's predict with
+;; interval = "confidence": the fit plus and minus t σ √h.
+(: (-> LinearModel (Vec double) double (Tuple double double)))
+(defun (model-mean-interval m xs level)
+  (def fit (model-predict m xs))
+  (def half (* (t-of m level) (record-ref m sigma) (sqrt (model-leverage m xs))))
+  (Tuple (- fit half) (+ fit half)))
+
+;; The interval of a new response at the predictors, R's predict with
+;; interval = "prediction": the fit plus and minus t σ √(1 + h).
+(: (-> LinearModel (Vec double) double (Tuple double double)))
+(defun (model-prediction-interval m xs level)
+  (def fit (model-predict m xs))
+  (def half (* (t-of m level) (record-ref m sigma) (sqrt (+ 1.0 (model-leverage m xs)))))
+  (Tuple (- fit half) (+ fit half)))
+
+;; y less the mean response of a generalized model, R's residuals of type
+;; "response".
+(: (-> GeneralizedModel double (Vec double) double))
+(defun (glm-residual m y xs) (- y (glm-predict m xs)))

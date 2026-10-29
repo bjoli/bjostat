@@ -236,6 +236,24 @@
                       converged?)
           #f)
 
+  ;; Rows after the fit, as R's residuals, hatvalues, rstandard and predict
+  (expect "cars: the first residual" (close? (model-residual cars 2.0 [4.0]) 3.8494598540145985 1e-12) #t)
+  (expect "cars: its leverage" (close? (model-leverage cars [4.0]) 0.11486131386861314 1e-12) #t)
+  (expect "cars: its standardized residual"
+          (close? (model-standardized-residual cars 2.0 [4.0]) 0.26604154873366543 1e-12) #t)
+  (expect "cars: the leverages sum to the number of coefficients"
+          (close? (loop (:for s speed) (:acc (summing (model-leverage cars [s])))) 2.0 1e-12) #t)
+  (expect "cars: the residuals as a column of a second loop, summing to 0"
+          (< (abs (loop (:for s speed) (:for d dist) (:acc (summing (model-residual cars d [s]))))) 1e-10) #t)
+  (def (Tuple mean-low mean-high) (model-mean-interval cars [21.0] 0.95))
+  (expect "cars: the interval of the mean at 21"
+          (Tuple (close? mean-low 58.597383784697204 1e-12) (close? mean-high 71.405594317492577 1e-12)) (Tuple #t #t))
+  (def (Tuple new-low new-high) (model-prediction-interval cars [21.0] 0.95))
+  (expect "cars: the interval of a new stop at 21"
+          (Tuple (close? new-low 33.42257364046449 1e-12) (close? new-high 96.580404461725291 1e-12)) (Tuple #t #t))
+  (expect "mtcars: a response residual"
+          (close? (glm-residual logit 1.0 [2.62]) (- 1.0 (glm-predict logit [2.62])) 1e-15) #t)
+
   ;; Intervals, as R's confint and confint.default
   (: (-> Table string (Vec double)))
   (defun (doubles-of t name) {vecing (option-value x 0.0) (:for x (: (match (column-as t name) ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells double)))})

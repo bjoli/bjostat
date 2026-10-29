@@ -353,6 +353,18 @@ p-values, the deviance and the null deviance, the AIC, and whether the fit
 converged. It is fitted by iteratively reweighted least squares, as R's, so
 its collector keeps the rows.
 
+A model keeps no rows, so what it says of each row comes from a second loop
+over them: ~(model-residual m y xs)~, ~(model-leverage m xs)~ (R's
+~hatvalues~), ~(model-standardized-residual m y xs)~ (~rstandard~), and
+~(model-mean-interval m xs 0.95)~ and ~(model-prediction-interval m xs
+0.95)~, R's ~predict~ with ~interval = "confidence"~ and ~"prediction"~;
+~glm-residual~ of a generalized model.
+
+#+BEGIN_SRC scheme
+(loop (:for s* speed) (:for d* dist) (:when-let (Some s) s*) (:when-let (Some d) d*)
+      (:acc (column-building (model-residual m d [s]))))
+#+END_SRC
+
 ~(model-intervals m 0.95)~ is R's ~confint~, and ~(glm-intervals m 0.95)~ its
 ~confint.default~, of Wald. A category is a predictor as R makes it, a 0 or
 1 for each level but the first: ~(indicators (vec-length levels) code)~ of

@@ -330,6 +330,10 @@ and statistics. Done so far:
   the interval of any level, and the chi-squared test of a crosstab with
   Yates's correction of 2 × 2, as R's. Checked against R's ~sleep~ and
   against mpmath at 50 digits, to 1e-11.
+- *Rows after the fit:* a ~LinearModel~ keeps (X'X)⁻¹, R's ~cov.unscaled~,
+  so a second loop over the rows gives R's residuals, ~hatvalues~,
+  ~rstandard~ and the intervals of ~predict~, of the mean and of a new
+  response. Checked against R's ~cars~ to 1e-12.
 
 Measured against Polars (1M rows; Polars 2.1.0 on 1 and 24 threads):
 
@@ -366,8 +370,13 @@ because the vector adds in another order.
 
 In the order that lets an analysis be done from start to end:
 
-1. *Models:* a formula macro, as R's ~y ~ x + z~, over the loop; the
-   residuals and fitted values of a model as columns.
+1. *Models:* not a formula macro as R's ~y ~ x + z~: the types of its columns would
+   be checked when the program runs, or written in the formula, and the
+   loop says each one and what a null does. Instead, two smaller things
+   that keep every type written: a ~columns~ macro, that only says once
+   what ~column-as~, its type and ~:propagate~ say for each column, as
+   ~(columns t (price double) (rooms long))~; and a collector that takes a
+   category's code as a predictor and makes its indicators and names.
 2. *More tests:* Wilcoxon's and Fisher's exact test, the correlation test,
    and an analysis of variance of a model.
 3. *Statistics:* a t-digest for quantiles in one pass with little memory.
