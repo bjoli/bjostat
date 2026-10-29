@@ -387,7 +387,9 @@ because the vector adds in another order.
 In the order that lets an analysis be done from start to end:
 
 1. *Statistics:* a t-digest for quantiles in one pass with little memory.
-2. *Plots* as Vega-Lite or SVG, and *Parquet*.
+2. *Parquet*. Plots are in a package of their own, ~(bjostat plot)~ in the
+   repository bjostat-plot: Vega-Lite specifications of tables, and images
+   by vl-convert.
 
 Not from R: the recycling of short vectors, silent conversions between
 types, NA that spreads through a sum unless the collector says so, and
