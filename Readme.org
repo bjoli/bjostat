@@ -95,7 +95,7 @@ the schema: a table holds it, prints it and writes it.
 | ~(csv->table text)~ | The table of CSV text |
 
 Both take ~#:header?~ (~#t~), ~#:separator~ (~#\,~), ~#:types~ and
-~#:guess-rows~ (1000).
+~#:guess-rows~ (1000) and ~#:nulls~ (none).
 
 *Types.* The first row is the names, unless ~#:header? #f~; then the columns
 are ~column-1~, ~column-2~ and so on. The type of a column is guessed from
@@ -110,7 +110,9 @@ fits. ~#:types~ gives the type of a column by name, ~int~ and ~float~ too, and
 ~Dates~, ~DateTimes~, ~Instants~, ~Bool~ and ~Category~: a category is read
 as strings and then made one, with its levels sorted.
 
-*Nulls.* An empty field is a null, in a column of any type.
+*Nulls.* An empty field is a null, in a column of any type, and so is each
+field that ~#:nulls~ names. R writes its missing values as ~NA~; read such a
+file with ~#:nulls ["NA"]~.
 
 *Errors.* A row with too many or too few fields, and a field that is not of
 its column's type, are an ~Err~ with the line. A column guessed as ~long~

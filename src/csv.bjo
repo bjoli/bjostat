@@ -17,7 +17,8 @@
 ;; still fits. `#:types` gives the type of a column by its name, and then
 ;; nothing is guessed for it.
 ;;
-;; An empty field is a null, in a column of any type. A number is the plain
+;; An empty field is a null, in a column of any type, and so is each field
+;; that `#:nulls` names: `#:nulls ["NA"]` reads R's missing values. A number is the plain
 ;; form only: no white space, no thousands separators, '.' as the decimal
 ;; point. A field that is not of its column's type is an error, with the line,
 ;; with one exception: a column guessed as long that meets a decimal later
@@ -87,37 +88,38 @@
 ;; What the reader knows of the file after its first row.
 (type (: Shape (Record (: names (Array string))
                        (: header? bool)
-                       (: guess-rows int))))
+                       (: guess-rows int)
+                       (: nulls (Vec string)))))
 
 ;; The table of the CSV file at `path`. A file that does not open is an Err.
 (: (-> string (#:header? bool) (#:separator char) (#:types (Vec (Tuple string ColumnType)))
-       (#:guess-rows int)
+       (#:guess-rows int) (#:nulls (Vec string))
        (Result TableError Table)))
-(defun (read-csv path #:header? #t #:separator #\, #:types [] #:guess-rows 1000)
-  (match (try (read-source (csv-file path) header? separator types guess-rows)
+(defun (read-csv path #:header? #t #:separator #\, #:types [] #:guess-rows 1000 #:nulls [])
+  (match (try (read-source (csv-file path) header? separator types guess-rows nulls)
               #:catch (System.IO.IOException System.UnauthorizedAccessException))
     ((Ok r) r)
     ((Err e) (refuse (str path ": " (.-Message e))))))
 
 ;; The table of CSV text.
 (: (-> string (#:header? bool) (#:separator char) (#:types (Vec (Tuple string ColumnType)))
-       (#:guess-rows int)
+       (#:guess-rows int) (#:nulls (Vec string))
        (Result TableError Table)))
-(defun (csv->table text #:header? #t #:separator #\, #:types [] #:guess-rows 1000)
-  (read-source text header? separator types guess-rows))
+(defun (csv->table text #:header? #t #:separator #\, #:types [] #:guess-rows 1000 #:nulls [])
+  (read-source text header? separator types guess-rows nulls))
 
-(: (-> %s bool char (Vec (Tuple string ColumnType)) int (Result TableError Table))
+(: (-> %s bool char (Vec (Tuple string ColumnType)) int (Vec string) (Result TableError Table))
    (where (CsvSource %s)))
-(defun (read-source source header? separator types guess-rows)
+(defun (read-source source header? separator types guess-rows nulls)
   (call-with-csv-reader source
-    (fun (rd) (read-table rd header? types guess-rows))
+    (fun (rd) (read-table rd header? types guess-rows nulls))
     #:separator separator))
 
 (: (-> CsvError (Result TableError %a)))
 (defun (csv-refuse e) (refuse (displayed e)))
 
-(: (-> CsvReader bool (Vec (Tuple string ColumnType)) int (Result TableError Table)))
-(defun (read-table rd header? types guess-rows)
+(: (-> CsvReader bool (Vec (Tuple string ColumnType)) int (Vec string) (Result TableError Table)))
+(defun (read-table rd header? types guess-rows nulls)
   (match (csv-next! rd)
     ((Err e) (csv-refuse e))
     ((Ok None) (make-table []))
@@ -127,7 +129,7 @@
            (iarray->array first)
            (vec->array {vecing (str "column-" (int->string (+ i 1)))
                                (:for i (range 0 (iarray-length first)))})))
-     (def shape (Shape (names names) (header? header?) (guess-rows guess-rows)))
+     (def shape (Shape (names names) (header? header?) (guess-rows guess-rows) (nulls nulls)))
      (def (Ok given) (given-kinds names types) :propagate)
      ;; The rows of the guess, with the line each starts on.
      (def held (transientvec-empty))
@@ -136,7 +138,7 @@
      (def rows (transientvec->vec held))
      (def kinds {vecing (match (vec-ref given i)
                           ((Some k) k)
-                          (None (guess-column rows i)))
+                          (None (guess-column shape rows i)))
                         (:for i (range 0 (array-length names)))})
      (def guessed (vec->array (vec-map (fun (g) (none? g)) given)))
      (def cols (vec->array (vec-map make-column kinds)))
@@ -207,9 +209,9 @@
 
 ;; The narrowest kind that holds column `i` of every row, string for a
 ;; column with no value.
-(: (-> (Vec (Tuple int (IArray string))) int int))
-(defun (guess-column rows i)
-  (def k (fold (fun (r k) (join-kinds k (guess-field (iarray-ref (snd r) i)))) kind-empty rows))
+(: (-> Shape (Vec (Tuple int (IArray string))) int int))
+(defun (guess-column shape rows i)
+  (def k (fold (fun (r k) (join-kinds k (guess-field (field shape (snd r) i)))) kind-empty rows))
   (if (= k kind-empty) kind-string k))
 
 (: (-> (Array CsvColumn) (Array bool) Shape (Vec (Tuple int (IArray string))) (Result TableError Unit)))
@@ -233,6 +235,13 @@
      (def (Ok _) (add-row! cols guessed shape line row) :propagate)
      (add-rest! rd cols guessed shape))))
 
+;; Field `i` of the row, or "" (a null) when `#:nulls` names it.
+(: (-> Shape (IArray string) int string))
+(defun (field shape row i)
+  (def f (iarray-ref row i))
+  (def nulls (record-ref shape nulls))
+  (if (and (> (vec-length nulls) 0) (some? (find (fun (n) (= n f)) nulls))) "" f))
+
 ;; Each field into its column. A guessed column of longs that meets a decimal
 ;; becomes one of doubles.
 (: (-> (Array CsvColumn) (Array bool) Shape int (IArray string) (Result TableError Unit)))
@@ -240,11 +249,11 @@
   (let loop ((i 0))
     (cond
       ((= i (array-length cols)) (Ok unit))
-      ((column-add! (array-ref cols i) (iarray-ref row i)) (loop (+ i 1)))
+      ((column-add! (array-ref cols i) (field shape row i)) (loop (+ i 1)))
       ((and (array-ref guessed i)
-            (= (guess-field (iarray-ref row i)) kind-double)
+            (= (guess-field (field shape row i)) kind-double)
             (widen! (array-ref cols i))
-            (column-add! (array-ref cols i) (iarray-ref row i)))
+            (column-add! (array-ref cols i) (field shape row i)))
        (loop (+ i 1)))
       (else (refuse (bad-field shape line (array-ref (record-ref shape names) i)
                                (iarray-ref row i) (column-kind (array-ref cols i))

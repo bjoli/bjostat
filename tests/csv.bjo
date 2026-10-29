@@ -57,6 +57,16 @@
   (expect "a column with no value is of strings"
           (types-of (ok (csv->table "a,b\n1,\n2,\n")))
           ["a:long" "b:string"])
+  (def na (ok (csv->table "n,s\n1,a\nNA,NA\n3,c\n" #:nulls ["NA"])))
+  (expect "#:nulls names nulls" (types-of na) ["n:long" "s:string"])
+  (expect "a named null in a number" (column-ref (ok (longs na "n")) 1) None)
+  (expect "a named null in a string" (string-column-ref (ok (strings na "s")) 1) None)
+  (expect "a named null after the guess"
+          (column-ref (ok (longs (ok (csv->table "n\n1\nNA\n" #:nulls ["NA"] #:guess-rows 1)) "n")) 1)
+          None)
+  (expect "without #:nulls, NA is a string"
+          (types-of (ok (csv->table "n\n1\nNA\n")))
+          ["n:string"])
 
   ;; #:types
   (def typed (ok (csv->table sales #:types [(Tuple "qty" Int) (Tuple "price" Float)])))
