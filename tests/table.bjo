@@ -271,4 +271,13 @@
                "north   10.5    3     5     \n"
                "south   20      1     null  \n"
                "… 2 more rows\n"))
+  (expect "printed with #:digits: a small number keeps its digits, and 0 stays 0"
+          (table->string (ok (make-table [(named "p" (array->column (vec->array [0.12345 2.5512e-11 0.0 -3.0e-9])))]))
+                         #:digits 2)
+          (str "p      \n"
+               "double \n"
+               "0.12   \n"
+               "2.6e-11\n"
+               "0      \n"
+               "-3e-09 \n"))
   0)

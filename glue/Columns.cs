@@ -196,10 +196,22 @@ public static partial class Columns
     private static double Rounded(double x, int digits) =>
         digits < 0 ? x : Math.Round(x, Math.Min(digits, 15), MidpointRounding.AwayFromZero);
 
+    // The text of a number rounded to `digits` decimals. A number that is not
+    // 0 and rounds to 0, as a small p-value, is written with `digits`
+    // significant digits instead (2.551e-11), so that it does not show as 0.
+    private static string NumberText(double x, int digits)
+    {
+        var c = CultureInfo.InvariantCulture;
+        var r = Rounded(x, digits);
+        if (r != 0 || x == 0 || !double.IsFinite(x)) return r.ToString("R", c);
+        return x.ToString("G" + Math.Max(digits, 1), c).Replace("E-", "e-");
+    }
+
     /// <summary>
     /// The text of a cell. With <paramref name="digits"/> 0 or more, a double
     /// or float is rounded to that many decimals first; below 0, it is all of
-    /// it. A rounded number is still the shortest text, so 10 stays "10".
+    /// it. A rounded number is still the shortest text, so 10 stays "10". A
+    /// number that rounds to 0 and is not 0 keeps that many significant digits.
     /// </summary>
     public static string CellText(IArrowArray a, int i, int digits)
     {
@@ -207,8 +219,8 @@ public static partial class Columns
         var c = CultureInfo.InvariantCulture;
         return a switch
         {
-            DoubleArray d => Rounded(d.GetValue(i)!.Value, digits).ToString("R", c),
-            FloatArray f => Rounded(f.GetValue(i)!.Value, digits).ToString("R", c),
+            DoubleArray d => NumberText(d.GetValue(i)!.Value, digits),
+            FloatArray f => NumberText(f.GetValue(i)!.Value, digits),
             Int64Array l => l.GetValue(i)!.Value.ToString(c),
             Int32Array n => n.GetValue(i)!.Value.ToString(c),
             Int16Array s => s.GetValue(i)!.Value.ToString(c),

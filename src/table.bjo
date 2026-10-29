@@ -736,7 +736,8 @@
 
 ;; The table as text: the names, the types, and the first `#:rows` rows, each
 ;; column as wide as its widest cell. With `#:digits`, a double or float is
-;; rounded to that many decimals.
+;; rounded to that many decimals; one that is not 0 and rounds to 0 is
+;; written with that many significant digits, as 2.551e-11.
 (: (-> Table (#:rows int) (#:digits int) string))
 (defun (table->string t #:rows 10 #:digits -1)
   (def shown (min rows (table-row-count t)))
