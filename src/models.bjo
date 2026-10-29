@@ -30,14 +30,17 @@
   LinearModel ModelError
   LinearModelling linear-model linear-model/origin
   SimpleModelling simple-linear-model
-  model->table model->string model-predict)
+  model->table model->string model-predict
+  ;; Generalized linear models
+  GeneralizedModel GeneralizedModelling logistic-model poisson-model
+  glm->table glm->string glm-predict)
 
 (import (std prelude))
 (import (bjostat table))
 (import (bjostat distributions))
-(import (only (std maths) nan?))
+(import (only (std maths) nan? exp))
 
-(import/class (Regression (: Bjostat.Regression)))
+(import/class (Regression (: Bjostat.Regression)) (Glm (: Bjostat.Glm)))
 
 (import/extern
   (clr-make (: Bjostat.Regression.Make (-> bool Regression)))
@@ -51,7 +54,20 @@
   (clr-rss (: Bjostat.Regression.ResidualSquares (-> Regression double)))
   (clr-tss (: Bjostat.Regression.TotalSquares (-> Regression double)))
   (clr-unscaled-errors (: Bjostat.Regression.UnscaledErrors (-> Regression (Array double))))
-  (significant (: Bjostat.Regression.Significant (-> double int string))))
+  (significant (: Bjostat.Regression.Significant (-> double int string)))
+  (glm-make (: Bjostat.Glm.Make (-> int bool Glm)))
+  (glm-add (: Bjostat.Glm.Add (-> Glm double (Vec double) Glm)))
+  (glm-fit (: Bjostat.Glm.Fit (-> Glm (Array string) string)))
+  (glm-estimates (: Bjostat.Glm.Estimates (-> Glm (Array double))))
+  (glm-errors (: Bjostat.Glm.StandardErrors (-> Glm (Array double))))
+  (glm-deviance (: Bjostat.Glm.Deviance (-> Glm double)))
+  (glm-null-deviance (: Bjostat.Glm.NullDeviance (-> Glm double)))
+  (glm-log-likelihood (: Bjostat.Glm.LogLikelihood (-> Glm double)))
+  (glm-rows (: Bjostat.Glm.Rows (-> Glm long)))
+  (glm-coefficients (: Bjostat.Glm.Coefficients (-> Glm int)))
+  (glm-intercept? (: Bjostat.Glm.Intercept (-> Glm bool)))
+  (glm-iterations (: Bjostat.Glm.Iterations (-> Glm int)))
+  (glm-converged? (: Bjostat.Glm.Converged (-> Glm bool))))
 
 ;; ===========================================================================
 ;; The model
@@ -195,6 +211,24 @@
 (defun (p-value-text p)
   (if (< p 2.2e-16) "<2e-16" (significant p 3)))
 
+;; Rows of cells as columns, each as wide as its widest cell: the first to
+;; the left, the others to the right, as R prints a table of coefficients.
+(: (-> (Vec (Vec string)) string))
+(defun (columns->string rows)
+  (def k (vec-length (vec-ref rows 0)))
+  (def widths {vecing (loop (:for r rows) (:acc w (folding 0 (max w (string-length (vec-ref r c))))))
+                      (:for c (range 0 k))})
+  (def sb (stringbuilder-empty))
+  (loop (:for r rows)
+        (:do (loop (:for c (range 0 k))
+                   (:do (when (> c 0) (stringbuilder-add-string! sb " "))
+                        (stringbuilder-add-string!
+                          sb (if (= c 0)
+                                 (string-pad-right (vec-ref r c) (vec-ref widths c))
+                                 (string-pad-left (vec-ref r c) (vec-ref widths c))))))
+             (stringbuilder-add-string! sb "\n")))
+  (stringbuilder->string sb))
+
 ;; The model as R's summary.lm prints it.
 (: (-> LinearModel string))
 (defun (model->string m)
@@ -206,20 +240,9 @@
              (significant (vec-ref (record-ref m t-values) i) 4)
              (p-value-text (vec-ref (record-ref m p-values) i))]
             (:for i (range 0 (vec-length terms)))})
-  (def header ["" "Estimate" "Std. Error" "t value" "Pr(>|t|)"])
-  (def all (vec-add-first rows header))
-  (def widths {vecing (loop (:for r all) (:acc w (folding 0 (max w (string-length (vec-ref r c))))))
-                      (:for c (range 0 5))})
   (def sb (stringbuilder-empty))
   (stringbuilder-add-string! sb "Coefficients:\n")
-  (loop (:for r all)
-        (:do (loop (:for c (range 0 5))
-                   (:do (when (> c 0) (stringbuilder-add-string! sb " "))
-                        (stringbuilder-add-string!
-                          sb (if (= c 0)
-                                 (string-pad-right (vec-ref r c) (vec-ref widths c))
-                                 (string-pad-left (vec-ref r c) (vec-ref widths c))))))
-             (stringbuilder-add-string! sb "\n")))
+  (stringbuilder-add-string! sb (columns->string (vec-add-first rows ["" "Estimate" "Std. Error" "t value" "Pr(>|t|)"])))
   (stringbuilder-add-string!
     sb (str "\nResidual standard error: " (significant (record-ref m sigma) 4)
             " on " (long->string (record-ref m df)) " degrees of freedom\n"
@@ -231,4 +254,145 @@
               " on " (int->string (- (vec-length terms) (if (record-ref m intercept?) 1 0)))
               " and " (long->string (record-ref m df)) " DF, p-value: "
               (p-value-text (record-ref m f-p-value)) "\n")))
+  (stringbuilder->string sb))
+
+;; ===========================================================================
+;; Generalized linear models
+;; ===========================================================================
+;;
+;; Logistic regression, R's glm(family = binomial), and Poisson regression,
+;; R's glm(family = poisson), with their usual links, the logit and the log:
+;;
+;;     (loop (:for w* weight) (:for a* automatic)
+;;           (:when-let (Some w) w*) (:when-let (Some a) a*)
+;;           (:acc (logistic-model ["weight"] (Tuple (if a 1.0 0.0) [w]))))
+;;
+;; The fit is iteratively reweighted least squares, as R's: each step is a
+;; QR of the rows weighted, so the collector keeps the rows, p + 1 numbers
+;; for each. The standard errors, z values and p-values are those of R's
+;; summary.glm, from the normal distribution, as the dispersion of both
+;; families is 1.
+
+;; A fitted model. `deviance` is the residual deviance, of `df` degrees of
+;; freedom; `null-deviance` that of the model of the intercept alone, of
+;; `null-df`. `aic` is Akaike's criterion, -2 ln L + 2 p, as R's. When the
+;; fit did not converge in 25 steps, `converged?` is #f, as R warns; data
+;; that a predictor separates do not converge, as their estimates grow
+;; without end.
+(type (: GeneralizedModel
+         (Record (: family string)
+                 (: terms (Vec string))
+                 (: estimates (Vec double))
+                 (: standard-errors (Vec double))
+                 (: z-values (Vec double))
+                 (: p-values (Vec double))
+                 (: deviance double)
+                 (: df long)
+                 (: null-deviance double)
+                 (: null-df long)
+                 (: aic double)
+                 (: rows long)
+                 (: iterations int)
+                 (: converged? bool)
+                 (: intercept? bool))))
+
+;; The model of a family on the predictors named `names`, with an intercept.
+(type (: GeneralizedModelling #:opaque (Struct (: family int) (: names (Vec string)))))
+
+;; Logistic regression: each element is a response from 0 to 1, most often
+;; 0 or 1, and the predictors.
+(: (-> (Vec string) GeneralizedModelling))
+(defun (logistic-model names) (GeneralizedModelling (family 0) (names names)))
+
+;; Poisson regression: each element is a count, and the predictors.
+(: (-> (Vec string) GeneralizedModelling))
+(defun (poisson-model names) (GeneralizedModelling (family 1) (names names)))
+
+(impl (Collector GeneralizedModelling)
+  (type %elem (Tuple double (Vec double)))
+  (type %acc Glm)
+  (type %out (Result ModelError GeneralizedModel))
+  (defun (collector-init c) (glm-make (record-ref c family) #t))
+  (defun (collector-step c acc e)
+    (match e ((Tuple y xs) (glm-add acc y xs))))
+  (defun (collector-finish c acc) (glm-of acc (record-ref c family) (record-ref c names))))
+
+(: (-> Glm int (Vec string) (Result ModelError GeneralizedModel)))
+(defun (glm-of m family names)
+  (def problem (glm-fit m (vec->array names)))
+  (def predictors (- (glm-coefficients m) (if (glm-intercept? m) 1 0)))
+  (cond
+    ((not (= problem "")) (Err (ModelError (message problem))))
+    ((not (= (vec-length names) predictors))
+     (Err (ModelError (message (str "the rows have " (int->string predictors)
+                                    (if (= predictors 1) " predictor" " predictors")
+                                    ", and there are " (int->string (vec-length names)) " names.")))))
+    (else
+     (def p (glm-coefficients m))
+     (def b (array->vec (glm-estimates m)))
+     (def se (array->vec (glm-errors m)))
+     (def zs {vecing (/ (vec-ref b i) (vec-ref se i)) (:for i (range 0 p))})
+     (def n (glm-rows m))
+     (def intercept? (glm-intercept? m))
+     (Ok (GeneralizedModel
+           (family (if (= family 0) "binomial" "poisson"))
+           (terms (if intercept? (vec-add-first names "(Intercept)") names))
+           (estimates b) (standard-errors se) (z-values zs)
+           (p-values (vec-map (fun (z) (* 2.0 (normal-cdf (- 0.0 (abs z))))) zs))
+           (deviance (glm-deviance m)) (df (- n (cast long p)))
+           (null-deviance (glm-null-deviance m)) (null-df (- n (if intercept? 1L 0L)))
+           (aic (+ (* -2.0 (glm-log-likelihood m)) (* 2.0 (cast double p))))
+           (rows n) (iterations (glm-iterations m)) (converged? (glm-converged? m))
+           (intercept? intercept?))))))
+
+;; The coefficients as a table, as broom's tidy: term, estimate, std.error,
+;; statistic (the z value) and p.value.
+(: (-> GeneralizedModel Table))
+(defun (glm->table m)
+  (match (make-table
+           [(named-strings "term" (array->string-column (vec->array (record-ref m terms))))
+            (named "estimate" (array->column (vec->array (record-ref m estimates))))
+            (named "std.error" (array->column (vec->array (record-ref m standard-errors))))
+            (named "statistic" (array->column (vec->array (record-ref m z-values))))
+            (named "p.value" (array->column (vec->array (record-ref m p-values))))])
+    ((Ok t) t)
+    ((Err e) (panic! (displayed e)))))
+
+;; The mean response the model gives for the predictors: a probability of
+;; the logistic model, a mean count of the Poisson one.
+(: (-> GeneralizedModel (Vec double) double))
+(defun (glm-predict m xs)
+  (def b (record-ref m estimates))
+  (def start (if (record-ref m intercept?) 1 0))
+  (def eta (loop (:for i (range 0 (vec-length xs)))
+                 (:acc sum (summing (* (vec-ref b (+ i start)) (vec-ref xs i))))
+                 => (+ (if (record-ref m intercept?) (vec-ref b 0) 0.0) sum)))
+  (if (= (record-ref m family) "binomial")
+      (/ 1.0 (+ 1.0 (exp (- 0.0 eta))))
+      (exp eta)))
+
+;; The model as R's summary.glm prints it.
+(: (-> GeneralizedModel string))
+(defun (glm->string m)
+  (def terms (record-ref m terms))
+  (def rows
+    {vecing [(vec-ref terms i)
+             (significant (vec-ref (record-ref m estimates) i) 4)
+             (significant (vec-ref (record-ref m standard-errors) i) 4)
+             (significant (vec-ref (record-ref m z-values) i) 4)
+             (p-value-text (vec-ref (record-ref m p-values) i))]
+            (:for i (range 0 (vec-length terms)))})
+  (def sb (stringbuilder-empty))
+  (stringbuilder-add-string! sb "Coefficients:\n")
+  (stringbuilder-add-string! sb (columns->string (vec-add-first rows ["" "Estimate" "Std. Error" "z value" "Pr(>|z|)"])))
+  (stringbuilder-add-string!
+    sb (str "\n(Dispersion parameter for " (record-ref m family) " family taken to be 1)\n\n"
+            "    Null deviance: " (significant (record-ref m null-deviance) 5)
+            "  on " (long->string (record-ref m null-df)) "  degrees of freedom\n"
+            "Residual deviance: " (significant (record-ref m deviance) 5)
+            "  on " (long->string (record-ref m df)) "  degrees of freedom\n"
+            "AIC: " (significant (record-ref m aic) 5) "\n\n"
+            "Number of Fisher Scoring iterations: " (int->string (record-ref m iterations)) "\n"))
+  (unless (record-ref m converged?)
+    (stringbuilder-add-string! sb "The fit did not converge in 25 iterations.\n"))
   (stringbuilder->string sb))

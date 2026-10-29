@@ -4,7 +4,8 @@
 
 ;; bjostat/tests/models.bjo — linear models against R's lm and against the
 ;; normal equations solved at 50 digits by mpmath (scratch/lm_ref.py made
-;; the values).
+;; the values), and generalized linear models against R's glm and Newton's
+;; method at 50 digits (scratch/glm_ref.py).
 ;;
 ;;     bjo run tests/models.bjo
 ;;
@@ -14,6 +15,7 @@
 (import (std simpletest))
 (import (bjostat table))
 (import (bjostat models))
+(import (only (std maths) exp))
 
 (: (-> double double double bool))
 (defun (close? got want rel)
@@ -71,7 +73,45 @@
           (:let c (/ (cast double (% (* i 13) 11)) 3.0))})
 
 (: (-> double double))
+(defun (exp-of x) (exp x))
+
+(: (-> int int int))
+(defun (quotient-of i n) (cast int (/ (cast double i) (cast double n))))
+
+(: (-> double double))
 (defun (floor-of x) (cast double (cast long x)))
+
+(: (-> (Result ModelError GeneralizedModel) GeneralizedModel))
+(defun (glm-ok r)
+  (match r
+    ((Ok m) m)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result ModelError GeneralizedModel) string))
+(defun (glm-error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+;; A GLM against the reference: estimates, standard errors, z values,
+;; p-values, then the deviance, the null deviance and the AIC.
+(: (-> string GeneralizedModel (Vec (Vec double)) (Vec double) double void))
+(defun (check-glm name m vecs scalars rel)
+  (expect (str name ": estimates") (all-close? (record-ref m estimates) (vec-ref vecs 0) rel) #t)
+  (expect (str name ": standard errors") (all-close? (record-ref m standard-errors) (vec-ref vecs 1) rel) #t)
+  (expect (str name ": z values") (all-close? (record-ref m z-values) (vec-ref vecs 2) rel) #t)
+  (expect (str name ": p-values") (all-close? (record-ref m p-values) (vec-ref vecs 3) (* 10.0 rel)) #t)
+  (expect (str name ": deviance, null deviance, AIC")
+          (all-close? [(record-ref m deviance) (record-ref m null-deviance) (record-ref m aic)] scalars rel)
+          #t)
+  (expect (str name ": converged") (record-ref m converged?) #t))
+
+(: (Vec double))
+(def wt [2.620 2.875 2.320 3.215 3.440 3.460 3.570 3.190 3.150 3.440 3.440 4.070 3.730 3.780 5.250 5.424
+         5.345 2.200 1.615 1.835 2.465 3.520 3.435 3.840 3.845 1.935 2.140 1.513 3.170 2.770 3.570 2.780])
+(: (Vec double))
+(def am [1.0 1.0 1.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0 1.0 1.0 0.0 0.0 0.0 0.0 0.0
+         1.0 1.0 1.0 1.0 1.0 1.0 1.0])
 
 (defun (main)
   ;; R's cars: lm(dist ~ speed)
@@ -137,6 +177,59 @@
   (expect "ill-conditioned: the estimates to 1e-7"
           (all-close? (record-ref ill estimates) [-894.8182636503428 0.18116663356194449 -7.938503098723279e-6] 1e-7)
           #t)
+
+  ;; R's mtcars: glm(am ~ wt, family = binomial)
+  (def logit (glm-ok (loop (:for w wt) (:for a am) (:acc (logistic-model ["wt"] (Tuple a [w]))))))
+  (check-glm "logistic, mtcars" logit
+             [[12.040369728657321 -4.0239699621732015]
+              [4.5100662389667597 1.4365277526235585]
+              [2.6696658298783053 -2.8011780174968059]
+              [0.0075926770167899876 0.0050916423069714345]]
+             [19.176084807445084 43.229733276857806 23.176084807445084]
+             1e-7)
+  (expect "logistic: degrees of freedom" (Tuple (record-ref logit df) (record-ref logit null-df)) (Tuple 30L 31L))
+  (expect "logistic: a predicted probability"
+          (close? (glm-predict logit [3.0]) (/ 1.0 (+ 1.0 (exp-of (- 0.0 (+ 12.040369728657321 (* 3.0 -4.0239699621732015)))))) 1e-7)
+          #t)
+  ;; R prints 1.436 for the error of wt: its errors are of the weights of
+  ;; the last step, a step behind the estimates. Of the estimates, at 50
+  ;; digits, it is 1.43653.
+  (expect "logistic: printed as R's summary.glm"
+          (glm->string logit)
+          (str "Coefficients:\n"
+               "            Estimate Std. Error z value Pr(>|z|)\n"
+               "(Intercept)    12.04       4.51    2.67  0.00759\n"
+               "wt            -4.024      1.437  -2.801  0.00509\n"
+               "\n"
+               "(Dispersion parameter for binomial family taken to be 1)\n"
+               "\n"
+               "    Null deviance: 43.23  on 31  degrees of freedom\n"
+               "Residual deviance: 19.176  on 30  degrees of freedom\n"
+               "AIC: 23.176\n"
+               "\n"
+               "Number of Fisher Scoring iterations: " (int->string (record-ref logit iterations)) "\n"))
+
+  ;; Poisson
+  (def counts (: {vecing (cast double (+ (% (* i 13) 7) (quotient-of i 8))) (:for i (range 0 40))} (Vec double)))
+  (def pois (glm-ok (loop (:for i (range 0 40)) (:for y counts)
+                          (:acc (poisson-model ["x" "k"] (Tuple y [(/ (cast double i) 10.0) (cast double (% (* i 7) 5))]))))))
+  (check-glm "Poisson" pois
+             [[1.0564819684258793 0.24683892439497985 0.022592430956627431]
+              [0.18454721403712071 0.062400246820881342 0.050069525427947554]
+              [5.7247245586344829 3.9557363467411601 0.45122119220281051]
+              [1.0360168900350092e-8 7.6299272838079965e-5 0.65183013726529864]]
+             [45.032129328314534 61.544047533042428 181.39877362314467]
+             1e-7)
+  (expect "a logistic response outside 0 to 1"
+          (glm-error-of (loop (:for w wt) (:acc (logistic-model ["wt"] (Tuple 2.0 [w])))))
+          "row 0 has the response 2; a logistic model needs one from 0 to 1.")
+  (expect "a negative count"
+          (glm-error-of (loop (:for w wt) (:acc (poisson-model ["wt"] (Tuple -1.0 [w])))))
+          "row 0 has the response -1; a Poisson model needs a count of at least 0.")
+  (expect "a separated logistic model does not converge"
+          (record-ref (glm-ok (loop (:for w wt) (:acc (logistic-model ["wt"] (Tuple (if (< w 3.0) 1.0 0.0) [w])))))
+                      converged?)
+          #f)
 
   ;; What cannot be fitted
   (expect "two rows for two coefficients"

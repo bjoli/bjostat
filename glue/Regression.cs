@@ -67,6 +67,14 @@ public sealed class Regression
         return m;
     }
 
+    /// <summary>A row of all p columns, the intercept's 1 too, for Glm's weighted rows.</summary>
+    internal void AddRow(double y, ReadOnlySpan<double> x)
+    {
+        if (_p < 0) Start(x.Length - (_intercept ? 1 : 0));
+        x.CopyTo(_row);
+        Rotate(y);
+    }
+
     private void Start(int predictors)
     {
         _p = predictors + (_intercept ? 1 : 0);
