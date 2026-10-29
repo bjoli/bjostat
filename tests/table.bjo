@@ -206,7 +206,7 @@
   ;; A sort of many rows is made in parts on the workers: 300 000 rows of
   ;; 1 000 values each and a null in every 97, in order and stable, the
   ;; nulls last, both ways.
-  (def many (ok (make-table [(named "v" (array->column {arraying (cast double (% (* i 7919) 1000)) (:for i (range 0 300000))}
+  (def many (ok (make-table [(named "v" (array->column {arraying (cast double (% (* (cast long i) 7919L) 1000L)) (:for i (range 0 300000))}
                                                       #:valid {arraying (not (= (% i 97) 5)) (:for i (range 0 300000))}))
                              (named "i" (array->column {arraying i (:for i (range 0 300000))}))])))
   (: (-> Table bool bool))

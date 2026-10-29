@@ -95,61 +95,123 @@ public static class Categories
     /// A number for each distinct string, from 0 in the order of their first
     /// rows, and the id of each row; 0 at a null. <paramref name="firsts"/>
     /// gets the first row of each id. The table is open addressing over the
-    /// bytes of the column, with each string's hash kept: no call through an
-    /// interface and no span made for each comparison.
+    /// strings' hashes, each kept, with no call through an interface. A long
+    /// column is numbered in parts on bjostat's workers.
     /// </summary>
     internal static int[] StringIds(StringArray s, out List<int> firsts)
     {
         int n = s.Length;
         var ids = new int[n];
-        firsts = new List<int>();
-        var offsets = s.ValueOffsets;
-        var bytes = s.ValueBuffer.Span;
-        var hashes = new List<int>();
-        int mask = 63;
-        var table = new int[mask + 1];
-        System.Array.Fill(table, -1);
-        bool nulls = s.NullCount != 0;
-        for (int r = 0; r < n; r++)
+        int parts = Math.Min(n / PartRows, 4 * Workers.Count);
+        if (parts < 2)
         {
-            if (nulls && s.IsNull(r)) continue;
-            var v = bytes.Slice(offsets[r], offsets[r + 1] - offsets[r]);
+            var one = new StringIdTable(s);
+            one.Number(0, n, ids);
+            firsts = one.Firsts;
+            return ids;
+        }
+        // Each part numbers its rows on a worker; then the parts' strings are
+        // numbered for the whole column, the parts in order, so that the
+        // numbers are in the order of the strings' first rows; then each
+        // part's rows get those numbers, on the workers again.
+        int size = (n + parts - 1) / parts;
+        var tables = new StringIdTable[parts];
+        Workers.For(parts, p =>
+        {
+            var t = new StringIdTable(s);
+            t.Number(p * size, Math.Min(n, (p + 1) * size), ids);
+            tables[p] = t;
+        });
+        var all = new StringIdTable(s);
+        var maps = new int[parts][];
+        for (int p = 0; p < parts; p++)
+        {
+            var t = tables[p];
+            var map = new int[t.Firsts.Count];
+            for (int k = 0; k < map.Length; k++) map[k] = all.IdOf(t.Firsts[k], t.Hashes[k]);
+            maps[p] = map;
+        }
+        bool nulls = s.NullCount != 0;
+        Workers.For(parts, p =>
+        {
+            var map = maps[p];
+            for (int r = p * size, to = Math.Min(n, (p + 1) * size); r < to; r++)
+                if (!nulls || s.IsValid(r)) ids[r] = map[ids[r]];
+        });
+        firsts = all.Firsts;
+        return ids;
+    }
+
+    // The fewest rows of a part when the strings of a column are numbered.
+    private const int PartRows = 1 << 16;
+
+    /// <summary>
+    /// Numbers for the distinct strings of a column, by open addressing over
+    /// the strings' hashes. A string's number is the count of distinct
+    /// strings before its first row.
+    /// </summary>
+    private sealed class StringIdTable(StringArray s)
+    {
+        public readonly List<int> Firsts = new();
+        public readonly List<int> Hashes = new();
+        private int _mask = 63;
+        private int[] _table = Filled(64);
+
+        private static int[] Filled(int n)
+        {
+            var t = new int[n];
+            System.Array.Fill(t, -1);
+            return t;
+        }
+
+        private ReadOnlySpan<byte> Bytes(int row) => s.GetBytes(row);
+
+        public static int Hash(ReadOnlySpan<byte> v)
+        {
             var hc = new HashCode();
             hc.AddBytes(v);
-            int h = hc.ToHashCode();
-            int i = h & mask, id;
-            while ((id = table[i]) >= 0)
-            {
-                if (hashes[id] == h)
-                {
-                    int f = firsts[id];
-                    if (bytes.Slice(offsets[f], offsets[f + 1] - offsets[f]).SequenceEqual(v)) break;
-                }
-                i = (i + 1) & mask;
-            }
-            if (id < 0)
-            {
-                id = firsts.Count;
-                firsts.Add(r);
-                hashes.Add(h);
-                table[i] = id;
-                if (firsts.Count * 2 > mask)
-                {
-                    // Twice the room, and each id where its hash puts it.
-                    mask = mask * 2 + 1;
-                    table = new int[mask + 1];
-                    System.Array.Fill(table, -1);
-                    for (int k = 0; k < hashes.Count; k++)
-                    {
-                        int j = hashes[k] & mask;
-                        while (table[j] >= 0) j = (j + 1) & mask;
-                        table[j] = k;
-                    }
-                }
-            }
-            ids[r] = id;
+            return hc.ToHashCode();
         }
-        return ids;
+
+        /// <summary>Numbers the rows from..to into ids; a null is left as it is.</summary>
+        public void Number(int from, int to, int[] ids)
+        {
+            bool nulls = s.NullCount != 0;
+            for (int r = from; r < to; r++)
+            {
+                if (nulls && s.IsNull(r)) continue;
+                ids[r] = IdOf(r, Hash(Bytes(r)));
+            }
+        }
+
+        /// <summary>The number of the string of row r, whose hash is h; a new one when it is new.</summary>
+        public int IdOf(int r, int h)
+        {
+            var v = Bytes(r);
+            int i = h & _mask, id;
+            while ((id = _table[i]) >= 0)
+            {
+                if (Hashes[id] == h && Bytes(Firsts[id]).SequenceEqual(v)) return id;
+                i = (i + 1) & _mask;
+            }
+            id = Firsts.Count;
+            Firsts.Add(r);
+            Hashes.Add(h);
+            _table[i] = id;
+            if (Firsts.Count * 2 > _mask)
+            {
+                // Twice the room, and each id where its hash puts it.
+                _mask = _mask * 2 + 1;
+                _table = Filled(_mask + 1);
+                for (int k = 0; k < Hashes.Count; k++)
+                {
+                    int j = Hashes[k] & _mask;
+                    while (_table[j] >= 0) j = (j + 1) & _mask;
+                    _table[j] = k;
+                }
+            }
+            return id;
+        }
     }
 
     // The validity bitmap of the column from row 0, or empty with no nulls.

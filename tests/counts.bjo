@@ -109,4 +109,21 @@
   (expect "crosstab: a value named as the row key"
           (error-of (table-crosstab (csv "a,b\nx,a\n") "a" "b"))
           "'b' has the value 'a', and the table has a column of that name already.")
+
+  ;; A long column of strings is numbered in parts on the workers: the
+  ;; distinct strings still in the order of their first rows, and every row
+  ;; counted.
+  (def words (ok (make-table [(named-strings "w" (array->string-column
+                                                   {arraying (str "w" (int->string (% (* (% i 1000) 7919) 1000))) (:for i (range 0 300000))}
+                                                   #:valid {arraying (not (= (% i 101) 3)) (:for i (range 0 300000))}))])))
+  (def word-cells (: (ok (column-as words "w")) (Cells string)))
+  (expect "strings in parts: the distinct ones in the order of their first rows"
+          {vecing w (:for w* (: (ok (column-as (ok (table-distinct words #:by ["w"])) "w")) (Cells string)))
+                    (:when-let (Some w) w*)}
+          (loop (:for w (skip-nulls word-cells))
+                (:acc seen (folding [] (if (some? (find (fun (x) (= x w)) seen)) seen (vec-add seen w))))))
+  (expect "strings in parts: every row counted, the nulls one key"
+          (Tuple (table-row-count (ok (table-count words ["w"])))
+                 (column-sum (ok (longs (ok (table-count words ["w"])) "n"))))
+          (Tuple 1001 300000L))
   0)
