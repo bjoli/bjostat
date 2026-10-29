@@ -607,6 +607,17 @@ loops before anything else, as they change the Collector trait:
      thread, which widens the column or gives the error with its line.
      186 to 68.0 ms (narrow), 516 to 178 (wide); Polars on one thread 71.6
      and 215, data.table 121 and 404, Polars on 24 threads 16.9 and 34.8.
+   - The ids of a column of strings (~Categories.StringIds~), which a
+     categorize, a count, a crosstab, a distinct and a sort by strings
+     start with: each part of the rows is numbered on a worker, the parts'
+     strings are numbered for the column in the order of the parts, so
+     that the ids stay in the order of the first rows, and each part's
+     rows are given those ids on the workers. 25 to 35 % less: categorize
+     12.8 to 8.20 ms (narrow) and 44.3 to 32.6 (wide), a count by a string
+     and a long 15.5 to 10.7 and 154 to 138, a crosstab 16.6 to 11.9 and
+     92.6 to 73.7, a distinct by them 14.5 to 10.0 and 97.7 to 83.9. The
+     rest of each is on one thread: the ids of the other keys put together,
+     and what is made of the groups.
    - Tried and left out: the ids of a count's, a crosstab's and a
      distinct's other keys on the workers while the first is numbered. No
      change (count by a string and a long 15.2 ms before and after): the
