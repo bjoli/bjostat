@@ -666,6 +666,37 @@ loops before anything else, as they change the Collector trait:
    counts do, when the keys are dense enough. Check also whether both keys
    of a join are sorted and unique, as pandas does: its join by ~id~ takes
    2 ms.
+
+   Done for groups: ~(string-groups t name)~ in (bjostat query) numbers
+   the strings of a column once, with ~Categories.StringIds~ in parts on
+   the workers, and gives the GroupIndex in the order first seen and the
+   group of each row as ~(Cells int)~; a loop then reads a row's group as
+   a number. A group by a string and a sum, measured alone: 28.2 to 8.92
+   ms (narrow), 72.6 to 29.0 with 20 000 regions (wide); Polars on one
+   thread 8.28 and 47.8, on 24 threads 2.38 and 21.2. ~group-of!~ stays,
+   for keys a loop makes.
+
+   Done for joins. Where a join's time went (narrow file): by a long,
+   about 26 ms finding the matches and 13 copying the columns; by a
+   string, 7 and 14. Now:
+   - A side whose rows come out each once and in order is not copied: its
+     columns are the result's as they are. That is the left side of a
+     lookup where each row has its one match.
+   - One key of integers, dates or timestamps needs no hash: when the
+     right keys are dense (the greatest less the least at most twice the
+     rows and 1 024), an array by the distance from the least has the rows
+     of each key; when both sides are sorted, the right keys unique and
+     neither null, the two are merged, each part of the left rows finding
+     its start in the right ones by halving. Else the hash table, as
+     before.
+   Measured alone: a join by a long, one to one, 38.4 to 9.10 ms (narrow)
+   and 51.6 to 14.0 (wide); by a string to the keys, 24.2 to 13.7 and 31.1
+   to 16.0. Polars on 24 threads: 22.5 and 35.6, 10.7 and 18.0. The tests
+   compare the joins by longs with the same joins by the keys as strings,
+   which go through the hash table, for each kind of keys. Not done: ids
+   for joins by strings. What is left of their matching (7 to 11 ms) is a
+   hash of each row's bytes in parts on the workers, and numbering the
+   strings first hashes each row's bytes too.
 3. *CSV fields as spans.* bjostat reads the narrow file in 68.0 ms in
    chunks on the workers (186 on one thread), Polars in 71.6 on one thread
    and in 16.9 on 24; the wide one in 178, 215 and 34.8. ~(text csv)~ makes

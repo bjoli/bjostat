@@ -143,6 +143,44 @@
         (:when (< (vec-ref [0 1 3 7 8 13 63 64 65] (% k 9)) (vec-ref [1 56 57 58 64 65 130 1200] (/ (% k 72) 9))))
         (:acc (counting k))))
 
+;; A table of n rows with a key `k` of longs from `key`, None a null, the
+;; same key as strings in `ks`, and the row's number in `row`.
+(: (-> int (-> int (Option long)) Table))
+(defun (keyed n key)
+  (def keys {vecing (key i) (:for i (range 0 n))})
+  (ok (make-table [(named "k" (array->column {arraying (match k ((Some v) v) (None 0L)) (:for k keys)}
+                                             #:valid {arraying (some? k) (:for k keys)}))
+                   (named-strings "ks" (array->string-column {arraying (match k ((Some v) (displayed v)) (None "")) (:for k keys)}
+                                                             #:valid {arraying (some? k) (:for k keys)}))
+                   (named "row" (array->column {arraying i (:for i (range 0 n))}))])))
+
+;; The rows of a join's result, as the left and right row numbers: "row.x"
+;; and "row.y" after a join of two tables of `keyed`, "row" after a semi or
+;; an anti join.
+(: (-> Table (List string)))
+(defun (joined-rows t)
+  (def names (table-names t))
+  (if (any? (fun (name) (= name "row.x")) (vec->list names))
+      (let ((x (: (ok (column-as t "row.x")) (Cells int)))
+            (y (: (ok (column-as t "row.y")) (Cells int))))
+        (loop (:for a* x) (:for b* y)
+              (:acc (listing (str (displayed a*) "-" (displayed b*))))))
+      (loop (:for a* (: (ok (column-as t "row")) (Cells int))) (:acc (listing (displayed a*))))))
+
+;; Whether each join of `left` and `right` by the longs `k` gives the rows the
+;; same join by the strings `ks` gives: the strings go through the hash
+;; table, the longs through an array, a merge or the hash table.
+(: (-> Table Table bool))
+(defun (integer-joins-agree? left right)
+  (def l (ok (table-select left ["k" "row"])))
+  (def r (ok (table-select right ["k" "row"])))
+  (def ls (ok (table-select left ["ks" "row"])))
+  (def rs (ok (table-select right ["ks" "row"])))
+  (and (= (joined-rows (ok (inner-join l r ["k"]))) (joined-rows (ok (inner-join ls rs ["ks"]))))
+       (= (joined-rows (ok (left-join l r ["k"]))) (joined-rows (ok (left-join ls rs ["ks"]))))
+       (= (joined-rows (ok (semi-join l r ["k"]))) (joined-rows (ok (semi-join ls rs ["ks"]))))
+       (= (joined-rows (ok (anti-join l r ["k"]))) (joined-rows (ok (anti-join ls rs ["ks"]))))))
+
 (defun (main)
   (def t (sales))
 
@@ -232,6 +270,45 @@
           (null-scan-failures)
           "")
   (expect "the cases of kinds, lengths and starts" (null-scan-cases) 520)
+  ;; Joins by one key of longs: dense keys by an array, sorted unique ones
+  ;; merged, others by hashes; the same rows as the hash join of strings.
+  (expect "a join by longs: dense keys with duplicates and nulls"
+          (integer-joins-agree? (keyed 3000 (fun (i) (if (= (% i 13) 0) None (Some (cast long (% (* i 7) 900))))))
+                                (keyed 2000 (fun (i) (if (= (% i 17) 0) None (Some (cast long (+ 50 (% (* i 3) 1000))))))))
+          #t)
+  (expect "a join by longs: sorted and unique, far apart, merged"
+          (integer-joins-agree? (keyed 3000 (fun (i) (Some (* (cast long (/ i 2)) 1000003L))))
+                                (keyed 2500 (fun (i) (Some (* (cast long (+ (* i 3) 7)) 1000003L)))))
+          #t)
+  (expect "a join by longs: far apart and not sorted, by hashes"
+          (integer-joins-agree? (keyed 3000 (fun (i) (Some (* (cast long (% (* i 7) 1000)) 1000003L))))
+                                (keyed 2500 (fun (i) (Some (* (cast long (% (* i 11) 1200)) 1000003L)))))
+          #t)
+  (expect "a join by longs: sorted, but a right key twice"
+          (integer-joins-agree? (keyed 3000 (fun (i) (Some (* (cast long i) 1000003L))))
+                                (keyed 2500 (fun (i) (Some (* (cast long (/ i 2)) 1000003L)))))
+          #t)
+  (expect "a join by longs: the right keys all null"
+          (integer-joins-agree? (keyed 300 (fun (i) (if (= (% i 3) 0) None (Some (cast long i)))))
+                                (keyed 200 (fun (_) None)))
+          #t)
+  (expect "a join by longs: one to one, the right rows in another order"
+          (integer-joins-agree? (keyed 1000 (fun (i) (Some (cast long (% (* i 7919) 1000)))))
+                                (keyed 1000 (fun (i) (Some (cast long i)))))
+          #t)
+  (expect "a join by longs: the right row of each left row, when the right rows are in another order"
+          (let ((j (ok (inner-join (ok (table-select (keyed 1000 (fun (i) (Some (cast long (% (* i 7919) 1000))))) ["k" "row"]))
+                                   (ok (table-select (keyed 1000 (fun (i) (Some (cast long i)))) ["k" "row"]))
+                                   ["k"]))))
+            (loop (:for k* (: (ok (column-as j "k")) (Cells long)))
+                  (:for y* (: (ok (column-as j "row.y")) (Cells int)))
+                  (:when (not (= (match k* ((Some k) (Some (cast int k))) (None None)) y*)))
+                  (:acc (counting k*))))
+          0)
+  (expect "a join by longs: one to one, in order, more rows than a part"
+          (integer-joins-agree? (keyed 200000 (fun (i) (Some (cast long i))))
+                                (keyed 200000 (fun (i) (Some (cast long i)))))
+          #t)
   (expect "complete-rows: columns of two lengths give the rows of the shorter"
           (loop (:for (Tuple _p r) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2])))])) "n")) (Cells int)))))
                 (:acc (listing r)))
