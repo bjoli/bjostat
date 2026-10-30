@@ -756,6 +756,26 @@ loops before anything else, as they change the Collector trait:
    for 64-bit keys where 8 bits needed 8: a sort by a number 27.1 and 28.0
    to 25.4 and 24.7 ms (narrow), 33.7 and 33.2 to 31.8 and 31.5 (wide), in
    two paired rounds.
+
+   The numbering of the strings of a column (~Categories.StringIds~), which
+   categorize, ~string-groups~, counts, crosstabs, distincts and sorts by a
+   string start with, measured in steps: of a categorize of 20 000 regions
+   (32 ms), 10.5 ms merged the parts' numbers on one thread, 10.3 sorted the
+   levels with a comparison that asked Arrow for the bytes of both strings,
+   and each row was numbered at about 80 ns, through Arrow's ~GetBytes~
+   and ~IsNull~. Now the parts' strings are merged in 64 buckets by their
+   hashes on the workers and then numbered in the order of their first
+   rows; a level is sorted by its first 8 bytes as a number, and by all
+   its bytes only after the same 8; the offsets, bytes and valid bits are
+   read directly; and the codes are written in parts. Smaller parts were
+   tried and left out: 4.64 to 4.35 ms on the narrow file, 15.5 to 23.0 on
+   the wide one, where each part has a large table of its own. Each case
+   alone, old and new in turn, narrow then wide: categorize 8.32 to 3.27
+   and 32.3 to 14.0 ms; ~string-groups~ 8.65 to 7.05 and 28.6 to 17.3; a
+   sort by a string and a number 45.4 to 42.5 and 73.1 to 64.1; a distinct
+   by a string and a long 9.94 to 7.08 and 82.6 to 72.6; a count by them
+   10.8 to 8.58 and 128 to 108; a crosstab 11.7 to 8.68 and 73.0 to 61.6.
+   (The comparison above was measured before this.)
 4. *Loops over cells with nulls.* Measured (bench/null-cost.bjo): the
    cost was not the processor guessing the test of each null wrong. Nulls
    in one run at the start cost as much as random ones, and one in a

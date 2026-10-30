@@ -123,6 +123,12 @@
   (expect "its cells as strings"
           (strings-of by-name "size")
           [(Some "medium") (Some "small") None (Some "large") (Some "small") (Some "medium")])
+  (expect "levels in the order of their bytes: the same first 8 bytes, a string at the start of another, cases, and a letter of two bytes"
+          (ok (category-levels (ok (table-categorize
+                                     (csv "w\nregion-9\nregion-10\nz\nregion-1\nregio\nZ\né\nregion-10x\nregion-10\nregion-100\n")
+                                     "w"))
+                               "w"))
+          ["Z" "regio" "region-1" "region-10" "region-100" "region-10x" "region-9" "z" "é"])
   (def ordered (ok (table-categorize sizes "size" #:levels ["small" "medium" "large"])))
   (expect "levels given" (ok (category-levels ordered "size")) ["small" "medium" "large"])
   (expect "printed as strings"
