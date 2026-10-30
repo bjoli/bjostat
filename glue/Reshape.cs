@@ -491,7 +491,7 @@ public static class Reshape
     // The cells of the columns, one column after the other. A copy of each
     // buffer, rather than one of each cell, as ArrowArrayConcatenator makes.
     // The columns are of the type.
-    private static IArrowArray Concat(List<IArrowArray> pieces, IArrowType type)
+    internal static IArrowArray Concat(List<IArrowArray> pieces, IArrowType type)
     {
         long total = pieces.Sum(p => (long)p.Length);
         if (total > int.MaxValue) throw new TableProblem($"{total} rows are too many for one column.");

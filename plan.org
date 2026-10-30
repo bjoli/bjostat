@@ -728,6 +728,24 @@ loops before anything else, as they change the Collector trait:
    chunks on the workers (186 on one thread), Polars in 71.6 on one thread
    and in 16.9 on 24; the wide one in 178, 215 and 34.8. ~(text csv)~ makes
    a string of each field and an array of each row, on each worker.
+
+   Done: the chunks of a large file are read by glue/CsvFast.cs, a field
+   as a span of the chunk's bytes given to its CsvColumn as it is found,
+   with no string and no array of a row; the types are guessed in C# from
+   the first rows, and all the chunks, the first too, are read on the
+   workers at once. A guessed column of longs with a decimal in a chunk is
+   widened there and then in the others. Where the file is not what it
+   reads, read-csv reads it on one thread as before, which gives the
+   errors and their lines. 68.0 to 36.8 ms (narrow) and 176 to 89.8
+   (wide), the means of two paired rounds; Polars on 24 threads 16.9 and
+   34.8. The tests compare the whole table, as text, with one thread's for
+   a file with CRLF, quotes, NA, dates, timestamps, bools, a given int, a
+   separator ';' and a late decimal, and for one with a blank line.
+
+   Also in this round: the radix passes of a sort are 11 bits, 6 passes
+   for 64-bit keys where 8 bits needed 8: a sort by a number 27.1 and 28.0
+   to 25.4 and 24.7 ms (narrow), 33.7 and 33.2 to 31.8 and 31.5 (wide), in
+   two paired rounds.
 4. *Loops over cells with nulls.* Measured (bench/null-cost.bjo): the
    cost was not the processor guessing the test of each null wrong. Nulls
    in one run at the start cost as much as random ones, and one in a

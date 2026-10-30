@@ -28,12 +28,15 @@
 ;; are held as strings; after them each field goes into its column at once.
 ;;
 ;; A file of 4 MB or more with a header is read in chunks of whole rows on
-;; bjostat's workers: the first chunk as above, so that the types are
-;; guessed from the first rows of the file, and the others with those types;
-;; then the chunks are put one after the other. When a chunk does not fit
-;; the types of the first, as a decimal in a column guessed as long, or the
-;; file has a problem, the file is read again on one thread, which widens
-;; the column or says what the problem is, with its line.
+;; bjostat's workers, without (text csv): each field is a span of the
+;; chunk's bytes, given to its column as it is found (glue/CsvFast.cs). The
+;; types are guessed from the first rows of the file, a guessed column of
+;; longs that meets a decimal in any chunk becomes one of doubles in all of
+;; them, and the chunks are put one after the other. When the file is not
+;; what that reader reads (a blank line, a carriage return or a quote inside
+;; a field that is not quoted, a row of another number of fields) or a field
+;; is not of its column's type, the file is read on one thread as above,
+;; which reads it or says what the problem is, with its line.
 
 (export read-csv csv->table)
 
@@ -44,6 +47,15 @@
 
 (import/class (CsvColumn (: Bjostat.CsvColumn)))
 (import/extern (csv-chunks (: Bjostat.CsvChunks.Split (-> string int long (Array string)))))
+
+;; The chunks of a large file, read with no string made for a field: see
+;; glue/CsvFast.cs. Each answers None where the file is not what it reads,
+;; and read-csv then reads the file on one thread.
+(import/extern
+  (fast-names (: Bjostat.CsvFast.Names (-> string int (Option (Array string)))))
+  (fast-guess (: Bjostat.CsvFast.Guess (-> string int int int (Array string) (Option (Array int)))))
+  (fast-read (: Bjostat.CsvFast.Read (-> (Array string) (Array string) (Array int) (Array bool) int (Array string)
+                                          (Option Table)))))
 
 ;; The kinds of a CsvColumn. Long, Double and String are the order of a
 ;; guess: each holds what the one before it holds.
@@ -115,28 +127,30 @@
        ((Ok r) r)
        ((Err e) (refuse (str path ": " (.-Message e))))))))
 
-;; The table of the chunks of a file, each with the header, or None when a
-;; chunk does not read with the types of the first. A category is made when
-;; the chunks are put together, so that all of them have its levels. The
-;; wait for the chunks parks the thread, as reading the file on one thread
-;; does: (text csv) reads through a port, so read-csv parks either way.
+;; The table of the chunks of a file, each with the header, or None when the
+;; file is not what the fast reader reads (glue/CsvFast.cs) or a chunk does
+;; not read with the types: then read-csv reads it on one thread, which says
+;; what is wrong. The types are guessed from the first rows of the first
+;; chunk, and all the chunks are read on the workers, a field as the bytes
+;; of the chunk. A category is made when the chunks are put together, so
+;; that all of them have its levels. The wait for the chunks parks the
+;; thread, as reading the file on one thread does: (text csv) reads through
+;; a port, so read-csv parks either way.
 (: (-> (Array string) char (Vec (Tuple string ColumnType)) int (Vec string) (Option Table)))
 (defun (read-chunks chunks separator types guess-rows nulls)
+  (def first (array-ref chunks 0))
+  (def sep (char->integer separator))
+  (def null-names (vec->array nulls))
   (def plain (vec-map (fun (p) (match p ((Tuple name Category) (Tuple name String)) (_ p))) types))
-  (match (csv->table (array-ref chunks 0) #:separator separator #:types plain #:guess-rows guess-rows #:nulls nulls)
-    ((Err _) None)
-    ((Ok first)
-     (def schema (table-schema first))
-     (match (sync/blocking (computing-each (- (array-length chunks) 1)
-                                           (fun (k) (csv->table (array-ref chunks (+ k 1)) #:separator separator
-                                                                #:types schema #:nulls nulls))))
-       ((Err _) None)
-       ((Ok rest)
-        (if (some? (find (fun (r) (err? r)) rest))
-            None
-            (match (table-append (vec-add-first {vecing t (:for r rest) (:when-let (Ok t) r)} first))
-              ((Ok t) (match (categorized t types) ((Ok c) (Some c)) ((Err _) None)))
-              ((Err _) None))))))))
+  (def (Some names) (fast-names first sep) :leave-with None)
+  (def (Ok given) (given-kinds names plain) :leave-with None)
+  (def (Some guessed-kinds) (fast-guess first (array-length names) sep guess-rows null-names) :leave-with None)
+  (def kinds {arraying (match (vec-ref given i) ((Some k) k) (None (array-ref guessed-kinds i)))
+                       (:for i (range 0 (array-length names)))})
+  (def guessed {arraying (none? g) (:for g given)})
+  (match (fast-read chunks names kinds guessed sep null-names)
+    ((Some t) (match (categorized t types) ((Ok c) (Some c)) ((Err _) None)))
+    (None None)))
 
 ;; The table of CSV text.
 (: (-> string (#:header? bool) (#:separator char) (#:types (Vec (Tuple string ColumnType)))

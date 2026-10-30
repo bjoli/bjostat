@@ -166,4 +166,44 @@
   (def late (ok (read-csv late-path)))
   (expect "chunks: a decimal after the guess makes the column double" (types-of late) ["n:double" "note:string"])
   (expect "chunks: its value" (cells-ref (: (ok (column-as late "n")) (Cells double)) 190000) 2.5)
+  ;; The whole table of a file in chunks, as text, against one thread's, for
+  ;; each thing the reader of chunks reads (glue/CsvFast.cs) or gives to the
+  ;; one thread: CRLF, quotes, NA, dates, timestamps, bools, a given int, a
+  ;; separator ';', a decimal in a later chunk, and a blank line.
+  (: (-> int string string))
+  (defun (mixed-row i end)
+    (str (int->string i) ";"
+         (if (= (% i 5) 0) "\"x; \"\"y\"\"\r\nz\"" (str "w" (int->string (% i 9)))) ";"
+         (if (= (% i 11) 0) "NA" (double->string (* 0.25 (cast double i)))) ";"
+         (if (= (% i 13) 0) "" (str "2025-0" (int->string (+ 1 (% i 9))) "-1" (int->string (% i 10)))) ";"
+         (str "2024-12-0" (int->string (+ 1 (% i 9))) "T1" (int->string (% i 10)) ":30:00") ";"
+         (if (= (% i 2) 0) "true" "FALSE") ";"
+         (if (= i 150000) "7.5" (int->string (% i 1000))) ";"
+         (int->string (% i 100)) ";" (str "t" (int->string (% i 4))) end))
+  (: (-> Table Table bool))
+  (defun (same-as-one-thread? in-chunks on-one)
+    (and (= (types-of in-chunks) (types-of on-one))
+         (= (table->string in-chunks #:rows (table-row-count on-one))
+            (table->string on-one #:rows (table-row-count on-one)))))
+  (def mixed-text (str "n;s;x;d;t;b;late;small;tail\r\n"
+                       (string-join {vecing (mixed-row i "\r\n") (:for i (range 0 200000))} "")))
+  (def mixed-path (path-combine (temp-dir) "bjostat-test-mixed.csv"))
+  (file-write-text mixed-path mixed-text)
+  (def mixed-types [(Tuple "small" Int)])
+  (def mixed-chunks (ok (read-csv mixed-path #:separator #\; #:nulls ["NA"] #:types mixed-types)))
+  (def mixed-one (ok (csv->table mixed-text #:separator #\; #:nulls ["NA"] #:types mixed-types)))
+  (expect "chunks: the size of the mixed file" (> (string-length mixed-text) 4000000) #t)
+  (expect "chunks: CRLF, quotes, NA, dates, timestamps, bools, a given int, ';', a late decimal: the table of one thread"
+          (same-as-one-thread? mixed-chunks mixed-one)
+          #t)
+  (expect "chunks: the types of the mixed file"
+          (types-of mixed-chunks)
+          ["n:long" "s:string" "x:double" "d:date" "t:datetime" "b:bool" "late:double" "small:int" "tail:string"])
+  (def blank-text (str "n,s\n" (string-join {vecing (str (int->string i) ",some text\n" (if (= i 120000) "\n" ""))
+                                                    (:for i (range 0 300000))} "")))
+  (def blank-path (path-combine (temp-dir) "bjostat-test-blank.csv"))
+  (file-write-text blank-path blank-text)
+  (expect "chunks: a blank line, read on one thread, gives the table of one thread"
+          (same-as-one-thread? (ok (read-csv blank-path)) (ok (csv->table blank-text)))
+          #t)
   0)

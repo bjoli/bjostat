@@ -5,7 +5,8 @@
 
 // Csv: the cells of a CSV file into Arrow columns, for (bjostat csv).
 //
-// (text csv) gives each field as a Bjolang string, which is UTF-8. A number
+// (text csv) gives each field as a Bjolang string, which is UTF-8, or
+// CsvFast gives it as a span of a chunk's bytes (AddSpan). A number
 // is parsed from those bytes and a string is kept as those bytes, so no
 // cell becomes a UTF-16 string. A field that does not parse answers false,
 // not an exception, because a guess tries several types for each field.
@@ -99,9 +100,11 @@ public sealed class CsvColumn
     public int Kind => _kind;
 
     /// <summary>Appends the field. False when it is not a value of the column's type.</summary>
-    public bool Add(Utf8String field)
+    public bool Add(Utf8String field) => AddSpan(field.AsSpan());
+
+    /// <summary>Appends the field's bytes. False when they are not a value of the column's type.</summary>
+    public bool AddSpan(ReadOnlySpan<byte> s)
     {
-        var s = field.AsSpan();
         if (s.IsEmpty)
         {
             AddNull();
@@ -338,9 +341,11 @@ public sealed class CsvColumn
     }
 
     /// <summary>The narrowest kind that holds the field, or Empty.</summary>
-    public static int Guess(Utf8String field)
+    public static int Guess(Utf8String field) => GuessSpan(field.AsSpan());
+
+    /// <summary>The narrowest kind that holds the field's bytes, or Empty.</summary>
+    public static int GuessSpan(ReadOnlySpan<byte> s)
     {
-        var s = field.AsSpan();
         if (s.IsEmpty) return Empty;
         if (TryLong(s, out _)) return Long;
         if (TryDouble(s, out _)) return Double;
