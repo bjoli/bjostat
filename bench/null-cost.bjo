@@ -38,14 +38,24 @@
 (: (-> int int bool))
 (defun (one-in n i) (= (% (cast int (% (* (cast long i) 2654435761L) 4294967296L)) n) 0))
 
+;; Half the rows, at random. Not (one-in 2 i): the multiplier is odd, so
+;; that is every second row, and (one-in 2 (+ i 7)) is the other rows.
+(: (-> int bool))
+(defun (half-at i) (= (% (/ (% (* (cast long i) 2654435761L) 4294967296L) 4096L) 2L) 0L))
+
 (: (Cells double)) (def none (column (fun (_) #f)))
 (: (Cells double)) (def random (column (fun (i) (one-in 20 i))))
 (: (Cells double)) (def run (column (fun (i) (< i (/ rows 20)))))
 (: (Cells double)) (def few (column (fun (i) (one-in 1000 i))))
+(: (Cells double)) (def half (column half-at))
 ;; A second column for the correlation, with nulls at other rows.
 (: (Cells double)) (def none2 (column (fun (_) #f)))
 (: (Cells double)) (def random2 (column (fun (i) (one-in 20 (+ i 7)))))
 (: (Cells double)) (def run2 (column (fun (i) (< i (/ rows 20)))))
+(: (Cells double)) (def few2 (column (fun (i) (one-in 1000 (+ i 7)))))
+;; Other rows: 27% of the rows are complete, near the 25% of two columns
+;; that do not depend on each other.
+(: (Cells double)) (def half2 (column (fun (i) (half-at (+ (* i 3) 1)))))
 
 (: (-> (Cells double) double))
 (defun (sum c) (loop (:for x* c) (:when-let (Some x) x*) (:acc (summing x))))
@@ -65,6 +75,8 @@
 
 (: (-> (Cells double) double))
 (defun (sum-skip c) (loop (:for x (skip-nulls c)) (:acc (summing x))))
+(: (-> (Cells double) (Option double)))
+(defun (sd-skip c) (loop (:for x (skip-nulls c)) (:acc (standard-deviation x))))
 (: (-> (Cells double) (Cells double) (Option double)))
 (defun (cor-complete a b)
   (loop (:for (Tuple x y) (complete-rows (Tuple a b))) (:acc (correlation (Tuple x y)))))
@@ -88,5 +100,17 @@
 (def/bench "sum of products, no nulls" (sum-products none none2))
 (def/bench "sum of products, 5% random" (sum-products random random2))
 (def/bench "cor, complete-rows, 5% random" (cor-complete random random2))
+
+;; skip-nulls and complete-rows for each kind of nulls: they find the next
+;; row with a value.
+(def/bench "skip-nulls sd, no nulls" (sd-skip none))
+(def/bench "skip-nulls sd, 0.1% random" (sd-skip few))
+(def/bench "skip-nulls sd, 5% random" (sd-skip random))
+(def/bench "skip-nulls sd, 5% in a run" (sd-skip run))
+(def/bench "skip-nulls sd, 50% random" (sd-skip half))
+(def/bench "complete-rows cor, no nulls" (cor-complete none none2))
+(def/bench "complete-rows cor, 0.1% random" (cor-complete few few2))
+(def/bench "complete-rows cor, 5% in a run" (cor-complete run run2))
+(def/bench "complete-rows cor, 50% random" (cor-complete half half2))
 
 (run-benches)

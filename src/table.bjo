@@ -107,6 +107,13 @@
   (clr-cells-contiguous? (: Bjostat.CellsOps.IsContiguous (-> (ClrCells %a) bool)))
   (clr-cells-values (: Bjostat.CellsOps.Values (-> (ClrCells %a) (RoSpan %a))))
   (clr-cells-valid (: Bjostat.CellsOps.Valid (-> (ClrCells %a) (RoSpan byte))))
+  ;; The next row with a value, of one column or of all of 2, 3 or 4, found
+  ;; 57 rows at a time in the valid bitmaps.
+  (clr-cells-next-valid (: Bjostat.CellsOps.NextValid (-> (ClrCells %a) int int)))
+  (clr-next-complete-2 (: Bjostat.CellsOps.NextComplete (-> (ClrCells %a) (ClrCells %b) int int int)))
+  (clr-next-complete-3 (: Bjostat.CellsOps.NextComplete (-> (ClrCells %a) (ClrCells %b) (ClrCells %c) int int int)))
+  (clr-next-complete-4 (: Bjostat.CellsOps.NextComplete
+                          (-> (ClrCells %a) (ClrCells %b) (ClrCells %c) (ClrCells %d) int int int)))
   (clr-day-cells (: Bjostat.TimeCells.Days (-> AnyColumn (Option (ClrCells int)))))
   (clr-micro-cells (: Bjostat.TimeCells.Micros (-> AnyColumn bool (Option (ClrCells long)))))
 
@@ -422,12 +429,7 @@
 
 ;; The first row from `i` on that is not null, or the length.
 (: (-> (Cells %a) int int))
-(defun (next-valid c i)
-  (cond
-    ((= (cells-null-count c) 0) i)
-    ((>= i (cells-length c)) i)
-    ((cells-valid? c i) i)
-    (else (next-valid c (+ i 1)))))
+(defun (next-valid c i) (clr-cells-next-valid (record-ref c clr) i))
 
 (impl (Iterable (NotNull %a))
   (type %elem %a)
@@ -447,9 +449,11 @@
 ;;           (:acc (correlation (Tuple (cast double f) (cast double m)))))
 ;;
 ;; It takes a Tuple of 2, 3 or 4 columns of cells. Columns of different
-;; lengths give the rows of the shortest. With nulls it is as fast as the
-;; same loop with :when-let; without them it is slower, as :when-let then
-;; reads the cells as spans (bench/nulls.bjo).
+;; lengths give the rows of the shortest. The next complete row is found in
+;; the valid bitmaps, 57 rows at a time (CellsOps.NextComplete), so many
+;; nulls cost little. Each row it gives costs more than in the same loop with
+;; :when-let, which reads the cells as spans (bench/nulls.bjo,
+;; bench/null-cost.bjo).
 (type (: (CompleteRows %t) #:opaque (Record (: columns %t) (: length int) (: nulls? bool))))
 
 ;; The columns of a CompleteRows: a Tuple of Cells.
@@ -462,7 +466,10 @@
   ;; Whether no column is null at the row.
   (: row-complete? (-> %t int bool))
   ;; The values of the row, which is complete.
-  (: row-values (-> %t int %row)))
+  (: row-values (-> %t int %row))
+  ;; The first complete row from `i` on, or `length`, the length of the
+  ;; shortest column.
+  (: row-next-complete (-> %t int int int)))
 
 (impl (RowColumns (Tuple (Cells %a) (Cells %b)))
   (type %row (Tuple %a %b))
@@ -477,7 +484,10 @@
     (and (cells-valid? a i) (cells-valid? b i)))
   (defun (row-values t i)
     (def (a b) t)
-    (Tuple (cells-ref a i) (cells-ref b i))))
+    (Tuple (cells-ref a i) (cells-ref b i)))
+  (defun (row-next-complete t length i)
+    (def (a b) t)
+    (clr-next-complete-2 (record-ref a clr) (record-ref b clr) length i)))
 
 (impl (RowColumns (Tuple (Cells %a) (Cells %b) (Cells %c)))
   (type %row (Tuple %a %b %c))
@@ -492,7 +502,10 @@
     (and (cells-valid? a i) (cells-valid? b i) (cells-valid? c i)))
   (defun (row-values t i)
     (def (a b c) t)
-    (Tuple (cells-ref a i) (cells-ref b i) (cells-ref c i))))
+    (Tuple (cells-ref a i) (cells-ref b i) (cells-ref c i)))
+  (defun (row-next-complete t length i)
+    (def (a b c) t)
+    (clr-next-complete-3 (record-ref a clr) (record-ref b clr) (record-ref c clr) length i)))
 
 (impl (RowColumns (Tuple (Cells %a) (Cells %b) (Cells %c) (Cells %d)))
   (type %row (Tuple %a %b %c %d))
@@ -508,7 +521,10 @@
     (and (cells-valid? a i) (cells-valid? b i) (cells-valid? c i) (cells-valid? d i)))
   (defun (row-values t i)
     (def (a b c d) t)
-    (Tuple (cells-ref a i) (cells-ref b i) (cells-ref c i) (cells-ref d i))))
+    (Tuple (cells-ref a i) (cells-ref b i) (cells-ref c i) (cells-ref d i)))
+  (defun (row-next-complete t length i)
+    (def (a b c d) t)
+    (clr-next-complete-4 (record-ref a clr) (record-ref b clr) (record-ref c clr) (record-ref d clr) length i)))
 
 (: (-> %t (CompleteRows %t)) (where (RowColumns %t)))
 (defun (complete-rows columns)
@@ -517,11 +533,9 @@
 ;; The first complete row from `i` on, or the length. Without nulls, `i`.
 (: (-> (CompleteRows %t) int int) (where (RowColumns %t)))
 (defun (next-complete r i)
-  (cond
-    ((not (record-ref r nulls?)) i)
-    ((>= i (record-ref r length)) i)
-    ((row-complete? (record-ref r columns) i) i)
-    (else (next-complete r (+ i 1)))))
+  (if (record-ref r nulls?)
+      (row-next-complete (record-ref r columns) (record-ref r length) i)
+      i))
 
 (impl (Iterable (CompleteRows %t))
   (where (RowColumns %t))

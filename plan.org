@@ -711,11 +711,19 @@ loops before anything else, as they change the Collector trait:
      names it. Now ~moments-add~ and ~co-moments-add~ are ~#:inline~, and
      with ~DOTNET_TieredPGO=0~ the correlation takes 3.75 ms instead of
      10.4; with the profile, as before.
-   What would end the rest of the cost of nulls is in the loop, and is
-   for a decision: the valid bits of all the loop's columns taken 64 at a
-   time, as one word, and a word whose rows are all valid run with no test
-   of a row, as Polars's kernels do. ~skip-nulls~ and ~complete-rows~
-   cost more than ~:when-let~ still. And the statistics without nulls are 5 times Polars's
+   The loop is not to change. So ~skip-nulls~ and ~complete-rows~ find
+   the next row with a value in C# (~Cells.NextValid~,
+   ~CellsOps.NextComplete~): the valid bits of 57 rows of each column from
+   one read of 8 bytes, the AND of the columns, and the first bit, with no
+   test of each row. Measured alone, 1 000 000 rows: the correlation over
+   ~complete-rows~ with half the rows null at random in each column 2.14
+   ms → 1.48, with 5% at random 5.00 → 4.89; in the run of all cases 5.51 →
+   4.86, as the old code also lost to the profile of the cases before it.
+   ~skip-nulls~ did not change (within 2%): the nulls were never its cost.
+   Both still cost about 1.9 ms more than ~:when-let~, with nulls or
+   without: that is the walk through the iterator and ~cells-ref~ for each
+   row, not the valid bits. The tests compare both with ~:when-let~ for 10
+   kinds of nulls, 8 lengths and 9 starts of a slice. And the statistics without nulls are 5 times Polars's
    (a standard deviation 2.49 ms against 0.49), as their sums are not
    vector sums; that is item 6 of what the comparison taught, a decision.
 5. *Statistics:* a t-digest for quantiles in one pass with little memory.

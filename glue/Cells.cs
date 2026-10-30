@@ -18,6 +18,7 @@
 // holds.
 
 using System.Buffers;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
@@ -67,6 +68,10 @@ public sealed unsafe class Cells<T>
     private readonly byte[]? _validBytes;
     private readonly int _validStart;
     private readonly byte* _validPointer;
+    // How many bytes of the bitmap there are from _validBytes[0] or
+    // _validPointer: a read of 8 bytes that ends after them is made a byte
+    // at a time.
+    private readonly int _validEnd;
 
     internal Cells(IArrowArray array)
     {
@@ -81,12 +86,14 @@ public sealed unsafe class Cells<T>
             {
                 _validBytes = bitSegment.Array;
                 _validStart = bitSegment.Offset * 8 + _offset;
+                _validEnd = bitSegment.Offset + bitSegment.Count;
             }
             else if (MemoryMarshal.TryGetMemoryManager(bits, out MemoryManager<byte>? bitManager)
                      && bitManager.GetType().FullName == "Apache.Arrow.Memory.NativeMemoryManager")
             {
                 _validPointer = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(bits.Span));
                 _validStart = _offset;
+                _validEnd = bits.Length;
             }
         }
         if (array is StringArray strings)
@@ -195,6 +202,81 @@ public sealed unsafe class Cells<T>
     }
 
     /// <summary>
+    /// The valid bits of the cells from <paramref name="i"/> on, as many as
+    /// <paramref name="count"/> gives back: bit 0 is cell i. All ones without
+    /// nulls. Cell i is in the cells.
+    /// </summary>
+    /// <remarks>
+    /// One read of 8 bytes, shifted by the bit of cell i in its byte, gives
+    /// at least 57 bits. The bits after the last cell are cleared, as Arrow
+    /// does not say what they hold.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public ulong ValidWindow(int i, out int count)
+    {
+        int left = Length - i;
+        count = left < 57 ? left : 57;
+        ulong mask = left < 57 ? (1UL << left) - 1 : (1UL << 57) - 1;
+        if (NullCount == 0) return mask;
+        int bit = _validStart + i;
+        int at = bit >> 3;
+        ulong w;
+        if (at + 8 <= _validEnd && (_validBytes != null || _validPointer != null))
+            w = _validBytes != null
+                ? Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_validBytes), at))
+                : Unsafe.ReadUnaligned<ulong>(_validPointer + at);
+        else
+            w = WindowSlowly(i);
+        return (w >> (bit & 7)) & mask;
+    }
+
+    /// <summary>
+    /// The 8 bytes from the byte of cell i, read a byte at a time: at the end
+    /// of the bitmap, or through Arrow when the bitmap is in other memory.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private ulong WindowSlowly(int i)
+    {
+        int bit = _validStart + i;
+        ulong w = 0;
+        if (_validBytes != null || _validPointer != null)
+        {
+            int at = bit >> 3;
+            for (int k = 0; k < 8 && at + k < _validEnd; k++)
+                w |= (ulong)(_validBytes != null ? _validBytes[at + k] : _validPointer[at + k]) << (8 * k);
+            return w;
+        }
+        // Through Arrow: the bits are placed as the shift in ValidWindow
+        // expects them.
+        int shift = bit & 7;
+        for (int k = 0; k < 57 && i + k < Length; k++)
+            if (_array.IsValid(i + k)) w |= 1UL << (k + shift);
+        return w;
+    }
+
+    /// <summary>The first cell from <paramref name="i"/> on that is not null, or the length.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int NextValid(int i)
+    {
+        if (NullCount == 0 || i >= Length) return i < Length ? i : Length;
+        ulong w = ValidWindow(i, out int count);
+        return w != 0 ? i + BitOperations.TrailingZeroCount(w) : NextValidAfter(i + count);
+    }
+
+    /// <summary>NextValid from <paramref name="i"/>, after a window with no valid cell.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private int NextValidAfter(int i)
+    {
+        while (i < Length)
+        {
+            ulong w = ValidWindow(i, out int count);
+            if (w != 0) return i + BitOperations.TrailingZeroCount(w);
+            i += count;
+        }
+        return Length;
+    }
+
+    /// <summary>
     /// Whether <see cref="Values"/> and <see cref="Valid"/> give all the
     /// cells: the values are numbers in one buffer, and the valid bitmap,
     /// when there is one, starts at a whole byte.
@@ -263,6 +345,57 @@ public static class CellsOps
     public static bool IsValid<T>(Cells<T> c, int i) => c.IsValid(i);
 
     public static int Length<T>(Cells<T> c) => c.Length;
+
+    /// <summary>The first cell from <paramref name="i"/> on that is not null, or the length.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int NextValid<T>(Cells<T> c, int i) => c.NextValid(i);
+
+    // The first row from i on where no column is null, or `length`, the
+    // length of the shortest column: the valid bits of 57 rows of each
+    // column, and of them, and the first bit. A row of the shortest column
+    // has a row in each.
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int NextComplete<A, B>(Cells<A> a, Cells<B> b, int length, int i)
+    {
+        while (i < length)
+        {
+            ulong w = a.ValidWindow(i, out int n) & b.ValidWindow(i, out _) & Rows(length - i);
+            if (w != 0) return i + BitOperations.TrailingZeroCount(w);
+            i += n < length - i ? n : length - i;
+        }
+        return length;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int NextComplete<A, B, C>(Cells<A> a, Cells<B> b, Cells<C> c, int length, int i)
+    {
+        while (i < length)
+        {
+            ulong w = a.ValidWindow(i, out int n) & b.ValidWindow(i, out _) & c.ValidWindow(i, out _)
+                      & Rows(length - i);
+            if (w != 0) return i + BitOperations.TrailingZeroCount(w);
+            i += n < length - i ? n : length - i;
+        }
+        return length;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int NextComplete<A, B, C, D>(Cells<A> a, Cells<B> b, Cells<C> c, Cells<D> d, int length, int i)
+    {
+        while (i < length)
+        {
+            ulong w = a.ValidWindow(i, out int n) & b.ValidWindow(i, out _) & c.ValidWindow(i, out _)
+                      & d.ValidWindow(i, out _) & Rows(length - i);
+            if (w != 0) return i + BitOperations.TrailingZeroCount(w);
+            i += n < length - i ? n : length - i;
+        }
+        return length;
+    }
+
+    /// <summary>A mask of the first <paramref name="left"/> bits, at most 57.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong Rows(int left) => left < 57 ? (1UL << left) - 1 : (1UL << 57) - 1;
 
     public static int NullCount<T>(Cells<T> c) => c.NullCount;
 

@@ -66,6 +66,83 @@
   (def c (ok (longs t name)))
   {vecing (column-ref c i) (:for i (range 0 (column-length c)))})
 
+;; A table of one column "x" of n longs, the number of each row, with a
+;; null where `null?` says; and its cells from row `from` on, through a
+;; slice, so that the valid bitmap starts inside a byte.
+(: (-> int (-> int bool) int (Cells long)))
+(defun (sliced-cells n null? from)
+  (def t (ok (make-table [(named "x" (array->column {arraying (cast long i) (:for i (range 0 n))}
+                                                    #:valid {arraying (not (null? i)) (:for i (range 0 n))}))])))
+  (ok (column-as (table-slice t #:from from) "x")))
+
+;; The values of the cells that are not null, as the loop with :when-let
+;; gives them: what skip-nulls must give.
+(: (-> (Cells long) (List long)))
+(defun (values-by-hand c)
+  (loop (:for x* c) (:when-let (Some x) x*) (:acc (listing x))))
+
+;; The kinds of nulls, each with its name: the bitmap is read 57 rows at a
+;; time, so these cross the windows in each way.
+(: (Vec (Tuple string (-> int bool))))
+(def null-kinds
+  [(Tuple "none" (fun (_) #f))
+   (Tuple "all" (fun (_) #t))
+   (Tuple "every second" (fun (i) (= (% i 2) 0)))
+   (Tuple "every third" (fun (i) (= (% i 3) 1)))
+   (Tuple "runs of 100" (fun (i) (< (% i 101) 100)))
+   (Tuple "runs of 57" (fun (i) (< (% i 58) 57)))
+   (Tuple "only the last" (fun (i) (not (= i 1199))))
+   (Tuple "only the first" (fun (i) (not (= i 0))))
+   (Tuple "random 5%" (fun (i) (= (% (* (cast long i) 2654435761L) 20L) 3L)))
+   (Tuple "random 50%" (fun (i) (= (% (/ (* (cast long i) 2654435761L) 7L) 2L) 0L)))])
+
+;; Whether skip-nulls and complete-rows of 2, 3 and 4 columns, and of two
+;; columns of two lengths, give what the loop with :when-let gives, for one
+;; kind of nulls, length and start of the slice.
+(: (-> (-> int bool) int int bool))
+(defun (scans-agree? null? n from)
+  (def c (sliced-cells n null? from))
+  (def d (sliced-cells n (fun (i) (null? (+ i 5))) from))
+  (def e (sliced-cells n (fun (i) (= (% i 7) 2)) from))
+  (def short (sliced-cells (max (+ from 1) (- n 3)) null? from))
+  (def pairs-by-hand
+    (loop (:for x* c) (:for y* d) (:when-let (Some x) x*) (:when-let (Some y) y*) (:acc (listing (Tuple x y)))))
+  (def triples-by-hand
+    (loop (:for x* c) (:for y* d) (:for z* e) (:when-let (Some x) x*) (:when-let (Some y) y*) (:when-let (Some _z) z*)
+          (:acc (listing x))))
+  (def short-by-hand
+    (loop (:for x* c) (:for y* short) (:when-let (Some x) x*) (:when-let (Some _y) y*) (:acc (listing x))))
+  (and (= (loop (:for x (skip-nulls c)) (:acc (listing x))) (values-by-hand c))
+       (= (count (skip-nulls c)) (list-length (values-by-hand c)))
+       (= (loop (:for p (complete-rows (Tuple c d))) (:acc (listing p))) pairs-by-hand)
+       (= (loop (:for (Tuple x _ _) (complete-rows (Tuple c d e))) (:acc (listing x))) triples-by-hand)
+       (= (loop (:for (Tuple x _ _ _) (complete-rows (Tuple c d e c))) (:acc (listing x))) triples-by-hand)
+       (= (loop (:for (Tuple x _) (complete-rows (Tuple c short))) (:acc (listing x))) short-by-hand)))
+
+;; The cases where they do not agree, or "": each kind of nulls with each
+;; length and each start, numbered as one index, since the :for clauses of a
+;; loop walk side by side.
+(: (-> string))
+(defun (null-scan-failures)
+  (def sizes [1 56 57 58 64 65 130 1200])
+  (def froms [0 1 3 7 8 13 63 64 65])
+  (def per-kind (* (vec-length sizes) (vec-length froms)))
+  (string-join
+   (loop (:for k (range 0 (* (vec-length null-kinds) per-kind)))
+         (:let (Tuple kind null?) (vec-ref null-kinds (/ k per-kind)))
+         (:let n (vec-ref sizes (/ (% k per-kind) (vec-length froms))))
+         (:let from (vec-ref froms (% k (vec-length froms))))
+         (:when (and (< from n) (not (scans-agree? null? n from))))
+         (:acc (vecing (str kind ", " (number->string n) " rows from " (number->string from)))))
+   "; "))
+
+;; How many cases null-scan-failures checks.
+(: (-> int))
+(defun (null-scan-cases)
+  (loop (:for k (range 0 (* 10 72)))
+        (:when (< (vec-ref [0 1 3 7 8 13 63 64 65] (% k 9)) (vec-ref [1 56 57 58 64 65 130 1200] (/ (% k 72) 9))))
+        (:acc (counting k))))
+
 (defun (main)
   (def t (sales))
 
@@ -151,6 +228,10 @@
           (loop (:for (Tuple p _r) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2 3 4]) #:valid (vec->array [#f #f #f #f])))])) "n")) (Cells int)))))
                 (:acc (counting p)))
           0)
+  (expect "skip-nulls and complete-rows give the rows of the loop with :when-let, for each kind of nulls, length and start of a slice"
+          (null-scan-failures)
+          "")
+  (expect "the cases of kinds, lengths and starts" (null-scan-cases) 520)
   (expect "complete-rows: columns of two lengths give the rows of the shorter"
           (loop (:for (Tuple _p r) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2])))])) "n")) (Cells int)))))
                 (:acc (listing r)))
