@@ -773,6 +773,13 @@ Fixed in Bjolang, and the generic code is now in Bjolang, not in the glue:
 - A ~match~ on a ~Tuple~ of two Options cost 2.4 ms a million rows more
   than two nested matches. Now it costs 2% more, and a ~:let~ of a
   ~Tuple~ costs nothing (measured in paired rounds).
+- A module-level ~def~ whose initialiser waited for fibers or workers that
+  use the module hung: the initialiser runs in the module's .NET static
+  constructor, and .NET stops each other thread that uses the module until
+  the constructor ends. Found with bench/parallel.bjo. Now the compiler
+  refuses such a ~def~, also ~(def r (computed (computing-each n (fun (k)
+  ...))))~ where the lambda uses the module. It does not find a function
+  that goes to the workers through a value, such as a box.
 
 Still open, checked again on the vectorise branch:
 - A column type that nothing decides is left as ~object~:
@@ -790,11 +797,6 @@ Still open, checked again on the vectorise branch:
   ~Run~ that are not generic are candidates. A method that is not generic
   and returns a plain ~Task~ works, so glue/Workers.cs gives a ~Task~ of
   the end of a part, and the part keeps its value itself.
-- A module-level ~def~ that starts fibers which read the module's other
-  values hangs: the fibers wait for the module to be set up (its static
-  constructor in .NET), and the module waits for the fibers. Found with
-  bench/parallel.bjo; the same code from ~main~ or a benchmark body works.
-  It should be an error, or the fibers should not wait.
 - ~array->column~ is generic over any ~%a~, so an array of strings
   compiles and is then an exception of Arrow at run time: Bjolang's string
   is a struct, which meets ~where T : struct~, but holds a reference, which
