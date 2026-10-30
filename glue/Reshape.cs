@@ -357,34 +357,46 @@ public static class Reshape
         if (total > int.MaxValue) throw new TableProblem($"{n} rows of {k} columns are too many rows.");
         int m = (int)total;
         // Row i, column j of the result is at i * k + j: the kept cells of
-        // row i, and the cell of column j, which is at j * n + i of the
-        // columns put one after the other.
-        var keptRows = new int[m];
-        var valueRows = new int[m];
-        for (int i = 0, at = 0; i < n; i++)
-            for (int j = 0; j < k; j++, at++)
-            {
-                keptRows[at] = i;
-                valueRows[at] = j * n + i;
-            }
+        // row i, and the cell of column j. A column of numbers is copied to
+        // those rows directly (Interleaved); another is taken through the
+        // rows, which are made only then.
+        int[]? keptRowsMade = null;
+        int[] KeptRows()
+        {
+            if (keptRowsMade != null) return keptRowsMade;
+            var rows = new int[m];
+            for (int i = 0, at = 0; i < n; i++)
+                for (int j = 0; j < k; j++) rows[at++] = i;
+            return keptRowsMade = rows;
+        }
 
         var fields = new List<Field>();
         var columns = new List<IArrowArray>();
-        var keptTable = Query.Take(Select(t, kept), keptRows, m);
-        for (int i = 0; i < kept.Length; i++)
+        foreach (int c in kept)
         {
-            fields.Add(keptTable.Schema.GetFieldByIndex(i));
-            columns.Add(keptTable.Column(i));
+            var a = t.Column(c);
+            fields.Add(t.Schema.GetFieldByIndex(c));
+            columns.Add(Interleavable(a.Data.DataType)
+                ? Interleaved(Enumerable.Repeat(a, k).ToArray(), n)
+                : Query.Take(Select(t, new[] { c }), KeptRows(), m).Column(0));
         }
 
         fields.Add(new Field(namesTo, StringType.Default, true));
         columns.Add(Repeated(names, n));
 
-        var values = k == 1 ? t.Column(cols[0]) : Concat(cols.Select(t.Column).ToList(), type);
-        var valueTable = new RecordBatch(new Schema.Builder().Field(new Field(valuesTo, type, true)).Build(),
-                                         new[] { values }, values.Length);
         fields.Add(new Field(valuesTo, type, true));
-        columns.Add(Query.Take(valueTable, valueRows, m).Column(0));
+        if (Interleavable(type))
+            columns.Add(Interleaved(cols.Select(t.Column).ToArray(), n));
+        else
+        {
+            var valueRows = new int[m];
+            for (int i = 0, at = 0; i < n; i++)
+                for (int j = 0; j < k; j++) valueRows[at++] = j * n + i;
+            var values = k == 1 ? t.Column(cols[0]) : Concat(cols.Select(t.Column).ToList(), type);
+            var valueTable = new RecordBatch(new Schema.Builder().Field(new Field(valuesTo, type, true)).Build(),
+                                             new[] { values }, values.Length);
+            columns.Add(Query.Take(valueTable, valueRows, m).Column(0));
+        }
 
         var schema = new Schema.Builder();
         foreach (var f in fields) schema.Field(f);
@@ -566,26 +578,105 @@ public static class Reshape
     }
 
     // A column of the names, all of them for each of `times` rows.
+    // The names, one after the other, `times` times, as a column of strings.
+    // The bytes are the names once, copied in blocks that double; the offset
+    // of name j of time i is i times the bytes of all the names and the
+    // offset of name j in them, made in parts on the workers.
     private static IArrowArray Repeated(string[] names, int times)
     {
         var encoded = names.Select(System.Text.Encoding.UTF8.GetBytes).ToArray();
-        long size = (long)encoded.Sum(e => e.Length) * times;
+        int period = encoded.Sum(e => e.Length), k = names.Length;
+        long size = (long)period * times;
         if (size > int.MaxValue) throw new TableProblem($"{size} bytes of names are too many for one column.");
-        int n = names.Length * times;
-        var offsetBytes = GC.AllocateUninitializedArray<byte>((n + 1) * sizeof(int));
-        var offsets = MemoryMarshal.Cast<byte, int>(offsetBytes.AsSpan());
+        int n = k * times;
         var bytes = GC.AllocateUninitializedArray<byte>((int)size);
-        int at = 0, end = 0;
-        for (int i = 0; i < times; i++)
-            foreach (var e in encoded)
+        var within = new int[k];
+        for (int j = 0, end = 0; j < k; j++)
+        {
+            within[j] = end;
+            if (times > 0) encoded[j].CopyTo(bytes, end);
+            end += encoded[j].Length;
+        }
+        for (long done = period; done < size; done *= 2)
+        {
+            int length = (int)Math.Min(done, size - done);
+            System.Array.Copy(bytes, 0, bytes, done, length);
+        }
+        var offsetBytes = GC.AllocateUninitializedArray<byte>((n + 1) * sizeof(int));
+        int parts = Math.Max(1, times / InterleavePart);
+        Workers.For(parts, p =>
+        {
+            var offsets = MemoryMarshal.Cast<byte, int>(offsetBytes.AsSpan());
+            int from = (int)((long)times * p / parts), to = (int)((long)times * (p + 1) / parts);
+            for (int i = from; i < to; i++)
             {
-                offsets[at++] = end;
-                e.CopyTo(bytes, end);
-                end += e.Length;
+                int start = i * period, at = i * k;
+                for (int j = 0; j < k; j++) offsets[at + j] = start + within[j];
             }
-        offsets[n] = end;
+        });
+        MemoryMarshal.Cast<byte, int>(offsetBytes.AsSpan())[n] = (int)size;
         return new StringArray(n, new ArrowBuffer(offsetBytes),
                                new ArrowBuffer(bytes), ArrowBuffer.Empty, 0);
+    }
+
+    // The rows of a part of an interleaved copy: a multiple of 8, so that
+    // each part writes whole bytes of the valid bitmap.
+    private const int InterleavePart = 1 << 16;
+
+    // Whether a column of the type is copied by Interleaved: numbers, dates
+    // and timestamps, a value in a fixed number of whole bytes.
+    private static bool Interleavable(IArrowType t) =>
+        t is FixedWidthType fw && t is not BooleanType && t is not DictionaryType && fw.BitWidth % 8 == 0
+        && fw.BitWidth is 8 or 16 or 32 or 64;
+
+    /// <summary>
+    /// The columns of n rows each, as one column of n times their count rows:
+    /// row i of column j at i * k + j, its null too. In parts of rows on the
+    /// workers. The columns are of one type that <see cref="Interleavable"/>
+    /// takes.
+    /// </summary>
+    private static IArrowArray Interleaved(IArrowArray[] cols, int n)
+    {
+        var type = cols[0].Data.DataType;
+        int k = cols.Length, m = n * k;
+        int width = ((FixedWidthType)type).BitWidth / 8;
+        var values = GC.AllocateUninitializedArray<byte>(m * width);
+        int nulls = cols.Sum(c => c.NullCount);
+        var valid = nulls == 0 ? null : new byte[(m + 7) / 8];
+        int parts = Math.Max(1, (n + InterleavePart - 1) / InterleavePart);
+        Workers.For(parts, p =>
+        {
+            int from = p * InterleavePart, to = Math.Min(n, from + InterleavePart);
+            for (int j = 0; j < k; j++)
+            {
+                var data = cols[j].Data;
+                var source = data.Buffers[1].Span.Slice(data.Offset * width);
+                switch (width)
+                {
+                    case 8: Strided(MemoryMarshal.Cast<byte, long>(source), MemoryMarshal.Cast<byte, long>(values.AsSpan()), from, to, k, j); break;
+                    case 4: Strided(MemoryMarshal.Cast<byte, int>(source), MemoryMarshal.Cast<byte, int>(values.AsSpan()), from, to, k, j); break;
+                    case 2: Strided(MemoryMarshal.Cast<byte, short>(source), MemoryMarshal.Cast<byte, short>(values.AsSpan()), from, to, k, j); break;
+                    default: Strided(source, values.AsSpan(), from, to, k, j); break;
+                }
+                if (valid != null)
+                {
+                    var c = cols[j];
+                    for (int i = from; i < to; i++)
+                        if (c.IsValid(i))
+                        {
+                            int bit = i * k + j;
+                            valid[bit >> 3] |= (byte)(1 << (bit & 7));
+                        }
+                }
+            }
+        });
+        var buffers = new[] { valid == null ? ArrowBuffer.Empty : new ArrowBuffer(valid), new ArrowBuffer(values) };
+        return ArrowArrayFactory.BuildArray(new ArrayData(type, m, nulls, 0, buffers));
+    }
+
+    private static void Strided<T>(ReadOnlySpan<T> source, Span<T> into, int from, int to, int k, int j)
+    {
+        for (int i = from; i < to; i++) into[i * k + j] = source[i];
     }
 
     // The table of the columns at the indices, without a copy.

@@ -36,6 +36,42 @@
 (: (-> (Vec string) string))
 (defun (lines ls) (string-join ls "\n"))
 
+;; A table of n rows: "id" longs, a null in every 7th row; "label"
+;; strings; and "a", "b", "c" doubles, each with nulls at other rows.
+(: (-> int Table))
+(defun (pivot-input n)
+  (ok (make-table
+        [(named "id" (array->column {arraying (cast long i) (:for i (range 0 n))}
+                                    #:valid {arraying (not (= (% i 7) 0)) (:for i (range 0 n))}))
+         (named-strings "label" (array->string-column {arraying (str "r" (number->string (% i 13))) (:for i (range 0 n))}))
+         (named "a" (array->column {arraying (* 1.5 (cast double i)) (:for i (range 0 n))}
+                                   #:valid {arraying (not (= (% i 5) 1)) (:for i (range 0 n))}))
+         (named "b" (array->column {arraying (- 0.0 (cast double i)) (:for i (range 0 n))}
+                                   #:valid {arraying (not (= (% i 3) 2)) (:for i (range 0 n))}))
+         (named "c" (array->column {arraying (+ 0.25 (cast double i)) (:for i (range 0 n))}))])))
+
+;; The rows of `wide` where the pivot of its "a", "b" and "c" does not give
+;; row i * 3 + j the kept cells of row i, the name of column j and its cell.
+(: (-> Table Table int))
+(defun (pivot-mismatches wide long)
+  (def ids (: (ok (column-as wide "id")) (Cells long)))
+  (def labels (: (ok (column-as wide "label")) (Cells string)))
+  (def values [(: (ok (column-as wide "a")) (Cells double))
+               (: (ok (column-as wide "b")) (Cells double))
+               (: (ok (column-as wide "c")) (Cells double))])
+  (def out-ids (: (ok (column-as long "id")) (Cells long)))
+  (def out-labels (: (ok (column-as long "label")) (Cells string)))
+  (def out-names (: (ok (column-as long "name")) (Cells string)))
+  (def out-values (: (ok (column-as long "value")) (Cells double)))
+  (if (not (= (table-row-count long) (* 3 (table-row-count wide))))
+      -1
+      (loop (:for r (range 0 (table-row-count long)))
+            (:when (not (and (= (cells-get out-ids r) (cells-get ids (/ r 3)))
+                             (= (cells-get out-labels r) (cells-get labels (/ r 3)))
+                             (= (cells-get out-names r) (Some (vec-ref ["a" "b" "c"] (% r 3))))
+                             (= (cells-get out-values r) (cells-get (vec-ref values (% r 3)) (/ r 3))))))
+            (:acc (counting r)))))
+
 (defun (main)
   ;; Distinct
   (def visits (csv "who,day,n\nann,1,10\nbob,1,20\nann,1,10\nann,2,30\n,1,40\n,1,40\nbob,1,50\n"))
@@ -131,6 +167,27 @@
                   "Norway   2025    12   "
                   "Spain    2024    7    "
                   "Spain    2025    null "
+                  ""]))
+  (def big (pivot-input 200000))
+  (expect "pivot-longer: each row of many, with nulls in the kept and the moved columns"
+          (pivot-mismatches big (ok (pivot-longer big ["a" "b" "c"])))
+          0)
+  (def sliced (table-slice big #:from 3 #:to 150000))
+  (expect "pivot-longer: a slice that starts inside the columns"
+          (pivot-mismatches sliced (ok (pivot-longer sliced ["a" "b" "c"])))
+          0)
+  (def times (ok (csv->table (str "day,t1,t2\n"
+                                 "2025-01-02,2025-01-02T10:00:00,2025-01-03T11:30:00\n"
+                                 ",2025-02-01T00:00:00,\n")
+                            #:types [(Tuple "day" Dates) (Tuple "t1" DateTimes) (Tuple "t2" DateTimes)])))
+  (expect "pivot-longer: dates kept, timestamps moved"
+          (shown (ok (pivot-longer times ["t1" "t2"])))
+          (lines ["day         name    value           "
+                  "date        string  datetime        "
+                  "2025-01-02  t1      2025-01-02T10:00"
+                  "2025-01-02  t2      2025-01-03T11:30"
+                  "null        t1      2025-02-01T00:00"
+                  "null        t2      null            "
                   ""]))
   (expect "pivot-longer: the names it gives by default"
           (table-names (ok (pivot-longer wide ["2025"])))
