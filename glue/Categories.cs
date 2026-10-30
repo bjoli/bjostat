@@ -92,6 +92,25 @@ public static class Categories
     }
 
     /// <summary>
+    /// The strings of the column as a category whose levels are the distinct
+    /// strings in the order of their first rows, not sorted: the code of a
+    /// row is the number of its string, from <see cref="StringIds"/>, so the
+    /// strings are numbered once, in parts on the workers. A null stays a
+    /// null. What (bjostat query)'s string-groups gives the groups and the
+    /// group of each row from.
+    /// </summary>
+    public static IArrowArray FirstSeen(IArrowArray a)
+    {
+        var s = (StringArray)a;
+        int n = s.Length;
+        var ids = StringIds(s, out var firsts);
+        var levels = new string[firsts.Count];
+        for (int k = 0; k < levels.Length; k++) levels[k] = s.GetString(firsts[k]);
+        var codes = MemoryMarshal.AsBytes(ids.AsSpan()).ToArray();
+        return Make(new ArrowBuffer(codes), Validity(s), s.NullCount, n, levels);
+    }
+
+    /// <summary>
     /// A number for each distinct string, from 0 in the order of their first
     /// rows, and the id of each row; 0 at a null. <paramref name="firsts"/>
     /// gets the first row of each id. The table is open addressing over the

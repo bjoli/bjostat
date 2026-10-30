@@ -231,6 +231,41 @@
   (expect "a zero sum where no value came" (double-values sparse "big-total")
           [(Some 0.0) (Some 20.0) (Some 0.0)])
 
+  ;; Groups of strings by their numbers
+  (def (Tuple by-ids ids) (ok (string-groups sales "region")))
+  (expect "string-groups: the groups group-of! gives, in the order first seen"
+          (group-keys by-ids) (group-keys groups))
+  (expect "string-groups: the group of each row"
+          (loop (:for g* ids) (:acc (listing (: g* (Option int))))) (list (Some 0) (Some 1) (Some 0) (Some 2) None))
+  (expect "string-groups: the same sums as group-of!"
+          (double-values (ok (loop (:for (Tuple g p) (complete-rows (Tuple ids (: price (Cells double)))))
+                                   (:acc totals (summing-by by-ids (Tuple g p)))
+                                   => (groups->table by-ids "region" [(Tuple "total" totals)])))
+                         "total")
+          [(Some 17.75) (Some 20.0) (Some 12.0)])
+  (expect "string-groups: a category"
+          (error-of (string-groups (ok (table-categorize sales "region")) "region"))
+          "'region' is a category: its groups are category-groups, and the group of a row category-codes.")
+  (expect "string-groups: a column of numbers" (error-of (string-groups sales "price"))
+          "'price' is a column of double, not of strings.")
+  (expect "string-groups: a misspelt column" (error-of (string-groups sales "regoin"))
+          "the table has no column 'regoin'. Its columns are: region, price, qty, day.")
+  ;; Enough rows to be numbered in parts on the workers, with nulls.
+  (def many-rows 300000)
+  (def many
+    (ok (make-table [(named-strings "k" (array->string-column
+                                          {arraying (str "k" (number->string (% (* i 7) 1013))) (:for i (range 0 many-rows))}
+                                          #:valid {arraying (not (= (% i 11) 0)) (:for i (range 0 many-rows))}))])))
+  (def many-cells (: (ok (column-as many "k")) (Cells string)))
+  (def by-hand (group-index))
+  (def hand-groups
+    (loop (:for k* many-cells) (:acc (vecing (match k* ((Some k) (Some (group-of! by-hand k))) (None None))))))
+  (def (Tuple many-groups many-ids) (ok (string-groups many "k")))
+  (expect "string-groups in parts: the groups of group-of!, in order"
+          (group-keys many-groups) (group-keys by-hand))
+  (expect "string-groups in parts: the group of each row, None at a null"
+          (loop (:for g* many-ids) (:acc (vecing (: g* (Option int))))) hand-groups)
+
   ;; Errors, before any row
   (expect "a misspelt column"
           (error-of (where-rows sales (col "pricee") (fun (p) (> p 10.0))))

@@ -71,6 +71,14 @@
             (:acc sums (summing-by groups (Tuple g p)))
             => (groups->table groups "region" [(Tuple "price" sums)]))))
 
+;; The same with the strings numbered first, in parts on the workers.
+(: (-> Table))
+(defun (by-region-ids)
+  (def (Tuple groups ids) (ok (string-groups t "region")))
+  (ok (loop (:for (Tuple g p) (complete-rows (Tuple ids price)))
+            (:acc sums (summing-by groups (Tuple g p)))
+            => (groups->table groups "region" [(Tuple "price" sums)]))))
+
 (: (-> Table))
 (defun (by-qty)
   (def groups (group-index))
@@ -114,6 +122,7 @@
 (def/bench "read csv" (table-row-count (ok (read-csv path))))
 (def/bench "filter, kept rows" (table-row-count (kept)))
 (def/bench "group by string, sum" (table-row-count (by-region)))
+(def/bench "group by string, sum, string-groups" (table-row-count (by-region-ids)))
 (def/bench "group by long, sum and count" (table-row-count (by-qty)))
 ;; A table of each region, in order, with a rate, and one of each id with a
 ;; number.

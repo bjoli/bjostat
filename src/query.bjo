@@ -33,7 +33,7 @@
   map->table table-with
 
   ;; Groups by number
-  GroupIndex group-index group-of! group-count group-keys category-groups
+  GroupIndex group-index group-of! group-count group-keys category-groups string-groups
 
   ;; Work on several cores
   computing computing-each computed worker-count
@@ -400,6 +400,25 @@
   (def groups (group-index))
   (loop (:for l levels) (:do (ignore (group-of! groups l))))
   (Ok groups))
+
+;; The groups of the distinct strings of the column of strings `name`, in
+;; the order of their first rows, and the group of each row, None at a null,
+;; so that a loop finds a row's group with no hash:
+;;
+;;     (def (Ok (Tuple groups ids)) (string-groups t "region"))
+;;     (loop (:for (Tuple g p) (complete-rows (Tuple ids price)))
+;;           (:acc totals (summing-by groups (Tuple g p)))
+;;           => (groups->table groups "region" [(Tuple "total" totals)]))
+;;
+;; The groups are those group-of! gives in the same order. Each string is
+;; numbered once, in parts on bjostat's workers; group-of! hashes the bytes
+;; of each row's string on one thread.
+(: (-> Table string (Result TableError (Tuple (GroupIndex string) (Cells int)))))
+(defun (string-groups t name)
+  (def (Ok (Tuple strings ids)) (string-numbers t name) :propagate)
+  (def groups (group-index))
+  (loop (:for s strings) (:do (ignore (group-of! groups s))))
+  (Ok (Tuple groups ids)))
 
 (: (-> (GroupIndex %k) int))
 (defun (group-count groups) (mutablevec-length (record-ref groups keys)))

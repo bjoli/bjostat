@@ -273,6 +273,7 @@ The columns are found first, where a misspelt name is an ~Err~:
 | ~(dates-building o)~, ~datetimes-building~, ~instants-building~ | A column of dates or timestamps of ~(std datetime)~ values, a null at each ~None~ |
 | ~(group-of! groups key)~ and ~summing-by~, ~counting-by~, ~min-by~, ~max-by~, ~mean-by~ | Aggregates by group, ~groups->table~ the table of them |
 | ~(category-groups t name)~ | The groups of a category's levels, so that a row's code is its group, with no hash |
+| ~(string-groups t name)~ | The groups of a column of strings, in the order first seen, and the group of each row: each string numbered once, in parts on the workers, not hashed for each row as ~group-of!~ does |
 | ~(grouping c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |
 | ~(table-with t name c)~ | The table with a column more, or one replaced |
 | ~(computing thunk)~, ~(computing-each n work)~ | An event of work that uses a core, run on bjostat's workers: one part, or ~(work k)~ for k from 0 to n - 1, the values in order |

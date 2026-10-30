@@ -51,7 +51,7 @@
   table-count table-crosstab
 
   ;; Categories
-  table-categorize category-levels category-codes
+  table-categorize category-levels category-codes string-numbers
 
   ;; Files
   read-arrow write-arrow
@@ -154,6 +154,7 @@
                      #:exceptions (Bjostat.TableProblem)))
   (clr-levels (: Bjostat.Categories.Levels (-> AnyColumn (Array string))))
   (clr-codes (: Bjostat.Categories.Codes (-> AnyColumn AnyColumn)))
+  (clr-first-seen (: Bjostat.Categories.FirstSeen (-> AnyColumn AnyColumn)))
 
   ;; Files. Arrow reports a file it cannot read with exceptions of several
   ;; types, so every exception is an Err.
@@ -818,9 +819,28 @@
 (: (-> Table string (Result TableError (Cells int))))
 (defun (category-codes t name)
   (def (Ok c) (find-category t name) :propagate)
+  (codes-of c name))
+
+(: (-> AnyColumn string (Result TableError (Cells int))))
+(defun (codes-of c name)
   (match (clr-cells-of (clr-codes c))
     ((Some cells) (Ok (Cells (clr cells))))
     (None (refuse (str "the codes of '" name "' are not ints.")))))
+
+;; The distinct strings of the column of strings `name`, in the order of
+;; their first rows, and the number of the string of each row, None at a
+;; null: (bjostat query)'s string-groups. Each string is numbered once, in
+;; parts on bjostat's workers.
+(: (-> Table string (Result TableError (Tuple (Vec string) (Cells int)))))
+(defun (string-numbers t name)
+  (def (Ok c) (find-column t name) :propagate)
+  (match (type-of-column c)
+    (String
+     (def numbered (clr-first-seen c))
+     (def (Ok codes) (codes-of numbered name) :propagate)
+     (Ok (Tuple (array->vec (clr-levels numbered)) codes)))
+    (Category (refuse (str "'" name "' is a category: its groups are category-groups, and the group of a row category-codes.")))
+    (other (refuse (str "'" name "' is a column of " (type-text other) ", not of strings.")))))
 
 ;; ===========================================================================
 ;; Files
