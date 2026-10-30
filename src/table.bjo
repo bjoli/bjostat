@@ -95,9 +95,10 @@
   (string-column-null-count (: Bjostat.Columns.StringsNullCount (-> StringColumn int)))
   (string-column-ref (: Bjostat.Columns.StringRef (-> StringColumn int (Option string))))
 
-  ;; Cells, at the type their use gives
-  (clr-cells-of (: Bjostat.CellsOps.Of (-> AnyColumn (Option (ClrCells %a)))))
-  (clr-cells-name (: Bjostat.CellsOps.NameOf (-> (Option (ClrCells %a)) string)))
+  ;; Cells, at the type their use gives. #:uses-type: these test typeof(T),
+  ;; so a use that does not decide the type is a compile error.
+  (clr-cells-of (: Bjostat.CellsOps.Of (-> AnyColumn (Option (ClrCells %a))) #:uses-type))
+  (clr-cells-name (: Bjostat.CellsOps.NameOf (-> (Option (ClrCells %a)) string) #:uses-type))
   (clr-cells-ref (: Bjostat.CellsOps.Ref (-> (ClrCells %a) int %a)))
   (clr-cells-get (: Bjostat.CellsOps.Get (-> (ClrCells %a) int (Option %a))))
   (clr-cells-valid? (: Bjostat.CellsOps.IsValid (-> (ClrCells %a) int bool)))
@@ -111,7 +112,7 @@
 
   ;; Building. The flags are empty for a column with no nulls, or one for
   ;; each value, #f at a null.
-  (clr-from-array (: Bjostat.Columns.FromArray (-> (Array %a) (Array bool) (Column %a))))
+  (clr-from-array (: Bjostat.Columns.FromArray (-> (Array %a) (Array bool) (Column %a)) #:uses-type))
   (clr-from-strings (: Bjostat.Columns.FromStrings (-> (Array string) (Array bool) StringColumn)))
 
   ;; Aggregates. A column of a type that is not a number is a C# error, for

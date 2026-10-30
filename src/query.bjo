@@ -62,7 +62,7 @@
 
   ;; A builder is changed in place, and answered so that it is a
   ;; collector's accumulator.
-  (builder-make (: Bjostat.BuilderOps.Make (-> int (Builder %a))))
+  (builder-make (: Bjostat.BuilderOps.Make (-> int (Builder %a)) #:uses-type))
   (builder-add (: Bjostat.BuilderOps.Add (-> (Builder %a) %a (Builder %a))))
   (builder-add-option (: Bjostat.BuilderOps.AddOption (-> (Builder %a) (Option %a) (Builder %a))))
   (builder-build (: Bjostat.BuilderOps.Build (-> (Builder %a) AnyColumn)))

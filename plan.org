@@ -780,12 +780,14 @@ Fixed in Bjolang, and the generic code is now in Bjolang, not in the glue:
   refuses such a ~def~, also ~(def r (computed (computing-each n (fun (k)
   ...))))~ where the lambda uses the module. It does not find a function
   that goes to the workers through a value, such as a box.
+- A column type that nothing decided was given to C# as ~object~:
+  ~(count-rows t (col "price") (fun (p) #t))~ compiled, and was then an Err
+  at run time, "'price' is a column of double, not of Object". Now the
+  imports of the glue that test ~typeof(T)~ say ~#:uses-type~, and Bjolang
+  follows the type through ~col~ and the other functions, across modules: a
+  call that leaves it undecided is a type error that asks for the type.
 
 Still open, checked again on the vectorise branch:
-- A column type that nothing decides is left as ~object~:
-  ~(count-rows t (col "price") (fun (p) #t))~ compiles, and is then an Err
-  at run time, "'price' is a column of double, not of Object". It should be
-  a Bjolang error that asks for the type.
 - The inferred ~where~ clauses are on functions only, not on type
   declarations: a Bjolang struct with a field ~(Column %a)~ is refused by C#,
   as Arrow's ~PrimitiveArray<T>~ needs ~where T : struct~. The glue's
@@ -803,6 +805,8 @@ Still open, checked again on the vectorise branch:
   Arrow's buffers cannot. Strings go to ~array->string-column~. A
   constraint on ~array->column~ of the types Arrow stores would make it a
   Bjolang error.
-- A number that only ~summing~ uses is an ~int~, as Bjolang reads a literal,
-  so ~(:acc (summing x))~ over cells asks for a column of ints, and a column
-  of doubles is an Err at run time. Such a value needs its type written.
+
+Not a fault of Bjolang: a number that only ~summing~ uses is an ~int~, as
+Bjolang reads a literal that nothing else decides, so ~(:acc (summing x))~
+over cells asks for a column of ints, and a column of doubles is an Err at
+run time. Such a value needs its type written.
