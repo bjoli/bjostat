@@ -715,15 +715,35 @@ loops before anything else, as they change the Collector trait:
    the next row with a value in C# (~Cells.NextValid~,
    ~CellsOps.NextComplete~): the valid bits of 57 rows of each column from
    one read of 8 bytes, the AND of the columns, and the first bit, with no
-   test of each row. Measured alone, 1 000 000 rows: the correlation over
-   ~complete-rows~ with half the rows null at random in each column 2.14
-   ms → 1.48, with 5% at random 5.00 → 4.89; in the run of all cases 5.51 →
-   4.86, as the old code also lost to the profile of the cases before it.
-   ~skip-nulls~ did not change (within 2%): the nulls were never its cost.
-   Both still cost about 1.9 ms more than ~:when-let~, with nulls or
-   without: that is the walk through the iterator and ~cells-ref~ for each
-   row, not the valid bits. The tests compare both with ~:when-let~ for 10
-   kinds of nulls, 8 lengths and 9 starts of a slice. And the statistics without nulls are 5 times Polars's
+   test of each row.
+
+   That alone changed little. The cost of ~skip-nulls~ and ~complete-rows~
+   (1.9 ms more than ~:when-let~ for a million rows, nulls or not) was a
+   call in the step to the next row: in the old ~next-valid~ (a recursive
+   function), in a seldom taken path of the C# (the end of the bitmap,
+   native memory, Arrow's ~IsValid~), and in a branch around the trait
+   method of ~complete-rows~. With a call in a loop, .NET kept the loop's
+   sums in memory and copied them each row (seen in its machine code). Now
+   ~Cells~ copies the valid bitmap once, from the bit of cell 0, with 8
+   bytes of zeros after it, so that the bits are read with no test and no
+   call, and ~next-complete~ always calls the C#, which answers at once
+   when no column has nulls. Measured, all cases in one run, a million
+   rows:
+   | case                                 | before | after   |
+   |--------------------------------------+--------+---------|
+   | ~skip-nulls~ sd, no nulls             | 4.33   | 2.47 ms |
+   | ~skip-nulls~ sd, 5% random            | 4.13   | 2.51 ms |
+   | ~skip-nulls~ sd, 50% random           | 2.22   | 1.33 ms |
+   | ~complete-rows~ cor, no nulls         | 4.51   | 2.93 ms |
+   | ~complete-rows~ cor, 5% random        | 5.51   | 3.34 ms |
+   | ~complete-rows~ cor, 50% random       | 2.66   | 1.04 ms |
+   | ~:when-let~ cor, 5% random            | 4.15   | 3.48 ms |
+   | ~:when-let~ sum of products, 5% random | 3.71   | 2.53 ms |
+   Alone, ~complete-rows~ cor without nulls takes 2.54 ms, as ~:when-let~
+   (2.6). The loops with ~:when-let~ gained too, as ~IsValid~ no longer has
+   a path that calls Arrow. The tests compare ~skip-nulls~ and
+   ~complete-rows~ with ~:when-let~ for 10 kinds of nulls, 8 lengths and 9
+   starts of a slice. And the statistics without nulls are 5 times Polars's
    (a standard deviation 2.49 ms against 0.49), as their sums are not
    vector sums; that is item 6 of what the comparison taught, a decision.
 5. *Statistics:* a t-digest for quantiles in one pass with little memory.
