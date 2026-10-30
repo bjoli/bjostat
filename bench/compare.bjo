@@ -33,8 +33,10 @@
 (: string)
 (def path (match (getenv "COMPARE_CSV") ((Some p) p) (None "scratch/compare.csv")))
 
+;; In a scope of its own: a module's initialiser has none, and a file read
+;; on one thread is a port that a scope owns.
 (: Table)
-(def t (ok (read-csv path)))
+(def t (with-scope (ok (read-csv path))))
 
 (: (Cells string))
 (def region (ok (column-as t "region")))
