@@ -12,6 +12,7 @@
 (import (std prelude))
 (import (std simpletest))
 (import (bjostat table))
+(import (only (bjostat query) table-with ColumnBuildingOption))
 
 (import/extern (temp-dir (: System.IO.Path.GetTempPath (-> string))))
 
@@ -181,6 +182,51 @@
        (= (joined-rows (ok (semi-join l r ["k"]))) (joined-rows (ok (semi-join ls rs ["ks"]))))
        (= (joined-rows (ok (anti-join l r ["k"]))) (joined-rows (ok (anti-join ls rs ["ks"]))))))
 
+;; A table of n rows of each kind of column a copy of rows takes apart:
+;; the row's number, longs with nulls, strings of 0 to 40 bytes with nulls,
+;; doubles, bools, and a category.
+(: (-> int Table))
+(defun (copy-input n)
+  (def t (ok (make-table
+               [(named "row" (array->column {arraying i (:for i (range 0 n))}))
+                (named "l" (array->column {arraying (* 3L (cast long i)) (:for i (range 0 n))}
+                                          #:valid {arraying (not (= (% i 9) 4)) (:for i (range 0 n))}))
+                (named-strings "s" (array->string-column
+                                     {arraying (string-pad-left (number->string i) (% (* i 7) 41) #:with #\x) (:for i (range 0 n))}
+                                     #:valid {arraying (not (= (% i 11) 3)) (:for i (range 0 n))}))
+                (named "d" (array->column {arraying (* 0.5 (cast double i)) (:for i (range 0 n))}))
+                (named-strings "c" (array->string-column {arraying (str "level" (number->string (% i 5))) (:for i (range 0 n))}))])))
+  (ok (table-with (ok (table-categorize t "c")) "b"
+                  (loop (:for i (range 0 n)) (:acc (column-building/option (if (= (% i 13) 0) None (Some (= (% i 2) 0)))))))))
+
+;; How many rows of the copy, sorted by the row number descending, are not
+;; the cells of the reversed row in each column.
+(: (-> Table int))
+(defun (copy-mismatches t)
+  (def n (table-row-count t))
+  (def u (ok (table-sort t [(descending "row")])))
+  (def ra (: (ok (column-as t "row")) (Cells int)))
+  (def rb (: (ok (column-as u "row")) (Cells int)))
+  (def la (: (ok (column-as t "l")) (Cells long)))
+  (def lb (: (ok (column-as u "l")) (Cells long)))
+  (def sa (: (ok (column-as t "s")) (Cells string)))
+  (def sb (: (ok (column-as u "s")) (Cells string)))
+  (def da (: (ok (column-as t "d")) (Cells double)))
+  (def db (: (ok (column-as u "d")) (Cells double)))
+  (def ba (: (ok (column-as t "b")) (Cells bool)))
+  (def bb (: (ok (column-as u "b")) (Cells bool)))
+  (def ca (: (ok (column-as t "c")) (Cells string)))
+  (def cb (: (ok (column-as u "c")) (Cells string)))
+  (loop (:for i (range 0 n))
+        (:let j (- (- n 1) i))
+        (:when (not (and (= (cells-get rb i) (cells-get ra j))
+                         (= (cells-get lb i) (cells-get la j))
+                         (= (cells-get sb i) (cells-get sa j))
+                         (= (cells-get db i) (cells-get da j))
+                         (= (cells-get bb i) (cells-get ba j))
+                         (= (cells-get cb i) (cells-get ca j)))))
+        (:acc (counting i))))
+
 (defun (main)
   (def t (sales))
 
@@ -308,6 +354,17 @@
   (expect "a join by longs: one to one, in order, more rows than a part"
           (integer-joins-agree? (keyed 200000 (fun (i) (Some (cast long i))))
                                 (keyed 200000 (fun (i) (Some (cast long i)))))
+          #t)
+  (expect "a copy of many rows in parts: each cell of each kind of column"
+          (copy-mismatches (copy-input 300000))
+          0)
+  (expect "a copy of many rows in parts, of a slice"
+          (copy-mismatches (table-slice (copy-input 300000) #:from 5 #:to 250003))
+          0)
+  (expect "a copy of many rows in parts: the count of nulls of each column"
+          (let ((t (copy-input 300000)))
+            (= (vec-map (fun (name) (column-nulls (ok (table-sort t [(descending "row")])) name)) ["l" "s" "b"])
+               (vec-map (fun (name) (column-nulls t name)) ["l" "s" "b"])))
           #t)
   (expect "complete-rows: columns of two lengths give the rows of the shorter"
           (loop (:for (Tuple _p r) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2])))])) "n")) (Cells int)))))

@@ -87,18 +87,22 @@ public static class Sorting
         where T : struct, INumber<T>, IEquatable<T>
     {
         var values = a.Values;
-        bool nulls = a.NullCount != 0;
         // The rows with numbers, then those with a NaN, then the nulls, each
-        // group in the order it had.
-        var rows = new int[order.Length];
-        var keys = new T[order.Length];
-        var nans = new List<int>();
-        var empty = new List<int>();
-        int count = 0;
+        // group in the order it had. The nulls are read from the bitmap
+        // itself, not through IsValid, and the rows that are not numbers go
+        // to the end of `others`, NaNs first, nulls from the back.
+        var valid = a.NullCount == 0 ? ReadOnlySpan<byte>.Empty : a.NullBitmapBuffer.Span;
+        int offset = a.Offset;
+        int n = order.Length;
+        var rows = new int[n];
+        var keys = new T[n];
+        var others = new int[n];
+        int count = 0, nanCount = 0, nullCount = 0;
         foreach (int r in order)
         {
-            if (nulls && !a.IsValid(r)) empty.Add(r);
-            else if (T.IsNaN(values[r])) nans.Add(r);
+            int bit = offset + r;
+            if (!valid.IsEmpty && (valid[bit >> 3] & (1 << (bit & 7))) == 0) others[n - 1 - nullCount++] = r;
+            else if (T.IsNaN(values[r])) others[nanCount++] = r;
             else
             {
                 rows[count] = r;
@@ -108,8 +112,9 @@ public static class Sorting
         }
         SortRows(rows.AsSpan(0, count), keys.AsSpan(0, count), descending);
         rows.AsSpan(0, count).CopyTo(order);
-        CollectionsMarshal.AsSpan(nans).CopyTo(order.AsSpan(count));
-        CollectionsMarshal.AsSpan(empty).CopyTo(order.AsSpan(count + nans.Count));
+        others.AsSpan(0, nanCount).CopyTo(order.AsSpan(count));
+        // The nulls were put from the back; they go in the order they had.
+        for (int i = 0; i < nullCount; i++) order[count + nanCount + i] = others[n - 1 - i];
     }
 
     // Strings become their rank among the distinct strings, which keeps their

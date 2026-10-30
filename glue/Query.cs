@@ -29,10 +29,14 @@ public static class Query
         CheckRows(rows.AsSpan(0, count), t.Length);
         var columns = new IArrowArray[t.ColumnCount];
         // The columns are copied on bjostat's workers when there is enough to
-        // copy. Most of the time of a copy is spent to get new memory: the
-        // operating system gives each page of a new array when it is first
-        // written. The threads get their pages at the same time. A column's
-        // exception is thrown as one thread would throw it.
+        // copy, each in parts of rows, so that one long column of strings
+        // does not take as long as all of them on one thread. Most of the
+        // time of a copy is spent to get new memory: the operating system
+        // gives each page of a new array when it is first written. The
+        // threads get their pages at the same time. A column's exception is
+        // thrown as one thread would throw it.
+        if (count >= 2 * TakePart)
+            return new RecordBatch(t.Schema, TakeInParts(t, rows, count), count);
         if (columns.Length > 1 && (long)count * columns.Length >= ParallelRows)
         {
             Workers.For(columns.Length, c => columns[c] = TakeColumn(t.Column(c), rows.AsSpan(0, count)));
@@ -41,6 +45,204 @@ public static class Query
             for (int c = 0; c < columns.Length; c++)
                 columns[c] = TakeColumn(t.Column(c), rows.AsSpan(0, count));
         return new RecordBatch(t.Schema, columns, count);
+    }
+
+    // The rows of a part of a copy: a multiple of 8, so that each part writes
+    // whole bytes of a bitmap.
+    private const int TakePart = 1 << 16;
+
+    // The columns at the rows, each column in parts of rows. One For over
+    // every part of every column: numbers and bits are copied, and a part of
+    // strings adds up the lengths of its strings. The sums give each part of
+    // strings where its bytes start, and a second For copies them. Not one
+    // For inside another: a worker that waits there could wait for workers
+    // that wait too.
+    private static IArrowArray[] TakeInParts(RecordBatch t, int[] rows, int count)
+    {
+        int parts = (count + TakePart - 1) / TakePart;
+        var plans = new PartedTake[t.ColumnCount];
+        for (int c = 0; c < plans.Length; c++) plans[c] = new PartedTake(t.Column(c), rows, count, parts);
+        Workers.For(plans.Length * parts, u => plans[u / parts].First(u % parts));
+        bool strings = false;
+        foreach (var plan in plans) strings |= plan.Between();
+        if (strings) Workers.For(plans.Length * parts, u => plans[u / parts].Second(u % parts));
+        return plans.Select(plan => plan.Result()).ToArray();
+    }
+
+    /// <summary>The copy of one column at the rows, in parts of <see cref="TakePart"/> rows.</summary>
+    private sealed class PartedTake
+    {
+        private readonly IArrowArray _a;
+        private readonly ArrayData _data;
+        private readonly int[] _rows;
+        private readonly int _count;
+        private readonly int _parts;
+        // Numbers: the width of a value, and the new values.
+        private readonly int _width;
+        private readonly byte[]? _values;
+        // Strings: the new offsets, each part's bytes, and the new bytes.
+        private readonly bool _strings;
+        private readonly byte[]? _offsets;
+        private readonly int[]? _partBytes;
+        private byte[]? _bytes;
+        private int _total;
+        // The valid bits, and each part's count of them.
+        private readonly byte[]? _valid;
+        private readonly int[] _set;
+        // Another type: copied whole by part 0, as before.
+        private IArrowArray? _whole;
+
+        public PartedTake(IArrowArray a, int[] rows, int count, int parts)
+        {
+            _a = a;
+            _data = a.Data;
+            _rows = rows;
+            _count = count;
+            _parts = parts;
+            _set = new int[parts];
+            var type = _data.DataType;
+            bool fixedWidth = type switch
+            {
+                BooleanType => false,
+                DictionaryType { IndexType: FixedWidthType iw } => iw.BitWidth % 8 == 0 && (_width = iw.BitWidth / 8) > 0,
+                FixedWidthType fw => fw.BitWidth % 8 == 0 && (_width = fw.BitWidth / 8) > 0,
+                _ => false,
+            };
+            _strings = type is StringType or BinaryType;
+            if (!fixedWidth && !_strings) return;
+            if (_data.NullCount != 0 && !_data.Buffers[0].IsEmpty)
+            {
+                CheckBuffer(_data.Buffers[0].Span, ((long)_data.Offset + _data.Length + 7) / 8);
+                _valid = GC.AllocateUninitializedArray<byte>((count + 7) / 8);
+            }
+            if (fixedWidth)
+            {
+                CheckBuffer(_data.Buffers[1].Span, ((long)_data.Offset + _data.Length) * _width);
+                _values = GC.AllocateUninitializedArray<byte>(count * _width);
+            }
+            else
+            {
+                var offsetBytes = _data.Buffers[1].Span;
+                CheckBuffer(offsetBytes, ((long)_data.Offset + _data.Length + 1) * sizeof(int));
+                var offsets = MemoryMarshal.Cast<byte, int>(offsetBytes).Slice(_data.Offset);
+                CheckBuffer(_data.Buffers[2].Span, offsets[_data.Length]);
+                _offsets = GC.AllocateUninitializedArray<byte>((count + 1) * sizeof(int));
+                _partBytes = new int[parts];
+            }
+        }
+
+        private (int from, int to) Range(int p) => (p * TakePart, Math.Min(_count, (p + 1) * TakePart));
+
+        /// <summary>The bits and the numbers of part p, or the lengths of its strings.</summary>
+        public void First(int p)
+        {
+            if (_values == null && !_strings)
+            {
+                if (p == 0) _whole = TakeColumn(_a, _rows.AsSpan(0, _count));
+                return;
+            }
+            var (from, to) = Range(p);
+            var rows = _rows.AsSpan(from, to - from);
+            if (_valid != null)
+            {
+                var bits = TakeBitsOf(_data.Buffers[0].Span, _data.Offset, rows, out _set[p]);
+                bits.CopyTo(_valid, from >> 3);
+            }
+            if (_values != null)
+            {
+                var values = _data.Buffers[1].Span;
+                var into = _values.AsSpan(from * _width, (to - from) * _width);
+                switch (_width)
+                {
+                    case 8: GatherInto<long>(values, _data.Offset, rows, into); break;
+                    case 4: GatherInto<int>(values, _data.Offset, rows, into); break;
+                    case 2: GatherInto<short>(values, _data.Offset, rows, into); break;
+                    case 1: GatherInto<byte>(values, _data.Offset, rows, into); break;
+                    default:
+                        for (int i = 0; i < rows.Length; i++)
+                            values.Slice((_data.Offset + rows[i]) * _width, _width).CopyTo(into.Slice(i * _width));
+                        break;
+                }
+                return;
+            }
+            var offsets = MemoryMarshal.Cast<byte, int>(_data.Buffers[1].Span).Slice(_data.Offset);
+            int sum = 0;
+            foreach (int r in rows) sum += offsets[r + 1] - offsets[r];
+            _partBytes![p] = sum;
+        }
+
+        /// <summary>For strings: where each part's bytes start, and the array of them. Whether there are strings.</summary>
+        public bool Between()
+        {
+            if (!_strings) return false;
+            long total = 0;
+            for (int p = 0; p < _parts; p++)
+            {
+                int bytes = _partBytes![p];
+                _partBytes[p] = (int)total;
+                total += bytes;
+            }
+            if (total > int.MaxValue) throw new InvalidDataException("(bjostat query): the strings are too many bytes for one column");
+            _total = (int)total;
+            _bytes = GC.AllocateUninitializedArray<byte>(_total + 16);
+            MemoryMarshal.Cast<byte, int>(_offsets.AsSpan())[_count] = _total;
+            return true;
+        }
+
+        /// <summary>For strings: the offsets and the bytes of part p.</summary>
+        public void Second(int p)
+        {
+            if (!_strings) return;
+            var (from, to) = Range(p);
+            ref int offsets = ref Unsafe.Add(ref Unsafe.As<byte, int>(ref MemoryMarshal.GetReference(_data.Buffers[1].Span)), _data.Offset);
+            var bytes = _data.Buffers[2].Span;
+            ref byte source = ref MemoryMarshal.GetReference(bytes);
+            ref int newOffsets = ref Unsafe.As<byte, int>(ref MemoryMarshal.GetArrayDataReference(_offsets!));
+            ref byte to0 = ref MemoryMarshal.GetArrayDataReference(_bytes!);
+            int lastWhole = bytes.Length - 16;
+            int at = _partBytes![p];
+            // Where the next part's bytes start: a copy of 16 bytes must not
+            // end after it, or it could write over the next part's first
+            // string, which another thread may have written.
+            int end = p + 1 < _parts ? _partBytes[p + 1] : _total + 16;
+            for (int i = from; i < to; i++)
+            {
+                int r = _rows[i];
+                int start = Unsafe.Add(ref offsets, r);
+                int length = Unsafe.Add(ref offsets, r + 1) - start;
+                Unsafe.Add(ref newOffsets, i) = at;
+                ref byte dest = ref Unsafe.Add(ref to0, at);
+                if (length <= 16 && start <= lastWhole && at + 16 <= end)
+                    Unsafe.WriteUnaligned(ref dest, Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector128<byte>>(ref Unsafe.Add(ref source, start)));
+                else
+                    Unsafe.CopyBlockUnaligned(ref dest, ref Unsafe.Add(ref source, start), (uint)length);
+                at += length;
+            }
+        }
+
+        public IArrowArray Result()
+        {
+            if (_whole != null) return _whole;
+            int set = 0;
+            foreach (int c in _set) set += c;
+            int nulls = _valid == null ? 0 : _count - set;
+            var bitmap = nulls == 0 ? ArrowBuffer.Empty : new ArrowBuffer(_valid!);
+            ArrayData taken = _strings
+                ? new ArrayData(_data.DataType, _count, nulls, 0,
+                    new[] { bitmap, new ArrowBuffer(_offsets!), new ArrowBuffer(new ReadOnlyMemory<byte>(_bytes!, 0, _total)) })
+                : new ArrayData(_data.DataType, _count, nulls, 0,
+                    new[] { bitmap, new ArrowBuffer(_values!) }, null, _data.Dictionary);
+            return ArrowArrayFactory.BuildArray(taken);
+        }
+    }
+
+    private static void GatherInto<T>(ReadOnlySpan<byte> values, int offset, ReadOnlySpan<int> rows, Span<byte> into)
+        where T : struct
+    {
+        ref T from = ref Unsafe.Add(ref Unsafe.As<byte, T>(ref MemoryMarshal.GetReference(values)), offset);
+        ref T to = ref Unsafe.As<byte, T>(ref MemoryMarshal.GetReference(into));
+        for (int i = 0; i < rows.Length; i++)
+            Unsafe.Add(ref to, i) = Unsafe.ReadUnaligned<T>(ref Unsafe.As<T, byte>(ref Unsafe.Add(ref from, rows[i])));
     }
 
     // Below this many cells, a copy on one thread is faster than the start of

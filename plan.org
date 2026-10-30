@@ -697,6 +697,33 @@ loops before anything else, as they change the Collector trait:
    for joins by strings. What is left of their matching (7 to 11 ms) is a
    hash of each row's bytes in parts on the workers, and numbering the
    strings first hashes each row's bytes too.
+
+   Done after the joins, each measured alone first where its time goes:
+   - ~pivot-longer~ spent its time on the names (two million strings,
+     each copied on its own: 8.9 ms), on putting the value columns end to
+     end (7.8) and on taking them through an array of rows (8.6). Now the
+     names are their bytes once, copied in blocks that double, with
+     offsets made in parts on the workers, and a column of numbers, kept
+     or moved, is copied to its rows directly (row i of column j to i * k
+     + j), in parts. 30.2 to 5.01 ms (narrow), 21.7 to 7.60 (wide); Polars
+     on one thread 4.74 and 4.57.
+   - The keys of a sort are not made on one thread for long: of a sort by
+     a number, about half was the copy of the rows, a column on each
+     worker, as long as the column of strings took alone. Now a copy of
+     many rows (~Query.Take~) copies each column in parts of rows: the
+     numbers and the bits in one pass over all the parts of all the
+     columns, the strings in two (the bytes of each part, then the copy).
+     Not one ~Workers.For~ inside another, where a worker could wait for
+     workers that wait too. And a pass of the sort by numbers reads the
+     nulls from the bitmap, not through ~IsValid~, which cost about 20 ms
+     on the wide file. A sort by a number 32.2 to 26.6 ms (narrow) and
+     68.3 to 33.1 (wide); by a string and a number 49.5 to 43.9 and 107 to
+     76.7; by a category and a number 43.7 to 36.3 and 69.5 to 62.2
+     (before the change to the nulls). Polars on 24 threads: 26.9 and
+     42.3, 49.5 and 65.8. What is left is mostly the radix passes, 11 to
+     16 ms. ~bjo bench~ shows more memory for these (the thread that
+     measures now makes the arrays the workers fill); the program uses
+     no more.
 3. *CSV fields as spans.* bjostat reads the narrow file in 68.0 ms in
    chunks on the workers (186 on one thread), Polars in 71.6 on one thread
    and in 16.9 on 24; the wide one in 178, 215 and 34.8. ~(text csv)~ makes
