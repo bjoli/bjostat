@@ -21,6 +21,7 @@
 // are found as a permutation, and Query.Take copies them.
 
 using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 
@@ -203,10 +204,17 @@ public static class Sorting
         return (ulong)long.CreateTruncating(x) ^ sign;
     }
 
-    // A least significant digit first radix sort, 8 bits a pass, of the keys
-    // with the rows beside them. It is stable. A digit that is the same in
-    // every key needs no pass. Many keys are sorted in parts on bjostat's
-    // workers.
+    // A least significant digit first radix sort, 11 bits a pass, of the
+    // keys with the rows beside them: 6 passes for 64 bits, where 8 bits a
+    // pass need 8. It is stable. A digit that is the same in every key needs
+    // no pass. Many keys are sorted in parts on bjostat's workers.
+    private const int DigitBits = 11;
+    private const int Buckets = 1 << DigitBits;
+    private const int Digits = (64 + DigitBits - 1) / DigitBits;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int Digit(ulong k, int d) => (int)((k >> (DigitBits * d)) & (Buckets - 1));
+
     private static void RadixSort(ulong[] keys, Span<int> rows)
     {
         int parts = Math.Min(keys.Length / PartKeys, Workers.Count);
@@ -231,11 +239,11 @@ public static class Sorting
         var all = new int[parts][];
         Workers.For(parts, p =>
         {
-            var c = new int[8 * 256];
+            var c = new int[Digits * Buckets];
             for (int i = p * size, to = Math.Min(n, i + size); i < to; i++)
             {
                 ulong k = keys[i];
-                for (int d = 0; d < 8; d++) c[d * 256 + (int)((k >> (8 * d)) & 0xFF)]++;
+                for (int d = 0; d < Digits; d++) c[d * Buckets + Digit(k, d)]++;
             }
             all[p] = c;
         });
@@ -245,22 +253,22 @@ public static class Sorting
         ulong[] fromKeys = keys, toKeys = keys2;
         int[] fromRows = rows1, toRows = rows2;
         var counts = new int[parts][];
-        for (int p = 0; p < parts; p++) counts[p] = new int[256];
-        for (int d = 0; d < 8; d++)
+        for (int p = 0; p < parts; p++) counts[p] = new int[Buckets];
+        for (int d = 0; d < Digits; d++)
         {
-            int first = (int)((keys[0] >> (8 * d)) & 0xFF), same = 0;
-            for (int p = 0; p < parts; p++) same += all[p][d * 256 + first];
+            int first = Digit(keys[0], d), same = 0;
+            for (int p = 0; p < parts; p++) same += all[p][d * Buckets + first];
             if (same == n) continue;
-            int shift = 8 * d;
+            int digit = d;
             var from = fromKeys;
             Workers.For(parts, p =>
             {
                 var c = counts[p];
                 System.Array.Clear(c);
-                for (int i = p * size, to = Math.Min(n, i + size); i < to; i++) c[(int)((from[i] >> shift) & 0xFF)]++;
+                for (int i = p * size, to = Math.Min(n, i + size); i < to; i++) c[Digit(from[i], digit)]++;
             });
             int sum = 0;
-            for (int b = 0; b < 256; b++)
+            for (int b = 0; b < Buckets; b++)
                 for (int p = 0; p < parts; p++)
                 {
                     int c = counts[p][b];
@@ -274,7 +282,7 @@ public static class Sorting
                 for (int i = p * size, to = Math.Min(n, i + size); i < to; i++)
                 {
                     ulong k = fk[i];
-                    int j = at[(int)((k >> shift) & 0xFF)]++;
+                    int j = at[Digit(k, digit)]++;
                     tk[j] = k;
                     tr[j] = fr[i];
                 }
@@ -288,31 +296,30 @@ public static class Sorting
     private static void RadixSortOne(ulong[] keys, Span<int> rows)
     {
         int n = keys.Length;
-        var counts = new int[8 * 256];
+        var counts = new int[Digits * Buckets];
         foreach (ulong k in keys)
-            for (int d = 0; d < 8; d++)
-                counts[d * 256 + (int)((k >> (8 * d)) & 0xFF)]++;
+            for (int d = 0; d < Digits; d++)
+                counts[d * Buckets + Digit(k, d)]++;
         var keys2 = new ulong[n];
         var rows1 = rows.ToArray();
         var rows2 = new int[n];
         ulong[] fromKeys = keys, toKeys = keys2;
         int[] fromRows = rows1, toRows = rows2;
-        for (int d = 0; d < 8; d++)
+        for (int d = 0; d < Digits; d++)
         {
-            var count = counts.AsSpan(d * 256, 256);
-            if (count[(int)((keys[0] >> (8 * d)) & 0xFF)] == n) continue;
+            var count = counts.AsSpan(d * Buckets, Buckets);
+            if (count[Digit(keys[0], d)] == n) continue;
             int sum = 0;
-            for (int b = 0; b < 256; b++)
+            for (int b = 0; b < Buckets; b++)
             {
                 int c = count[b];
                 count[b] = sum;
                 sum += c;
             }
-            int shift = 8 * d;
             for (int i = 0; i < n; i++)
             {
                 ulong k = fromKeys[i];
-                int at = count[(int)((k >> shift) & 0xFF)]++;
+                int at = count[Digit(k, d)]++;
                 toKeys[at] = k;
                 toRows[at] = fromRows[i];
             }
