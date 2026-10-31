@@ -141,6 +141,9 @@ public static class Reshape
             case Int32Array i: ids = Integers(i.Values, a, x => x, out card); break;
             case Int16Array i: ids = Integers(i.Values, a, x => x, out card); break;
             case UInt8Array i: ids = Integers(i.Values, a, x => x, out card); break;
+            case UInt16Array i: ids = Integers(i.Values, a, x => x, out card); break;
+            case UInt32Array i: ids = Integers(i.Values, a, x => x, out card); break;
+            case UInt64Array i: ids = Integers(i.Values, a, x => unchecked((long)x), out card); break;
             case Date32Array d: ids = Integers(d.Values, a, x => x, out card); break;
             case TimestampArray t: ids = Integers(t.Values, a, x => x, out card); break;
             case DoubleArray d:
@@ -236,20 +239,7 @@ public static class Reshape
     }
 
     // The name of a type as (bjostat table) prints it.
-    internal static string TypeText(IArrowType t) => t switch
-    {
-        DoubleType => "double",
-        FloatType => "float",
-        Int64Type => "long",
-        Int32Type => "int",
-        StringType => "string",
-        Date32Type => "date",
-        TimestampType { Timezone: not (null or "") } => "instant",
-        TimestampType => "datetime",
-        BooleanType => "bool",
-        _ when Categories.IsType(t) => "category",
-        _ => t.Name,
-    };
+    internal static string TypeText(IArrowType t) => ColumnTypes.ArrowName(t);
 
     // ---------------------------------------------------------------------
     // Distinct

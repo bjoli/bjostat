@@ -481,9 +481,7 @@ public sealed class Builder<T>
     private int _count;
     private int _nulls;
 
-    private static bool IsNumber =>
-        typeof(T) == typeof(double) || typeof(T) == typeof(float) || typeof(T) == typeof(long)
-        || typeof(T) == typeof(int) || typeof(T) == typeof(short) || typeof(T) == typeof(byte);
+    private static bool IsNumber => ColumnTypes.IsNumber<T>();
 
     public Builder(int capacity)
     {
@@ -503,8 +501,10 @@ public sealed class Builder<T>
 
     private static void CheckType()
     {
-        if (!(IsNumber || typeof(T) == typeof(bool) || typeof(T) == typeof(Utf8String)))
-            throw new ArgumentException($"(bjostat query): a column of {typeof(T).Name} cannot be made");
+        // The message says what a column holds and, for a type Arrow has a
+        // column for but not one of ours, what is missing instead of it.
+        if (!ColumnTypes.CanHold<T>())
+            throw new ArgumentException($"(bjostat query): a column of {ColumnTypes.Name<T>()} cannot be made: {ColumnTypes.Refusal<T>()}");
     }
 
     public int Count => _count;
@@ -672,13 +672,7 @@ public sealed class Builder<T>
         _values = System.Array.Empty<T>();
     }
 
-    internal static IArrowType ArrowType() =>
-        typeof(T) == typeof(double) ? DoubleType.Default
-        : typeof(T) == typeof(float) ? FloatType.Default
-        : typeof(T) == typeof(long) ? Int64Type.Default
-        : typeof(T) == typeof(int) ? Int32Type.Default
-        : typeof(T) == typeof(short) ? Int16Type.Default
-        : UInt8Type.Default;
+    internal static IArrowType ArrowType() => ColumnTypes.ArrowType<T>();
 }
 
 public static class BuilderOps

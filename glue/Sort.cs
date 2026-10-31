@@ -35,6 +35,7 @@ public static class Sorting
     /// </summary>
     public static string Unsortable(IArrowArray a) =>
         a is DoubleArray or FloatArray or Int64Array or Int32Array or Int16Array or UInt8Array
+            or UInt16Array or UInt32Array or UInt64Array
             or StringArray or BooleanArray or Date32Array or TimestampArray
         || Categories.Is(a)
             ? ""
@@ -73,6 +74,9 @@ public static class Sorting
             case Int32Array i: PassNumbers(order, i, descending); break;
             case Int16Array s: PassNumbers(order, s, descending); break;
             case UInt8Array b: PassNumbers(order, b, descending); break;
+            case UInt16Array s: PassNumbers(order, s, descending); break;
+            case UInt32Array u: PassNumbers(order, u, descending); break;
+            case UInt64Array l: PassNumbers(order, l, descending); break;
             case Date32Array d: PassNumbers(order, d, descending); break;
             case TimestampArray ts: PassNumbers(order, ts, descending); break;
             case StringArray s: PassStrings(order, s, descending); break;

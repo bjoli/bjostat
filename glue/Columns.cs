@@ -225,6 +225,9 @@ public static partial class Columns
             Int32Array n => n.GetValue(i)!.Value.ToString(c),
             Int16Array s => s.GetValue(i)!.Value.ToString(c),
             UInt8Array b => b.GetValue(i)!.Value.ToString(c),
+            UInt16Array s => s.GetValue(i)!.Value.ToString(c),
+            UInt32Array n => n.GetValue(i)!.Value.ToString(c),
+            UInt64Array l => l.GetValue(i)!.Value.ToString(c),
             BooleanArray b => b.GetValue(i)!.Value ? "#t" : "#f",
             StringArray s => s.GetString(i),
             // ISO 8601, as (std datetime) writes them.

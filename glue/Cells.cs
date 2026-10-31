@@ -277,30 +277,13 @@ public static class CellsOps
     public static BjolangRuntime.Option<Cells<T>> Of<T>(IArrowArray a) =>
         Holds<T>(a) ? BjolangRuntime.Some(new Cells<T>(a)) : BjolangRuntime.None<Cells<T>>();
 
-    private static bool Holds<T>(IArrowArray a) =>
-        typeof(T) == typeof(double) ? a is DoubleArray
-        : typeof(T) == typeof(float) ? a is FloatArray
-        : typeof(T) == typeof(long) ? a is Int64Array
-        : typeof(T) == typeof(int) ? a is Int32Array
-        : typeof(T) == typeof(short) ? a is Int16Array
-        : typeof(T) == typeof(byte) ? a is UInt8Array
-        : typeof(T) == typeof(bool) ? a is BooleanArray
-        : typeof(T) == typeof(Utf8String) && (a is StringArray || Categories.Is(a));
+    private static bool Holds<T>(IArrowArray a) => ColumnTypes.Is<T>(a);
 
     /// <summary>
     /// Bjolang's name for T, for the error when a column is not of it. The
     /// argument only carries T.
     /// </summary>
-    public static string NameOf<T>(BjolangRuntime.Option<Cells<T>> _) =>
-        typeof(T) == typeof(double) ? "double"
-        : typeof(T) == typeof(float) ? "float"
-        : typeof(T) == typeof(long) ? "long"
-        : typeof(T) == typeof(int) ? "int"
-        : typeof(T) == typeof(short) ? "short"
-        : typeof(T) == typeof(byte) ? "byte"
-        : typeof(T) == typeof(bool) ? "bool"
-        : typeof(T) == typeof(Utf8String) ? "string"
-        : typeof(T).Name;
+    public static string NameOf<T>(BjolangRuntime.Option<Cells<T>> _) => ColumnTypes.Name<T>();
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static T Ref<T>(Cells<T> c, int i) => c.Ref(i);
@@ -354,6 +337,34 @@ public static class CellsOps
         while (i < length)
         {
             ulong w = a.ValidWindow(i) & b.ValidWindow(i) & c.ValidWindow(i) & d.ValidWindow(i) & Rows(length - i);
+            if (w != 0) return i + BitOperations.TrailingZeroCount(w);
+            i += 57;
+        }
+        return length;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int NextComplete<A, B, C, D, E>(Cells<A> a, Cells<B> b, Cells<C> c, Cells<D> d, Cells<E> e,
+                                                  int length, int i)
+    {
+        while (i < length)
+        {
+            ulong w = a.ValidWindow(i) & b.ValidWindow(i) & c.ValidWindow(i) & d.ValidWindow(i)
+                      & e.ValidWindow(i) & Rows(length - i);
+            if (w != 0) return i + BitOperations.TrailingZeroCount(w);
+            i += 57;
+        }
+        return length;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int NextComplete<A, B, C, D, E, F>(Cells<A> a, Cells<B> b, Cells<C> c, Cells<D> d, Cells<E> e,
+                                                     Cells<F> f, int length, int i)
+    {
+        while (i < length)
+        {
+            ulong w = a.ValidWindow(i) & b.ValidWindow(i) & c.ValidWindow(i) & d.ValidWindow(i)
+                      & e.ValidWindow(i) & f.ValidWindow(i) & Rows(length - i);
             if (w != 0) return i + BitOperations.TrailingZeroCount(w);
             i += 57;
         }

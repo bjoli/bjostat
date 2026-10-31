@@ -182,6 +182,9 @@ public static class Joins
         Int32Array x => Widen(x.Values, v => v),
         Int16Array x => Widen(x.Values, v => v),
         UInt8Array x => Widen(x.Values, v => v),
+        UInt16Array x => Widen(x.Values, v => v),
+        UInt32Array x => Widen(x.Values, v => v),
+        UInt64Array x => Widen(x.Values, (ulong v) => unchecked((long)v)),
         Date32Array x => Widen(x.Values, v => v),
         TimestampArray x => x.Values.ToArray(),
         _ => null,
@@ -436,6 +439,7 @@ public static class Joins
 
     internal static bool KeyType(IArrowType t) =>
         t is DoubleType or FloatType or Int64Type or Int32Type or Int16Type or UInt8Type
+            or UInt16Type or UInt32Type or UInt64Type
             or StringType or BooleanType or Date32Type or TimestampType
         || Categories.IsType(t);
 
@@ -462,6 +466,9 @@ public static class Joins
                 case Int32Array i: Values(v, i.Values, x => (ulong)x); break;
                 case Int16Array s: Values(v, s.Values, x => (ulong)x); break;
                 case UInt8Array b: Values(v, b.Values, x => x); break;
+                case UInt16Array s: Values(v, s.Values, x => x); break;
+                case UInt32Array u: Values(v, u.Values, x => x); break;
+                case UInt64Array l: Values(v, l.Values, x => x); break;
                 case Date32Array d: Values(v, d.Values, x => (ulong)x); break;
                 case TimestampArray t: Values(v, t.Values, x => (ulong)x); break;
                 case BooleanArray b:
@@ -531,6 +538,9 @@ public static class Joins
             (Int32Array x, Int32Array y) => (i, j) => x.Values[i] == y.Values[j],
             (Int16Array x, Int16Array y) => (i, j) => x.Values[i] == y.Values[j],
             (UInt8Array x, UInt8Array y) => (i, j) => x.Values[i] == y.Values[j],
+            (UInt16Array x, UInt16Array y) => (i, j) => x.Values[i] == y.Values[j],
+            (UInt32Array x, UInt32Array y) => (i, j) => x.Values[i] == y.Values[j],
+            (UInt64Array x, UInt64Array y) => (i, j) => x.Values[i] == y.Values[j],
             (Date32Array x, Date32Array y) => (i, j) => x.Values[i] == y.Values[j],
             (TimestampArray x, TimestampArray y) => (i, j) => x.Values[i] == y.Values[j],
             (BooleanArray x, BooleanArray y) => (i, j) => x.GetValue(i) == y.GetValue(j),
