@@ -1,0 +1,159 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/examples/shop.bjo — a year of orders of a small shop, and the
+;; questions its owner asks at the end of the year.
+;;
+;;     python3 examples/shop-data.py scratch/shop
+;;     bjo run examples/shop.bjo scratch/shop
+;;
+;; Each step is one loop over the cells, or one operation on tables.
+
+(import (std prelude))
+(import (only (std datetime) ->month))
+(import (only (std maths) round))
+(import (bjostat table))
+(import (bjostat csv))
+(import (bjostat query))
+(import (bjostat stats))
+
+(defun (main args)
+  (match (analyse (if (> (vec-length args) 0) (vec-ref args 0) "scratch/shop"))
+    ((Ok _) 0)
+    ((Err e) (println (displayed e)) 1)))
+
+;; To two decimals, for the printed numbers.
+(: (-> double string))
+(defun (two-decimals x) (double->string (/ (round (* x 100.0)) 100.0)))
+
+(: (-> (Option double) string))
+(defun (shown x)
+  (match x ((Some v) (two-decimals v)) (None "-")))
+
+;; The discount code of an order, or "(none)".
+(: (-> (Option string) string))
+(defun (code-name c*)
+  (match c* ((Some c) c) (None "(none)")))
+
+(: (-> string (Result TableError Unit)))
+(defun (analyse dir)
+  (def (Ok orders) (read-csv (str dir "/orders.csv")) :propagate)
+  (def (Ok customers) (read-csv (str dir "/customers.csv")) :propagate)
+
+  ;; 1. What is in the files: the types read-csv guessed, and a summary of
+  ;; each column, as R's summary().
+  (println (str (int->string (table-row-count orders)) " orders, "
+                (int->string (table-row-count customers)) " customers.\n"))
+  (println (table->string orders #:rows 3))
+  (println (table->string (table-summary orders) #:digits 2))
+
+  ;; 2. A new column: the revenue of each order.
+  (def* ((Ok quantity) (column-as orders "quantity") :propagate)
+        ((Ok price) (column-as orders "unit_price") :propagate))
+  (def (Ok sales)
+    (table-with orders "revenue"
+                (loop (:for q* quantity) (:for p* price)
+                      (:acc (column-building/option
+                              (match (Tuple q* p*)
+                                ((Tuple (Some q) (Some p)) (Some (* (cast double (: q long)) (: p double))))
+                                (_ None))))))
+    :propagate)
+
+  ;; 3. Revenue by country: each order joined to its customer, then
+  ;; grouped by the customer's country, the largest first.
+  (def (Ok joined) (inner-join sales customers ["customer"]) :propagate)
+  (def* ((Ok country) (column-as joined "country") :propagate)
+        ((Ok revenue) (column-as joined "revenue") :propagate))
+  (def countries (group-index))
+  (def (Ok by-country)
+    (loop (:for c* country) (:for r* revenue)
+          (:when-let (Some c) c*) (:when-let (Some r) r*)
+          (:let g (group-of! countries (: c string)))
+          (:acc total (summing-by countries (Tuple g (: r double))))
+          (:acc n (counting-by countries (Tuple g r)))
+          (:acc average (mean-by countries (Tuple g r)))
+          => (groups->table countries "country"
+                            [(Tuple "revenue" total) (Tuple "orders" n) (Tuple "mean order" average)]))
+    :propagate)
+  (def (Ok by-country-sorted) (table-sort by-country [(descending "revenue")]) :propagate)
+  (println "Revenue by country:")
+  (println (table->string by-country-sorted #:digits 0))
+
+  ;; 4. Revenue by month, from the column of dates.
+  (def (Ok days) (date-cells sales "day") :propagate)
+  (def (Ok sales-revenue) (column-as sales "revenue") :propagate)
+  (def months (group-index))
+  (def (Ok by-month)
+    (loop (:for d* days) (:for r* sales-revenue)
+          (:when-let (Some d) d*) (:when-let (Some r) r*)
+          (:let g (group-of! months (->month d)))
+          (:acc total (summing-by months (Tuple g (: r double))))
+          (:acc n (counting-by months (Tuple g r)))
+          => (groups->table months "month" [(Tuple "revenue" total) (Tuple "orders" n)]))
+    :propagate)
+  (def (Ok by-month-sorted) (table-sort by-month [(ascending "month")]) :propagate)
+  (println "Revenue by month:")
+  (println (table->string by-month-sorted #:rows 12 #:digits 0))
+
+  ;; 5. A typical order. The mean is above the median when a few large
+  ;; orders pull it up.
+  (def order-values
+    (loop (:for r* sales-revenue) (:when-let (Some r) r*)
+          (:acc mean (mean (: r double)))
+          (:acc qs (quantiles [0.25 0.5 0.75 0.9 0.99] r))
+          => (Tuple mean qs)))
+  (def (Tuple order-mean order-quantiles) order-values)
+  (println (str "A typical order: the mean is " (shown order-mean) "."))
+  (match order-quantiles
+    ((Some qs) (println (str "Quartiles " (two-decimals (vec-ref qs 0)) ", "
+                             (two-decimals (vec-ref qs 1)) ", " (two-decimals (vec-ref qs 2))
+                             "; 90% of orders are below " (two-decimals (vec-ref qs 3))
+                             " and 99% below " (two-decimals (vec-ref qs 4)) ".\n")))
+    (None unit))
+
+  ;; 6. Do discount codes make larger orders? An empty cell is a null: the
+  ;; order had no code.
+  (def (Ok codes) (column-as sales "code") :propagate)
+  (def by-code
+    (loop (:for c* codes) (:for r* sales-revenue)
+          (:when-let (Some r) r*)
+          (:let code (code-name c*))
+          (:acc (grouping (pairing mean standard-deviation) (Tuple code (Tuple (: r double) r))))))
+  (println "Order value by discount code (mean, standard deviation):")
+  (loop (:for (Tuple code agg) by-code)
+        (:let (Tuple m sd) agg)
+        (:do (println (str "  " code ": " (shown m) ", " (shown sd)))))
+  (println "")
+
+  ;; 7. Is a lower price met with a larger quantity? Within each product,
+  ;; the price differs by country.
+  (def (Ok products) (column-as sales "product") :propagate)
+  (def by-product
+    (loop (:for o* products) (:for q* quantity) (:for p* price)
+          (:when-let (Some o) o*) (:when-let (Some q) q*) (:when-let (Some p) p*)
+          (:acc (grouping correlation (Tuple (: o string) (Tuple (: p double) (cast double (: q long))))))))
+  (println "Correlation of unit price and quantity, by product:")
+  (loop (:for (Tuple product r) by-product)
+        (:do (println (str "  " product ": " (shown r)))))
+  (println "")
+
+  ;; 8. The best customers: revenue by customer, the five largest, with
+  ;; their country.
+  (def (Ok who) (column-as sales "customer") :propagate)
+  (def by-customer
+    (loop (:for c* who) (:for r* sales-revenue)
+          (:when-let (Some c) c*) (:when-let (Some r) r*)
+          (:acc (grouping summing (Tuple (: c string) (: r double))))))
+  (def (Ok spend) (map->table by-customer "customer" "revenue") :propagate)
+  (def (Ok ranked) (table-sort spend [(descending "revenue")]) :propagate)
+  (def (Ok best) (left-join (table-slice ranked #:to 5) customers ["customer"]) :propagate)
+  (println "The five best customers:")
+  (println (table->string best #:digits 0))
+
+  ;; 9. Customers who signed up and never ordered: rows of customers with
+  ;; no match in orders. Mail them a code?
+  (def (Ok silent) (anti-join customers orders ["customer"]) :propagate)
+  (println (str (int->string (table-row-count silent)) " customers never ordered. The first:"))
+  (println (table->string silent #:rows 5))
+  (Ok unit))
