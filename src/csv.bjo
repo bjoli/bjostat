@@ -98,6 +98,13 @@
     (Bool (Some kind-bool))
     ;; Read as strings, then made a category.
     (Category (Some kind-string))
+    ;; The narrow and unsigned widths have a column but no field parse here:
+    ;; read the column as a long, and make the width in a loop.
+    (Short None)
+    (Byte None)
+    (UShort None)
+    (UInt None)
+    (ULong None)
     ((Other _) None)))
 
 (: (-> string (Result TableError %a)))

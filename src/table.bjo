@@ -37,7 +37,7 @@
   ;; Cells: a column at the type its use gives
   Cells column-as cells-ref cells-get cells-valid? cells-length cells-null-count
   DateCells DateTimeCells InstantCells date-cells datetime-cells instant-cells
-  NotNull skip-nulls CompleteRows RowColumns complete-rows
+  RowSource NotNull skip-nulls CompleteRows RowColumns complete-rows
   cells-window window-rows lowest-bit
 
   ;; Aggregates
@@ -58,7 +58,12 @@
   read-arrow write-arrow
 
   ;; Printing
-  table->string)
+  table->string
+
+  ;; A script's unwrapper: the value, or the panic of the Err. The `of ...`
+  ;; family that once sat here was a stopgap; a `:panic` failure part on `def`
+  ;; is where this belongs.
+  or-panic)
 
 (import (std prelude))
 (import (only (std datetime) Date DateTime Instant unix-days->date unix-microseconds->instant
@@ -117,6 +122,11 @@
   (clr-next-complete-3 (: Bjostat.CellsOps.NextComplete (-> (ClrCells %a) (ClrCells %b) (ClrCells %c) int int int)))
   (clr-next-complete-4 (: Bjostat.CellsOps.NextComplete
                           (-> (ClrCells %a) (ClrCells %b) (ClrCells %c) (ClrCells %d) int int int)))
+  (clr-next-complete-5 (: Bjostat.CellsOps.NextComplete
+                          (-> (ClrCells %a) (ClrCells %b) (ClrCells %c) (ClrCells %d) (ClrCells %e) int int int)))
+  (clr-next-complete-6 (: Bjostat.CellsOps.NextComplete
+                          (-> (ClrCells %a) (ClrCells %b) (ClrCells %c) (ClrCells %d) (ClrCells %e)
+                              (ClrCells %f) int int int)))
   (clr-day-cells (: Bjostat.TimeCells.Days (-> AnyColumn (Option (ClrCells int)))))
   (clr-micro-cells (: Bjostat.TimeCells.Micros (-> AnyColumn bool (Option (ClrCells long)))))
 
@@ -179,6 +189,17 @@
 (: (-> string (Result TableError %a)))
 (defun (refuse message) (Err (TableError (message message))))
 
+;; The value, or a panic carrying the message the Err would have given: for a
+;; script, where a misspelt column is a bug and not a case to handle. A chain
+;; of steps that can fail is threaded with `try->` and unwrapped once with
+;; this, or a `def` takes the `:panic` failure part, which does the same where
+;; the language has it. The message is the one the Err has.
+(: (-> (Result TableError %a) %a))
+(defun (or-panic r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
 ;; The type of a column's values. `Dates`, `DateTimes` and `Instants` are
 ;; columns of the types Date, DateTime and Instant of (std datetime): Arrow's
 ;; Date32, timestamps with no time zone, and timestamps with one. `Bool` is
@@ -187,8 +208,9 @@
 ;; of int codes and string levels; its cells are strings. `Other` is any
 ;; Arrow type this module does not take apart yet, by Arrow's name for it:
 ;; Decimal and so on. A table holds it, prints it and writes it.
-(type (: ColumnType (Union Double Float Long Int String Bool Category Dates DateTimes Instants
-                                 (: Other string))))
+(type (: ColumnType (Union Double Float Long Int Short Byte UShort UInt ULong
+                               String Bool Category Dates DateTimes Instants
+                               (: Other string))))
 
 (: (-> AnyColumn ColumnType))
 (defun (type-of-column c)
@@ -197,6 +219,11 @@
     ("Float" Float)
     ("Int64" Long)
     ("Int32" Int)
+    ("Int16" Short)
+    ("UInt8" Byte)
+    ("UInt16" UShort)
+    ("UInt32" UInt)
+    ("UInt64" ULong)
     ("String" String)
     ("Boolean" Bool)
     ("Category" Category)
@@ -212,6 +239,11 @@
     (Float "float")
     (Long "long")
     (Int "int")
+    (Short "short")
+    (Byte "byte")
+    (UShort "ushort")
+    (UInt "uint")
+    (ULong "ulong")
     (String "string")
     (Bool "bool")
     (Category "category")
@@ -424,16 +456,78 @@
   (defun (iterable-next c i) (+ i 1))
   (defun (count c) (clr-cells-length (record-ref c micros))))
 
-;; The values of cells that are not null, as Julia's skipmissing: for a loop
+;; A column of cells of any of the kinds this module reads: the four things a
+;; null-skipping walk asks of it. `skip-nulls` and `complete-rows` are written
+;; over this, so a column of dates or timestamps is skipped by nulls and joined
+;; with the rest of a row as a column of numbers is, and each answers its own
+;; kind of value: a double, a Date, a DateTime, an Instant.
+;;
+;; `source-cells` is the Arrow cells under the kinds that convert, which is
+;; what the window-at-a-time walks take: the valid bits do not depend on how a
+;; value is read.
+(def/trait (RowSource %c)
+  (type %cell)
+  ;; The Arrow cells under it, and the type of the numbers in them.
+  (type %read)
+  (: source-length (-> %c int))
+  (: source-null-count (-> %c int))
+  (: source-valid? (-> %c int bool))
+  (: source-ref (-> %c int %cell))
+  (: source-next-valid (-> %c int int))
+  (: source-cells (-> %c (ClrCells %read))))
+
+(impl (RowSource (Cells %a))
+  (type %cell %a)
+  (type %read %a)
+  (defun (source-length c) (cells-length c))
+  (defun (source-null-count c) (cells-null-count c))
+  (defun (source-valid? c i) (cells-valid? c i))
+  (defun (source-ref c i) (cells-ref c i))
+  (defun (source-next-valid c i) (clr-cells-next-valid (record-ref c clr) i))
+  (defun (source-cells c) (record-ref c clr)))
+
+(impl (RowSource DateCells)
+  (type %cell Date)
+  (type %read int)
+  (defun (source-length c) (clr-cells-length (record-ref c days)))
+  (defun (source-null-count c) (clr-cells-null-count (record-ref c days)))
+  (defun (source-valid? c i) (clr-cells-valid? (record-ref c days) i))
+  (defun (source-ref c i)
+    (option-ref (time-cell (record-ref c days) i
+                           (fun (n) (in-calendar (unix-days->date (cast long n)))))))
+  (defun (source-next-valid c i) (clr-cells-next-valid (record-ref c days) i))
+  (defun (source-cells c) (record-ref c days)))
+
+(impl (RowSource DateTimeCells)
+  (type %cell DateTime)
+  (type %read long)
+  (defun (source-length c) (clr-cells-length (record-ref c micros)))
+  (defun (source-null-count c) (clr-cells-null-count (record-ref c micros)))
+  (defun (source-valid? c i) (clr-cells-valid? (record-ref c micros) i))
+  (defun (source-ref c i)
+    (option-ref (time-cell (record-ref c micros) i
+                           (fun (us) (instant->utc-datetime (in-calendar (unix-microseconds->instant us)))))))
+  (defun (source-next-valid c i) (clr-cells-next-valid (record-ref c micros) i))
+  (defun (source-cells c) (record-ref c micros)))
+
+(impl (RowSource InstantCells)
+  (type %cell Instant)
+  (type %read long)
+  (defun (source-length c) (clr-cells-length (record-ref c micros)))
+  (defun (source-null-count c) (clr-cells-null-count (record-ref c micros)))
+  (defun (source-valid? c i) (clr-cells-valid? (record-ref c micros) i))
+  (defun (source-ref c i)
+    (option-ref (time-cell (record-ref c micros) i
+                           (fun (us) (in-calendar (unix-microseconds->instant us))))))
+  (defun (source-next-valid c i) (clr-cells-next-valid (record-ref c micros) i))
+  (defun (source-cells c) (record-ref c micros)))
+
+;; The values of a column that are not null, as Julia's skipmissing: for a loop
 ;; over one column. Next to another column it would not stay on its row.
-(type (: (NotNull %a) #:opaque (Record (: cells (Cells %a)))))
+(type (: (NotNull %c) #:opaque (Record (: source %c))))
 
-(: (-> (Cells %a) (NotNull %a)))
-(defun (skip-nulls c) (NotNull (cells c)))
-
-;; The first row from `i` on that is not null, or the length.
-(: (-> (Cells %a) int int))
-(defun (next-valid c i) (clr-cells-next-valid (record-ref c clr) i))
+(: (-> %c (NotNull %c)) (where (RowSource %c)))
+(defun (skip-nulls c) (NotNull (source c)))
 
 ;; The valid bits of the `window-rows` rows from `i` on, of the rows before
 ;; `length`, as the bits of a long: bit 0 is row i. 0 from `length` on. A loop
@@ -446,14 +540,15 @@
 (: window-rows int)
 (def window-rows 57)
 
-(impl (Iterable (NotNull %a))
-  (type %elem %a)
+(impl (Iterable (NotNull %c)) (where (RowSource %c))
+  (type %elem (assoc RowSource cell %c))
   (type %cursor int)
-  (defun (iterable-start s) (next-valid (record-ref s cells) 0))
-  (defun (iterable-done? s i) (>= i (cells-length (record-ref s cells))))
-  (defun (iterable-current s i) (cells-ref (record-ref s cells) i))
-  (defun (iterable-next s i) (next-valid (record-ref s cells) (+ i 1)))
-  (defun (count s) (- (cells-length (record-ref s cells)) (cells-null-count (record-ref s cells)))))
+  (defun (iterable-start s) (source-next-valid (record-ref s source) 0))
+  (defun (iterable-done? s i) (>= i (source-length (record-ref s source))))
+  (defun (iterable-current s i) (source-ref (record-ref s source) i))
+  (defun (iterable-next s i) (source-next-valid (record-ref s source) (+ i 1)))
+  (defun (count s)
+    (- (source-length (record-ref s source)) (source-null-count (record-ref s source)))))
 
 ;; The rows of several columns where no column is null, as R's
 ;; complete.cases and na.omit: each row is a Tuple of the values, so that a
@@ -463,7 +558,8 @@
 ;;     (loop (:for (Tuple f m) (complete-rows (Tuple flipper mass)))
 ;;           (:acc (correlation (Tuple (cast double f) (cast double m)))))
 ;;
-;; It takes a Tuple of 2, 3 or 4 columns of cells. Columns of different
+;; It takes a Tuple of 2 to 6 columns: of cells, or of the kinds of cells that
+;; convert (`date-cells`, `datetime-cells`, `instant-cells`), mixed freely. Columns of different
 ;; lengths give the rows of the shortest. The next complete row is found in
 ;; the valid bitmaps, 57 rows at a time (CellsOps.NextComplete), so many
 ;; nulls cost little, and a loop over it is as fast as the same loop with
@@ -485,60 +581,115 @@
   ;; shortest column.
   (: row-next-complete (-> %t int int int)))
 
-(impl (RowColumns (Tuple (Cells %a) (Cells %b)))
-  (type %row (Tuple %a %b))
+(impl (RowColumns (Tuple %a %b)) (where (RowSource %a) (RowSource %b))
+  (type %row (Tuple (assoc RowSource cell %a) (assoc RowSource cell %b)))
   (defun (row-columns-length t)
     (def (a b) t)
-    (min (cells-length a) (cells-length b)))
+    (min (source-length a) (source-length b)))
   (defun (row-columns-nulls? t)
     (def (a b) t)
-    (or (> (cells-null-count a) 0) (> (cells-null-count b) 0)))
+    (or (> (source-null-count a) 0) (> (source-null-count b) 0)))
   (defun (row-complete? t i)
     (def (a b) t)
-    (and (cells-valid? a i) (cells-valid? b i)))
+    (and (source-valid? a i) (source-valid? b i)))
   (defun (row-values t i)
     (def (a b) t)
-    (Tuple (cells-ref a i) (cells-ref b i)))
+    (Tuple (source-ref a i) (source-ref b i)))
   (defun (row-next-complete t length i)
     (def (a b) t)
-    (clr-next-complete-2 (record-ref a clr) (record-ref b clr) length i)))
+    (clr-next-complete-2 (source-cells a) (source-cells b) length i)))
 
-(impl (RowColumns (Tuple (Cells %a) (Cells %b) (Cells %c)))
-  (type %row (Tuple %a %b %c))
+(impl (RowColumns (Tuple %a %b %c)) (where (RowSource %a) (RowSource %b) (RowSource %c))
+  (type %row (Tuple (assoc RowSource cell %a) (assoc RowSource cell %b) (assoc RowSource cell %c)))
   (defun (row-columns-length t)
     (def (a b c) t)
-    (min (cells-length a) (min (cells-length b) (cells-length c))))
+    (min (source-length a) (min (source-length b) (source-length c))))
   (defun (row-columns-nulls? t)
     (def (a b c) t)
-    (or (> (cells-null-count a) 0) (> (cells-null-count b) 0) (> (cells-null-count c) 0)))
+    (or (> (source-null-count a) 0) (> (source-null-count b) 0) (> (source-null-count c) 0)))
   (defun (row-complete? t i)
     (def (a b c) t)
-    (and (cells-valid? a i) (cells-valid? b i) (cells-valid? c i)))
+    (and (source-valid? a i) (source-valid? b i) (source-valid? c i)))
   (defun (row-values t i)
     (def (a b c) t)
-    (Tuple (cells-ref a i) (cells-ref b i) (cells-ref c i)))
+    (Tuple (source-ref a i) (source-ref b i) (source-ref c i)))
   (defun (row-next-complete t length i)
     (def (a b c) t)
-    (clr-next-complete-3 (record-ref a clr) (record-ref b clr) (record-ref c clr) length i)))
+    (clr-next-complete-3 (source-cells a) (source-cells b) (source-cells c) length i)))
 
-(impl (RowColumns (Tuple (Cells %a) (Cells %b) (Cells %c) (Cells %d)))
-  (type %row (Tuple %a %b %c %d))
+(impl (RowColumns (Tuple %a %b %c %d))
+  (where (RowSource %a) (RowSource %b) (RowSource %c) (RowSource %d))
+  (type %row (Tuple (assoc RowSource cell %a) (assoc RowSource cell %b)
+                    (assoc RowSource cell %c) (assoc RowSource cell %d)))
   (defun (row-columns-length t)
     (def (a b c d) t)
-    (min (min (cells-length a) (cells-length b)) (min (cells-length c) (cells-length d))))
+    (min (min (source-length a) (source-length b)) (min (source-length c) (source-length d))))
   (defun (row-columns-nulls? t)
     (def (a b c d) t)
-    (or (> (cells-null-count a) 0) (> (cells-null-count b) 0)
-        (> (cells-null-count c) 0) (> (cells-null-count d) 0)))
+    (or (> (source-null-count a) 0) (> (source-null-count b) 0)
+        (> (source-null-count c) 0) (> (source-null-count d) 0)))
   (defun (row-complete? t i)
     (def (a b c d) t)
-    (and (cells-valid? a i) (cells-valid? b i) (cells-valid? c i) (cells-valid? d i)))
+    (and (source-valid? a i) (source-valid? b i) (source-valid? c i) (source-valid? d i)))
   (defun (row-values t i)
     (def (a b c d) t)
-    (Tuple (cells-ref a i) (cells-ref b i) (cells-ref c i) (cells-ref d i)))
+    (Tuple (source-ref a i) (source-ref b i) (source-ref c i) (source-ref d i)))
   (defun (row-next-complete t length i)
     (def (a b c d) t)
-    (clr-next-complete-4 (record-ref a clr) (record-ref b clr) (record-ref c clr) (record-ref d clr) length i)))
+    (clr-next-complete-4 (source-cells a) (source-cells b) (source-cells c) (source-cells d) length i)))
+
+(impl (RowColumns (Tuple %a %b %c %d %e))
+  (where (RowSource %a) (RowSource %b) (RowSource %c) (RowSource %d) (RowSource %e))
+  (type %row (Tuple (assoc RowSource cell %a) (assoc RowSource cell %b)
+                    (assoc RowSource cell %c) (assoc RowSource cell %d)
+                    (assoc RowSource cell %e)))
+  (defun (row-columns-length t)
+    (def (a b c d e) t)
+    (min (min (source-length a) (source-length b))
+         (min (source-length c) (min (source-length d) (source-length e)))))
+  (defun (row-columns-nulls? t)
+    (def (a b c d e) t)
+    (or (> (source-null-count a) 0) (> (source-null-count b) 0)
+        (> (source-null-count c) 0) (> (source-null-count d) 0) (> (source-null-count e) 0)))
+  (defun (row-complete? t i)
+    (def (a b c d e) t)
+    (and (source-valid? a i) (source-valid? b i) (source-valid? c i)
+         (source-valid? d i) (source-valid? e i)))
+  (defun (row-values t i)
+    (def (a b c d e) t)
+    (Tuple (source-ref a i) (source-ref b i) (source-ref c i) (source-ref d i) (source-ref e i)))
+  (defun (row-next-complete t length i)
+    (def (a b c d e) t)
+    (clr-next-complete-5 (source-cells a) (source-cells b) (source-cells c) (source-cells d)
+                         (source-cells e) length i)))
+
+(impl (RowColumns (Tuple %a %b %c %d %e %f))
+  (where (RowSource %a) (RowSource %b) (RowSource %c) (RowSource %d) (RowSource %e) (RowSource %f))
+  (type %row (Tuple (assoc RowSource cell %a) (assoc RowSource cell %b)
+                    (assoc RowSource cell %c) (assoc RowSource cell %d)
+                    (assoc RowSource cell %e) (assoc RowSource cell %f)))
+  (defun (row-columns-length t)
+    (def (a b c d e f) t)
+    (min (min (source-length a) (source-length b))
+         (min (min (source-length c) (source-length d))
+              (min (source-length e) (source-length f)))))
+  (defun (row-columns-nulls? t)
+    (def (a b c d e f) t)
+    (or (> (source-null-count a) 0) (> (source-null-count b) 0)
+        (> (source-null-count c) 0) (> (source-null-count d) 0)
+        (> (source-null-count e) 0) (> (source-null-count f) 0)))
+  (defun (row-complete? t i)
+    (def (a b c d e f) t)
+    (and (source-valid? a i) (source-valid? b i) (source-valid? c i)
+         (source-valid? d i) (source-valid? e i) (source-valid? f i)))
+  (defun (row-values t i)
+    (def (a b c d e f) t)
+    (Tuple (source-ref a i) (source-ref b i) (source-ref c i) (source-ref d i)
+           (source-ref e i) (source-ref f i)))
+  (defun (row-next-complete t length i)
+    (def (a b c d e f) t)
+    (clr-next-complete-6 (source-cells a) (source-cells b) (source-cells c) (source-cells d)
+                         (source-cells e) (source-cells f) length i)))
 
 (: (-> %t (CompleteRows %t)) (where (RowColumns %t)))
 (defun (complete-rows columns)
@@ -626,10 +777,17 @@
                            (vec->array (vec-map (fun (r) (match r ((Ok c) c) ((Err _) (panic! "unreachable")))) cols))
                            (table-row-count t))))))
 
-;; The rows from `#:from` up to `#:to`, without a copy.
-(: (-> Table (#:from int) (#:to int) Table))
+;; The rows from `#:from` up to `#:to`, without a copy. A range outside the
+;; table, or one that ends before it starts, is an Err: Arrow's own slice
+;; throws, and every other table operation answers a Result.
+(: (-> Table (#:from int) (#:to int) (Result TableError Table)))
 (defun (table-slice t #:from 0 #:to (table-row-count t))
-  (clr-slice t from to))
+  (def n (table-row-count t))
+  (cond
+    ((< from 0) (refuse (str "a slice from " (int->string from) " starts before the first row.")))
+    ((> to n) (refuse (str "a slice to " (int->string to) " ends past the last of " (int->string n) " rows.")))
+    ((> from to) (refuse (str "a slice from " (int->string from) " to " (int->string to) " ends before it starts.")))
+    (else (Ok (clr-slice t from to)))))
 
 ;; A column to sort by, and the direction.
 (type (: SortKey (Union (: ascending string) (: descending string))))
