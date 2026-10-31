@@ -44,7 +44,7 @@ a copy.
 | ~(array->string-column a [#:valid v])~ | The same, of strings |
 | ~(named name c)~, ~(named-strings name c)~, ~(make-table cols)~ | A table of columns |
 | ~(named-any name c)~ | The same, for an Arrow column of any type |
-| ~(table-select t names)~, ~(table-slice t #:from #:to)~ | Part of a table, without a copy |
+| ~(table-select t names)~, ~(table-slice t #:from #:to)~ | Part of a table, without a copy; a range outside the table is an ~Err~ |
 | ~(table-sort t [(ascending name) (descending name) …])~ | The rows in the order of the keys, as R's ~order~: stable, nulls last |
 | ~(date-cells t name)~, ~datetime-cells~, ~instant-cells~ | A column of dates or timestamps; a loop over it gets ~Date~, ~DateTime~ or ~Instant~ of ~(std datetime)~ |
 | ~(inner-join a b keys)~, ~left-join~, ~semi-join~, ~anti-join~ | The rows whose keys are equal, as dplyr's joins: left order, two nulls equal, ~.x~ and ~.y~ on shared names |
@@ -67,8 +67,15 @@ over ~column-values~ reads ~column-valid?~ when ~column-null-count~ is not 0.
 .NET's ~TensorPrimitives~, which is vectorized. A loop of your own over
 ~column-values~ is a loop over a span, as fast as one over an array.
 
-*Types.* A column of ~double~, ~float~, ~long~, ~int~ or ~string~ can be
-taken out typed. A column of dates holds days since 1970-01-01, and one of
+*Types.* A column of ~double~, ~float~, ~long~, ~int~, ~short~, ~byte~,
+~ushort~, ~uint~, ~ulong~, ~bool~ or ~string~ can be taken out typed and made
+by a loop: those are the types a column holds, and the schema names each one
+(~short~, ~byte~, ~ushort~, ~uint~, ~ulong~), prints its values as numbers,
+sorts and joins by it and summarises it. A column of another type — a
+~decimal~, an ~int128~, a ~bigint~ — cannot be made, and the message says why
+and what to write instead: a ~decimal~ carries a scale of its own and an Arrow
+decimal column has one, and an Arrow integer has no more digits than
+decimal128. A column of dates holds days since 1970-01-01, and one of
 timestamps microseconds since 1970-01-01T00:00, as in Arrow and Polars; its
 cells are ~Date~, ~DateTime~ (no time zone) or ~Instant~ (a time zone) of
 ~(std datetime)~, made with ~unix-days->date~ and
@@ -246,10 +253,18 @@ that each is named once:
       ((Ok seen) (date-cells t "first seen") :propagate))
 #+END_SRC
 
-Nothing is guessed: each column has the type written, and a column the
-table does not have, or one of another type, is an ~Err~ of the function
-around it. The types are ~double~, ~float~, ~long~, ~int~, ~string~,
-~bool~, ~date~, ~datetime~ and ~instant~.
+A clause is ~(name type)~, ~(name "column" type)~, or just ~name~ for a column
+named as the binding whose type the use decides — the same "the use decides"
+that ~col~ of ~(bjostat query)~ does, checked once where the column is read. A
+name nothing uses leaves the type undecided, and the error says so. The types
+are ~double~, ~float~, ~long~, ~int~, ~string~, ~bool~, ~date~, ~datetime~ and
+~instant~; a column the table does not have, or one of another type, is an
+~Err~ of the function around it.
+
+~columns/panic~ is the same for a function that does not return a ~Result~: it
+binds each column or panics with the message the ~Err~ would have given. A
+script uses it, or threads a chain of steps that can fail with ~try->~ and
+unwraps the chain once with ~or-panic~.
 
 ** The module (bjostat query)
 
@@ -272,6 +287,7 @@ The columns are found first, where a misspelt name is an ~Err~:
 | ~(column-building x)~, ~(column-building/option o)~ | A column, a null at each ~None~ |
 | ~(dates-building o)~, ~datetimes-building~, ~instants-building~ | A column of dates or timestamps of ~(std datetime)~ values, a null at each ~None~ |
 | ~(group-of! groups key)~ and ~summing-by~, ~counting-by~, ~min-by~, ~max-by~, ~mean-by~ | Aggregates by group, ~groups->table~ the table of them |
+| ~groups->table~ and the key it makes | A key is a value a column can hold, which is what the trait ~ColumnValue~ says: the numbers, a string, a bool, a ~Date~, a ~DateTime~ or an ~Instant~. Group by a date and the table's column of keys is a column of dates. A ~Cells~ is not one, so a column passed where the row's value was meant is refused when the program is compiled, not when it runs. |
 | ~(category-groups t name)~ | The groups of a category's levels, so that a row's code is its group, with no hash |
 | ~(string-groups t name)~ | The groups of a column of strings, in the order first seen, and the group of each row: each string numbered once, in parts on the workers, not hashed for each row as ~group-of!~ does |
 | ~(grouping c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |
@@ -296,13 +312,15 @@ nulls:
 #+BEGIN_SRC scheme
 ;; The values of one column that are not null, as Julia's skipmissing
 (loop (:for p (skip-nulls price)) (:acc (summing p)))
-;; The rows where no column is null, as R's complete.cases: 2, 3 or 4 columns
+;; The rows where no column is null, as R's complete.cases: 2 to 6 columns
 (loop (:for (Tuple p q) (complete-rows (Tuple price qty)))
       (:acc (summing (* p (cast double q)))))
 #+END_SRC
 
 Do not put two ~skip-nulls~ side by side: each leaves out its own nulls, so
-the columns would not stay on one row. ~complete-rows~ is for that. Columns
+the columns would not stay on one row. ~complete-rows~ is for that, and it
+takes columns of dates and timestamps as it takes columns of numbers: a
+~date-cells~ column gives a ~Date~, and the kinds mix freely. Columns
 of two lengths give the rows of the shorter.
 
 They are as fast as ~:when-let~ where there are nulls. Where there are none,
