@@ -1,0 +1,86 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; (bjostat loops): loop clauses over cells.
+;;
+;; `in-complete` is the rows of one or more columns where no column is null,
+;; as `complete-rows`, but as clauses of the loop rather than an Iterable:
+;;
+;;     (loop (:for (Tuple p q) (in-complete price qty))
+;;           (:acc (correlation (Tuple p q))))
+;;
+;; It reads the valid bits of 57 rows of each column at a time, ANDs them,
+;; and steps from one set bit to the next, all in the loop's own code: no
+;; call in the step, which would make .NET keep the loop's sums in memory.
+;; The driver steps once for each complete row and for nothing else, so a
+;; driver beside it steps with the rows.
+;; A column of cells is any (Cells %a); the columns may be of different types.
+
+(import (std syntax-match))
+(import (bjostat table))
+
+(export in-complete)
+
+;; The window of rows from `b` on where every column is valid: the AND of the
+;; columns' windows.
+(: (-> (List Syntax) Syntax Syntax Syntax))
+(defun (window-of cols n b)
+  (match cols
+    ((Cons c Nil) #'(cells-window ,c ,n ,b))
+    ((Cons c rest) #'(bitwise-and (cells-window ,c ,n ,b) ,(window-of rest n b)))
+    (Nil (SInt "0"))))
+
+;; The length of the shortest column.
+(: (-> (List Syntax) Syntax))
+(defun (shortest cols)
+  (match cols
+    ((Cons c Nil) #'(cells-length ,c))
+    ((Cons c rest) #'(min (cells-length ,c) ,(shortest rest)))
+    (Nil (SInt "0"))))
+
+;; The values of the row, one or a Tuple of them.
+(: (-> (List Syntax) Syntax Syntax))
+(defun (row-of cols i)
+  (match cols
+    ((Cons c Nil) #'(cells-ref ,c ,i))
+    (_ #'(Tuple ,@(list-map (fun (c) #'(cells-ref ,c ,i)) cols)))))
+
+;; One name for each column, which hygiene renames as it does the rest.
+(: (-> (List Syntax) (List Syntax)))
+(defun (column-names columns)
+  (loop (:for _ columns)
+        (:with k 0 (+ k 1))
+        (:acc out (listing (SSym (string->symbol (str "column" (number->string k))))))
+        => out))
+
+(def/loop-clause (in-complete form inject compare)
+  (syntax-match form
+    ((_ pat (_ column ...))
+     (begin
+       (def names (column-names column))
+       (def n #'n)
+       (def base #'base)
+       (def m #'m)
+       ;; The first window from row `from` on with a complete row, as the
+       ;; Tuple of its first row and its bits; (Tuple n 0L) when there is none.
+       ;; A loop in the driver's own code, so that the step makes no call.
+       (defun (window-from from)
+         (def b #'b)
+         (def w #'w)
+         #'(loop (:with ,b ,from (+ ,b window-rows) (>= ,b ,n))
+                 (:let ,w ,(window-of names n b))
+                 (:finish (not (= ,w 0L)) (Tuple ,b ,w))
+                 => (Tuple ,n 0L)))
+       #'(begin
+           ,@{listing #'(:prologue ,name ,c) (:for name names) (:for c column)}
+           (:prologue ,n ,(shortest names))
+           ;; base is the first row of the window, m its complete rows left:
+           ;; the row is the lowest bit. A step clears it, or finds the next
+           ;; window with a complete row.
+           (:with (Tuple ,base ,m) ,(window-from #'0)
+                  (let ((rest (bitwise-and ,m (- ,m 1L))))
+                    (if (= rest 0L) ,(window-from #'(+ ,base window-rows)) (Tuple ,base rest)))
+                  (>= ,base ,n))
+           (:let ,pat ,(row-of names #'(+ ,base (lowest-bit ,m)))))))
+    (bad (syntax-error bad "(:for pattern (in-complete column ...)): one or more columns of cells."))))

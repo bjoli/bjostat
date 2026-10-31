@@ -38,6 +38,7 @@
   Cells column-as cells-ref cells-get cells-valid? cells-length cells-null-count
   DateCells DateTimeCells InstantCells date-cells datetime-cells instant-cells
   NotNull skip-nulls CompleteRows RowColumns complete-rows
+  cells-window window-rows lowest-bit
 
   ;; Aggregates
   column-sum column-mean column-min column-max column-count
@@ -110,6 +111,8 @@
   ;; The next row with a value, of one column or of all of 2, 3 or 4, found
   ;; 57 rows at a time in the valid bitmaps.
   (clr-cells-next-valid (: Bjostat.CellsOps.NextValid (-> (ClrCells %a) int int)))
+  (clr-cells-window (: Bjostat.CellsOps.Window (-> (ClrCells %a) int int long)))
+  (lowest-bit (: Bjostat.CellsOps.LowestBit (-> long int)))
   (clr-next-complete-2 (: Bjostat.CellsOps.NextComplete (-> (ClrCells %a) (ClrCells %b) int int int)))
   (clr-next-complete-3 (: Bjostat.CellsOps.NextComplete (-> (ClrCells %a) (ClrCells %b) (ClrCells %c) int int int)))
   (clr-next-complete-4 (: Bjostat.CellsOps.NextComplete
@@ -431,6 +434,17 @@
 ;; The first row from `i` on that is not null, or the length.
 (: (-> (Cells %a) int int))
 (defun (next-valid c i) (clr-cells-next-valid (record-ref c clr) i))
+
+;; The valid bits of the `window-rows` rows from `i` on, of the rows before
+;; `length`, as the bits of a long: bit 0 is row i. 0 from `length` on. A loop
+;; clause (in-complete, of (bjostat loops)) ANDs the windows of its columns
+;; and steps from one set bit to the next with `lowest-bit`.
+(: (-> (Cells %a) int int long))
+(defun (cells-window c length i) (clr-cells-window (record-ref c clr) length i))
+
+;; How many rows a window holds.
+(: window-rows int)
+(def window-rows 57)
 
 (impl (Iterable (NotNull %a))
   (type %elem %a)

@@ -360,6 +360,21 @@ public static class CellsOps
         return length;
     }
 
+    /// <summary>
+    /// The valid bits of the 57 rows from <paramref name="i"/> on, of the rows
+    /// before <paramref name="length"/>; 0 from the length on. For a loop
+    /// clause that walks the rows where no column is null a window at a time:
+    /// it ANDs the windows of the columns, and steps from one set bit to the
+    /// next with no call.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static long Window<T>(Cells<T> c, int length, int i) =>
+        i >= length ? 0 : (long)(c.ValidWindow(i) & Rows(length - i));
+
+    /// <summary>The number of the lowest set bit of <paramref name="m"/>, which is not 0.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static int LowestBit(long m) => BitOperations.TrailingZeroCount(m);
+
     /// <summary>A mask of the first <paramref name="left"/> bits, at most 57.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ulong Rows(int left) => left < 57 ? (1UL << left) - 1 : (1UL << 57) - 1;

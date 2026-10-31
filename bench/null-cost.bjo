@@ -22,6 +22,7 @@
 (import (std bench))
 (import (bjostat table))
 (import (bjostat stats))
+(import (bjostat loops))
 
 (: int) (def rows 1000000)
 
@@ -81,6 +82,14 @@
 (defun (cor-complete a b)
   (loop (:for (Tuple x y) (complete-rows (Tuple a b))) (:acc (correlation (Tuple x y)))))
 
+;; The same with the loop clause in-complete: the next complete row is found
+;; in the loop's own code, 57 rows a window.
+(: (-> (Cells double) (Option double)))
+(defun (sd-in c) (loop (:for x (in-complete c)) (:acc (standard-deviation x))))
+(: (-> (Cells double) (Cells double) (Option double)))
+(defun (cor-in a b)
+  (loop (:for (Tuple x y) (in-complete a b)) (:acc (correlation (Tuple x y)))))
+
 (def/bench "sum, no nulls" (sum none))
 (def/bench "sum, 5% random" (sum random))
 (def/bench "sum, 5% in a run" (sum run))
@@ -112,5 +121,17 @@
 (def/bench "complete-rows cor, 0.1% random" (cor-complete few few2))
 (def/bench "complete-rows cor, 5% in a run" (cor-complete run run2))
 (def/bench "complete-rows cor, 50% random" (cor-complete half half2))
+
+;; in-complete for the same kinds of nulls.
+(def/bench "in-complete sd, no nulls" (sd-in none))
+(def/bench "in-complete sd, 0.1% random" (sd-in few))
+(def/bench "in-complete sd, 5% random" (sd-in random))
+(def/bench "in-complete sd, 5% in a run" (sd-in run))
+(def/bench "in-complete sd, 50% random" (sd-in half))
+(def/bench "in-complete cor, no nulls" (cor-in none none2))
+(def/bench "in-complete cor, 0.1% random" (cor-in few few2))
+(def/bench "in-complete cor, 5% random" (cor-in random random2))
+(def/bench "in-complete cor, 5% in a run" (cor-in run run2))
+(def/bench "in-complete cor, 50% random" (cor-in half half2))
 
 (run-benches)

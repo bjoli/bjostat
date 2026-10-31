@@ -12,6 +12,7 @@
 (import (std prelude))
 (import (std simpletest))
 (import (bjostat table))
+(import (bjostat loops))
 (import (only (bjostat query) table-with ColumnBuildingOption))
 
 (import/extern (temp-dir (: System.IO.Path.GetTempPath (-> string))))
@@ -99,7 +100,9 @@
 
 ;; Whether skip-nulls and complete-rows of 2, 3 and 4 columns, and of two
 ;; columns of two lengths, give what the loop with :when-let gives, for one
-;; kind of nulls, length and start of the slice.
+;; kind of nulls, length and start of the slice; and the loop clause
+;; in-complete of 1, 2, 3 and 5 columns, and of two lengths, and with a
+;; driver beside it.
 (: (-> (-> int bool) int int bool))
 (defun (scans-agree? null? n from)
   (def c (sliced-cells n null? from))
@@ -118,7 +121,15 @@
        (= (loop (:for p (complete-rows (Tuple c d))) (:acc (listing p))) pairs-by-hand)
        (= (loop (:for (Tuple x _ _) (complete-rows (Tuple c d e))) (:acc (listing x))) triples-by-hand)
        (= (loop (:for (Tuple x _ _ _) (complete-rows (Tuple c d e c))) (:acc (listing x))) triples-by-hand)
-       (= (loop (:for (Tuple x _) (complete-rows (Tuple c short))) (:acc (listing x))) short-by-hand)))
+       (= (loop (:for (Tuple x _) (complete-rows (Tuple c short))) (:acc (listing x))) short-by-hand)
+       (= (loop (:for x (in-complete c)) (:acc (listing x))) (values-by-hand c))
+       (= (loop (:for p (in-complete c d)) (:acc (listing p))) pairs-by-hand)
+       (= (loop (:for (Tuple x _ _) (in-complete c d e)) (:acc (listing x))) triples-by-hand)
+       (= (loop (:for (Tuple x _ _ _ _) (in-complete c d e c d)) (:acc (listing x))) triples-by-hand)
+       (= (loop (:for (Tuple x _) (in-complete c short)) (:acc (listing x))) short-by-hand)
+       ;; A driver beside in-complete steps once for each complete row.
+       (= (loop (:for _p (in-complete c d)) (:for k (up-from 0)) (:acc (listing k)))
+          {listing k (:for k (range 0 (list-length pairs-by-hand)))})))
 
 ;; The cases where they do not agree, or "": each kind of nulls with each
 ;; length and each start, numbered as one index, since the :for clauses of a
