@@ -95,11 +95,11 @@
                   "null    1     40  "
                   ""]))
   (expect "distinct of a table with no row twice is the table"
-          (table-row-count (ok (table-distinct (table-slice visits #:to 2)))) 2)
+          (table-row-count (ok (table-distinct (ok (table-slice visits #:to 2))))) 2)
   (expect "distinct of no rows"
-          (table-row-count (ok (table-distinct (table-slice visits #:to 0)))) 0)
+          (table-row-count (ok (table-distinct (ok (table-slice visits #:to 0))))) 0)
   (expect "distinct of a slice"
-          (shown (ok (table-distinct (table-slice visits #:from 2 #:to 6) #:by ["who"])))
+          (shown (ok (table-distinct (ok (table-slice visits #:from 2 #:to 6)) #:by ["who"])))
           (lines ["who     day   n   "
                   "string  long  long"
                   "ann     1     10  "
@@ -128,17 +128,17 @@
                   "2     3.5     null  "
                   ""]))
   (expect "append: slices"
-          (shown (ok (table-append [(table-slice first #:from 1) (table-slice first #:to 1)])))
+          (shown (ok (table-append [(ok (table-slice first #:from 1)) (ok (table-slice first #:to 1))])))
           (lines ["id    price "
                   "long  double"
                   "2     3.5   "
                   "1     2.5   "
                   ""]))
   (expect "append: empty tables"
-          (table-row-count (ok (table-append [(table-slice first #:to 0) second (table-slice second #:to 0)]))) 1)
+          (table-row-count (ok (table-append [(ok (table-slice first #:to 0)) second (ok (table-slice second #:to 0))]))) 1)
   (def holes (csv "day,n,name\n2025-01-02,1,a\n,,\n2025-03-04,3,ccc\n2025-05-06,,dd\n"))
   (expect "append: slices with nulls, dates and strings"
-          (shown (ok (table-append [(table-slice holes #:from 1) holes (table-slice holes #:from 3)])))
+          (shown (ok (table-append [(ok (table-slice holes #:from 1)) holes (ok (table-slice holes #:from 3))])))
           (lines ["day         n     name  "
                   "date        long  string"
                   "null        null  null  "
@@ -172,7 +172,7 @@
   (expect "pivot-longer: each row of many, with nulls in the kept and the moved columns"
           (pivot-mismatches big (ok (pivot-longer big ["a" "b" "c"])))
           0)
-  (def sliced (table-slice big #:from 3 #:to 150000))
+  (def sliced (ok (table-slice big #:from 3 #:to 150000)))
   (expect "pivot-longer: a slice that starts inside the columns"
           (pivot-mismatches sliced (ok (pivot-longer sliced ["a" "b" "c"])))
           0)
@@ -216,7 +216,7 @@
                   "cid     1     null"
                   ""]))
   (expect "pivot-wider: no other columns, one row"
-          (shown (ok (pivot-wider (ok (table-select (table-slice scores #:to 2) ["test" "score"]))
+          (shown (ok (pivot-wider (ok (table-select (ok (table-slice scores #:to 2)) ["test" "score"]))
                                   #:names-from "test" #:values-from "score")))
           (lines ["math  art "
                   "long  long"

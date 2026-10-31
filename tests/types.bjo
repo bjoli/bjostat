@@ -100,7 +100,7 @@
   (expect "joined by a bool"
           (table-row-count (ok (inner-join t (csv "paid,word\ntrue,yes\n") ["paid"]))) 2)
   (expect "appended, with a slice"
-          (bools-of (ok (table-append [(table-slice t #:from 3) t])) "paid")
+          (bools-of (ok (table-append [(ok (table-slice t #:from 3)) t])) "paid")
           [(Some #t) (Some #f) (Some #t) (Some #f) None (Some #t) (Some #f)])
   (expect "the summary: a bool is 0 or 1, and the mean is the share of trues"
           (table->string (ok (table-select (table-summary t) ["column" "type" "count" "min" "mean" "max"]))
@@ -132,7 +132,7 @@
   (def ordered (ok (table-categorize sizes "size" #:levels ["small" "medium" "large"])))
   (expect "levels given" (ok (category-levels ordered "size")) ["small" "medium" "large"])
   (expect "printed as strings"
-          (table->string (table-slice ordered #:to 3))
+          (table->string (ok (table-slice ordered #:to 3)))
           (lines ["id    size      price "
                   "long  category  double"
                   "1     medium    2     "
@@ -205,7 +205,7 @@
   (expect "a category joined to strings"
           (error-of (inner-join ordered sizes ["size"]))
           "'size' is a column of category in the left table and of string in the right.")
-  (def appended (ok (table-append [ordered names (table-slice ordered #:to 0)])))
+  (def appended (ok (table-append [ordered names (ok (table-slice ordered #:to 0))])))
   (expect "appended to a category of other levels: the levels of both"
           (ok (category-levels appended "size")) ["small" "medium" "large"])
   (expect "appended: the strings"
@@ -221,7 +221,7 @@
            (Some "medium") (Some "small") None (Some "large") (Some "small") (Some "medium")])
   (expect "appended, levels in the order they come"
           (ok (category-levels (ok (table-append [names ordered])) "size")) ["large" "small" "medium"])
-  (def wide (ok (pivot-wider (ok (table-select (table-slice ordered #:from 3) ["id" "size" "price"]))
+  (def wide (ok (pivot-wider (ok (table-select (ok (table-slice ordered #:from 3)) ["id" "size" "price"]))
                              #:names-from "size" #:values-from "price")))
   (expect "pivot-wider: names from a category"
           (table-names wide) ["id" "large" "small" "medium"])
@@ -236,4 +236,45 @@
   (def back (ok (read-arrow cpath)))
   (expect "a category written and read back" (strings-of back "size") (strings-of ordered "size"))
   (expect "its levels too" (ok (category-levels back "size")) ["small" "medium" "large"])
+
+  ;; --- the narrow and unsigned widths --------------------------------------
+  ;; A column of short, byte, ushort, uint or ulong: a type of its own in the
+  ;; schema, printed as a number, sorted, joined by and summarised.
+  (def narrow
+    (ok (make-table
+          [(named-any "s16" {column-building x (:for x [(cast short 3) (cast short 1) (cast short 2)])})
+           (named-any "u8" {column-building x (:for x [(cast byte 30) (cast byte 10) (cast byte 20)])})
+           (named-any "u16" {column-building x (:for x [(cast ushort 300) (cast ushort 100) (cast ushort 200)])})
+           (named-any "u32" {column-building x (:for x [(cast uint 30000) (cast uint 10000) (cast uint 20000)])})
+           (named-any "u64" {column-building x (:for x [3000000UL 1000000UL 2000000UL])})])))
+  (expect "the widths have types of their own"
+          (vec-map (fun (n) (match (column-type narrow n) ((Some t) (displayed t)) (None "none"))) (table-names narrow))
+          ["short" "byte" "ushort" "uint" "ulong"])
+  (expect "a width prints as a number"
+          (shown narrow)
+          (str (lines ["s16    u8    u16     u32    u64    "
+                  "short  byte  ushort  uint   ulong  "
+                  "3      30    300     30000  3000000"
+                  "1      10    100     10000  1000000"
+                  "2      20    200     20000  2000000"]) "\n"))
+  (def sorted (ok (table-sort narrow [(ascending "u16")])))
+  (def sorted-u16 (ok (: (column-as sorted "u16") (Result TableError (Cells ushort)))))
+  (expect "a width sorts"
+          (loop (:for v (skip-nulls sorted-u16)) (:acc (listing (int->string (cast int v)))))
+          (list "100" "200" "300"))
+  (expect "a width is a join key"
+          (table-row-count (ok (inner-join narrow
+                                           (ok (make-table [(named-any "u32" {column-building x (:for x [(cast uint 30000) (cast uint 20000)])})
+                                                            (named-any "word" {column-building x (:for x ["thirty" "twenty"])})]))
+                                           ["u32"])))
+          2)
+  (def summarised (table-summary narrow))
+  (expect "a width is summarised"
+          (vec-map (fun (n) (match (column-type summarised n) ((Some t) (displayed t)) (None "none")))
+                   (table-names summarised))
+          ["string" "string" "long" "long" "double" "double" "double" "double" "double" "double" "double"])
+  (expect "and its numbers are in the summary"
+          (vec-map (fun (x) (match x ((Some v) (double->string v)) (None "null")))
+                   {vecing r (:for r (: (ok (column-as summarised "mean")) (Cells double)))})
+          ["2" "20" "200" "20000" "2000000"])
   0)

@@ -75,7 +75,7 @@
 (defun (sliced-cells n null? from)
   (def t (ok (make-table [(named "x" (array->column {arraying (cast long i) (:for i (range 0 n))}
                                                     #:valid {arraying (not (null? i)) (:for i (range 0 n))}))])))
-  (ok (column-as (table-slice t #:from from) "x")))
+  (ok (column-as (ok (table-slice t #:from from)) "x")))
 
 ;; The values of the cells that are not null, as the loop with :when-let
 ;; gives them: what skip-nulls must give.
@@ -370,7 +370,7 @@
           (copy-mismatches (copy-input 300000))
           0)
   (expect "a copy of many rows in parts, of a slice"
-          (copy-mismatches (table-slice (copy-input 300000) #:from 5 #:to 250003))
+          (copy-mismatches (ok (table-slice (copy-input 300000) #:from 5 #:to 250003)))
           0)
   (expect "a copy of many rows in parts: the count of nulls of each column"
           (let ((t (copy-input 300000)))
@@ -402,7 +402,7 @@
   (expect "selecting a missing column"
           (error-of (table-select t ["qty" "nope"]))
           "the table has no column 'nope'. Its columns are: region, price, qty, rating.")
-  (def middle (table-slice t #:from 1 #:to 3))
+  (def middle (ok (table-slice t #:from 1 #:to 3)))
   (expect "a slice's rows" (table-row-count middle) 2)
   (expect "a slice's values" (column-sum (ok (doubles middle "price"))) 27.25)
 
@@ -550,7 +550,7 @@
   (expect "a join on two keys"
           (table-row-count (ok (inner-join orders regions ["region" "qty"]))) 0)
   (expect "a left join to an empty table"
-          (longs-of (ok (left-join orders (table-slice regions #:from 0 #:to 0) ["region"])) "qty.y")
+          (longs-of (ok (left-join orders (ok (table-slice regions #:from 0 #:to 0)) ["region"])) "qty.y")
           [None None None None None])
   (expect "a key of other types"
           (error-of (inner-join orders (ok (make-table [(named "region" (array->column (vec->array [1L])))])) ["region"]))

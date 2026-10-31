@@ -67,7 +67,7 @@
   (expect "count by no key: the rows"
           (shown (ok (table-count survey [])))
           (lines ["n   " "long" "6   " ""]))
-  (expect "count of no rows" (table-row-count (ok (table-count (table-slice survey #:to 0) ["sex"]))) 0)
+  (expect "count of no rows" (table-row-count (ok (table-count (ok (table-slice survey #:to 0)) ["sex"]))) 0)
   (expect "count by a category, in the order of its levels"
           (shown (ok (table-count (ok (table-categorize survey "smoker" #:levels ["yes" "no"])) ["smoker"])))
           (lines ["smoker    n   "
@@ -101,7 +101,7 @@
           (table-names (ok (table-crosstab (ok (table-categorize survey "smoker" #:levels ["yes" "no"])) "sex" "smoker")))
           ["sex" "yes" "no"])
   (expect "crosstab of no rows"
-          (shown (ok (table-crosstab (table-slice survey #:to 0) "sex" "smoker")))
+          (shown (ok (table-crosstab (ok (table-slice survey #:to 0)) "sex" "smoker")))
           (lines ["sex   " "string" ""]))
   (expect "crosstab of one key twice"
           (error-of (table-crosstab survey "sex" "sex"))

@@ -121,7 +121,7 @@
      (loop
        (:for from [0 3 8 13])
        (:do
-        (def u (table-slice t #:from (min from n)))
+        (def u (ok (table-slice t #:from (min from n))))
         (def m (table-row-count u))
         (def base (min from n))
         (def price (ok (column-as u "price")))

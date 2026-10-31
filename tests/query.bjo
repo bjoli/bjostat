@@ -317,4 +317,37 @@
           (parameterize ((test-parameter 7))
             (computed (computing (fun () (parameter-ref test-parameter)))))
           7)
+
+  ;; --- groups->table and the types a key can be ----------------------------
+  ;; A key becomes a column, so it has to be a type one can hold: a Date key
+  ;; makes a column of dates, and a column is not a key — that is refused when
+  ;; the program is compiled, which a test here cannot see.
+  (def dated (ok (csv->table "d,x\n2026-01-02,1\n2026-01-02,2\n2026-01-09,3\n"
+                             #:types [(Tuple "x" Long)])))
+  (def day (ok (date-cells dated "d")))
+  (def amount (ok (: (column-as dated "x") (Result TableError (Cells long)))))
+  (def groups (group-index))
+  (def by-day
+    (ok (loop (:for (Tuple d a) (complete-rows (Tuple day amount)))
+              (:let g (group-of! groups d))
+              (:acc n (counting-by groups (Tuple g a)))
+              => (groups->table groups "day" [(Tuple "n" n)]))))
+  (expect "a Date key is a column of dates" (column-type by-day "day") (Some Dates))
+  (expect "a Date key groups by the date" (table-row-count by-day) 2)
+  (expect "and counts each" (loop (:for v (skip-nulls (ok (: (column-as by-day "n") (Result TableError (Cells int)))))) (:acc s (summing (cast int v)))) 3)
+
+  ;; The integer widths Arrow has, which a column can hold: ushort, uint, ulong.
+  (def widths
+    (ok (make-table [(named-any "u16" {column-building (: x ushort) (:for x [1 2 3])})
+                     (named-any "u32" {column-building (: x uint) (:for x [1 2 3])})
+                     (named-any "u64" {column-building (: x ulong) (:for x [1 2 3])})])))
+  (expect "a column of ushort, read back"
+          (loop (:for v (skip-nulls (ok (: (column-as widths "u16") (Result TableError (Cells ushort)))))) (:acc s (summing (cast int v))))
+          6)
+  (expect "a column of uint, read back"
+          (loop (:for v (skip-nulls (ok (: (column-as widths "u32") (Result TableError (Cells uint)))))) (:acc s (summing (cast int v))))
+          6)
+  (expect "a column of ulong, read back"
+          (loop (:for v (skip-nulls (ok (: (column-as widths "u64") (Result TableError (Cells ulong)))))) (:acc s (summing (cast long v))))
+          6)
   0)
