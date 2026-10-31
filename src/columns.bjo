@@ -2,8 +2,8 @@
 ;; License, v. 2.0. If a copy of the MPL was not distributed with this
 ;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-;; bjostat/src/columns.bjo — the module (bjostat columns): the macro
-;; `columns`, which takes several columns of a table at their types in one
+;; bjostat/src/columns.bjo — the module (bjostat columns): the macros
+;; `columns` and `columns/panic`, which take several columns of a table in one
 ;; form.
 ;;
 ;;     (columns t (price double) (rooms long) (seen "first seen" date))
@@ -14,47 +14,99 @@
 ;;           ((Ok rooms) (: (column-as t "rooms") (Result TableError (Cells long))) :propagate)
 ;;           ((Ok seen) (date-cells t "first seen") :propagate))
 ;;
-;; Nothing is guessed: each column has the type written, and is an Err of
-;; the function around it when the table has no such column or one of
-;; another type, as column-as is. A clause is (name type), whose column is
-;; named as the name, or (name "column" type). The type is that of the
-;; cells: double, float, long, int, string or bool; or date, datetime or
-;; instant, of (std datetime). The function around it returns a
-;; (Result TableError ...), and imports (bjostat table).
+;; A clause is one of
+;;
+;;     name                the column named as the binding, at the type its use gives
+;;     (name type)         the column named as the binding, at `type`
+;;     (name "column" type) that column, at `type`
+;;
+;; and the type is that of the cells: double, float, long, int, short, byte,
+;; ushort, uint, ulong, string or bool; or date, datetime or instant, of
+;; (std datetime). A clause with no
+;; type says nothing about it and the use decides, as `col` of (bjostat query)
+;; does: the type is checked once, where the column is read, so a name used as
+;; one type is that type's column, and a name used as two is refused. A name
+;; nothing uses leaves its type undecided, which is an error that asks for the
+;; annotation.
+;;
+;; `columns` is for a function that returns a (Result TableError ...), and
+;; `columns/panic` for any other: it binds each column or panics with the
+;; message the Err would have given. Until the language has a `:panic` failure
+;; part on `def` — which is where this belongs — `columns/panic` is how a
+;; script takes its columns.
 ;;
 ;; A macro is in a module of its own, as Bjolang runs it while it compiles
 ;; the modules that import it.
 
-(export columns)
+(export columns columns/panic)
 
 (import (std prelude))
 (import (std syntax-match))
+(import (bjostat table))
 
-;; The form that reads one column, of the clause's name, column and type.
-(: (-> Syntax Syntax Syntax Syntax Syntax))
-(defun (column-binding table name column type)
+;; The expression that reads one column, of the clause's column and type.
+(: (-> Syntax Syntax Syntax Syntax))
+(defun (column-expression table column type)
   (def kind (match type ((SSym s) (symbol->string s)) (_ "")))
   (cond
-    ((= kind "date") #'((Ok ,name) (date-cells ,table ,column) :propagate))
-    ((= kind "datetime") #'((Ok ,name) (datetime-cells ,table ,column) :propagate))
-    ((= kind "instant") #'((Ok ,name) (instant-cells ,table ,column) :propagate))
-    ((or (= kind "double") (= kind "float") (= kind "long") (= kind "int") (= kind "string") (= kind "bool"))
-     #'((Ok ,name) (: (column-as ,table ,column) (Result TableError (Cells ,type))) :propagate))
+    ((= kind "date") #'(date-cells ,table ,column))
+    ((= kind "datetime") #'(datetime-cells ,table ,column))
+    ((= kind "instant") #'(instant-cells ,table ,column))
+    ((or (= kind "double") (= kind "float") (= kind "long") (= kind "int")
+         (= kind "short") (= kind "byte") (= kind "ushort") (= kind "uint")
+         (= kind "ulong") (= kind "string") (= kind "bool"))
+     #'(: (column-as ,table ,column) (Result TableError (Cells ,type))))
     (else (syntax-error type (str "columns: '" (syntax->string type) "' is not a type of cells. "
-                                  "One is double, float, long, int, string, bool, date, datetime or instant.")))))
+                                  "One is double, float, long, int, short, byte, ushort, uint, ulong, string, bool, date, datetime or instant.")))))
 
+;; A clause as the three parts the bindings are made from: the name, the
+;; column's name as a string, and the type — or the empty list for a clause
+;; that gives none.
+(: (-> Syntax Syntax))
+(defun (clause-shape clause)
+  (match clause
+    ((SSym s)
+     (let ((column (SStr (symbol->string s))))
+       #'(,clause ,column ())))
+    (_ (syntax-match clause
+         ;; A name in parentheses: the same as one without, so that a clause
+         ;; with no type sits beside the others.
+         ((name)
+          (match name
+            ((SSym s)
+             (let ((column (SStr (symbol->string s))))
+               #'(,name ,column ())))
+            (_ (syntax-error clause "columns: a clause is name, (name) for its type from use, (name type) or (name \"column\" type)."))))
+         ((name column type)
+          (match column
+            ((SStr _) #'(,name ,column ,type))
+            (_ (syntax-error clause "columns: a clause is name, (name type) or (name \"column\" type)."))))
+         ((name type)
+          (match name
+            ((SSym s)
+             (let ((column (SStr (symbol->string s))))
+               #'(,name ,column ,type)))
+            (_ (syntax-error clause "columns: a clause is name, (name type) or (name \"column\" type)."))))
+         (bad (syntax-error bad "columns: a clause is name, (name type) or (name \"column\" type)."))))))
+
+;; The clause as the binding of `columns`: (Ok name) from the Result. A clause
+;; with no type reads the column unannotated, so the use decides its type.
 (: (-> Syntax Syntax Syntax))
 (defun (clause-binding table clause)
-  (syntax-match clause
-    ((name column type)
-     (match column
-       ((SStr _) (column-binding table name column type))
-       (_ (syntax-error clause "columns: a clause is (name type) or (name \"column\" type)."))))
-    ((name type)
-     (match name
-       ((SSym s) (column-binding table name (SStr (symbol->string s)) type))
-       (_ (syntax-error clause "columns: a clause is (name type) or (name \"column\" type)."))))
-    (bad (syntax-error bad "columns: a clause is (name type) or (name \"column\" type)."))))
+  (match (clause-shape clause)
+    ((SList (Cons name (Cons column (Cons type Nil))))
+     (match type
+       ((SList Nil) #'((Ok ,name) (column-as ,table ,column) :propagate))
+       (_ #'((Ok ,name) ,(column-expression table column type) :propagate))))))
+
+;; The clause as the binding of `columns/panic`: the name from the panic.
+(: (-> Syntax Syntax Syntax))
+(defun (clause-binding/panic table clause)
+  (match (clause-shape clause)
+    ((SList (Cons name (Cons column (Cons type Nil))))
+     (match type
+       ((SList Nil) #'(def ,name (or-panic (column-as ,table ,column))))
+       (_ #'(def ,name (or-panic ,(column-expression table column type))))))))
 
 (def/macro (columns form inject compare)
   (syntax-match form
@@ -62,4 +114,12 @@
      (if (= (length clause) 0)
          (syntax-error form "columns takes a table and at least one clause.")
          #'(def* ,@(loop (:for c clause) (:acc (listing (clause-binding table c)))))))
-    (bad (syntax-error bad "columns takes a table and clauses as (name type)."))))
+    (bad (syntax-error bad "columns takes a table and clauses as name or (name type)."))))
+
+(def/macro (columns/panic form inject compare)
+  (syntax-match form
+    ((_ table clause ...)
+     (if (= (length clause) 0)
+         (syntax-error form "columns/panic takes a table and at least one clause.")
+         #'(begin ,@(loop (:for c clause) (:acc (listing (clause-binding/panic table c)))))))
+    (bad (syntax-error bad "columns/panic takes a table and clauses as name or (name type)."))))

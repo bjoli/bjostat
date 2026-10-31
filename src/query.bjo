@@ -34,6 +34,9 @@
 
   ;; Groups by number
   GroupIndex group-index group-of! group-count group-keys category-groups string-groups
+  ;; What a group's key, and any other column of values, can be
+  ColumnValue
+
 
   ;; Work on several cores
   computing computing-each computed worker-count
@@ -568,12 +571,46 @@
           None)
       (:for g (range 0 n))}))
 
+;; ===========================================================================
+;; The types a column can hold
+;; ===========================================================================
+;;
+;; A group's key becomes a column of the table `groups->table` makes, so a key
+;; has to be a value one can hold. Saying that with a trait says it where the
+;; type is known and not at run time: a key of `Cells` — the column itself
+;; where the row's value was meant, which is the mistake this is for — is a
+;; type with no instance, so it is a compile error naming the trait rather
+;; than a column of table__Cells`1 that could not be made, several steps
+;; later.
+;;
+;; The instances are the types the builder makes a column of, and the three
+;; kinds of time, which have builders of their own: a `Date` key makes a
+;; column of dates, so grouping by a day gives the days back.
+(def/trait (ColumnValue %a)
+  (: column-of (-> (Vec %a) AnyColumn)))
+
+(impl (ColumnValue double) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue float) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue long) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue int) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue short) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue byte) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue ushort) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue uint) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue ulong) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue bool) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue string) (defun (column-of xs) {column-building x (:for x xs)}))
+(impl (ColumnValue Date) (defun (column-of xs) {dates-building (Some x) (:for x xs)}))
+(impl (ColumnValue DateTime) (defun (column-of xs) {datetimes-building (Some x) (:for x xs)}))
+(impl (ColumnValue Instant) (defun (column-of xs) {instants-building (Some x) (:for x xs)}))
+
 ;; The table of the groups: a column of their keys under `key-name`, and the
 ;; columns the `-by` collectors made, in order.
-(: (-> (GroupIndex %k) string (Vec (Tuple string AnyColumn)) (Result TableError Table)))
+(: (-> (GroupIndex %k) string (Vec (Tuple string AnyColumn)) (Result TableError Table))
+   (where (ColumnValue %k)))
 (defun (groups->table groups key-name cols)
   (make-table (vec-add-first (vec-map (fun (p) (named-any (fst p) (snd p))) cols)
-                             (named-any key-name {column-building k (:for k (group-keys groups))}))))
+                             (named-any key-name (column-of (group-keys groups))))))
 
 ;; The table of a map, as `grouping` makes: a column of the keys and a
 ;; column of the values, in the map's order.

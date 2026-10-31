@@ -19,8 +19,9 @@
 
 (import (std syntax-match))
 (import (bjostat table))
+(import (only (bjostat query) group-index group-of! groups->table))
 
-(export in-complete)
+(export in-complete grouped)
 
 ;; The window of rows from `b` on where every column is valid: the AND of the
 ;; columns' windows.
@@ -84,3 +85,140 @@
                   (>= ,base ,n))
            (:let ,pat ,(row-of names #'(+ ,base (lowest-bit ,m)))))))
     (bad (syntax-error bad "(:for pattern (in-complete column ...)): one or more columns of cells."))))
+
+;; A name as a string, for the title of a column of a `grouped`.
+(: (-> Syntax Syntax))
+(defun (title-of item)
+  (match item
+    ((SSym s) (SStr (symbol->string s)))
+    (_ item)))
+
+;; ===========================================================================
+;; (grouped key "title" clause ...): a loop whose accumulators are per group
+;; ===========================================================================
+;;
+;;     (grouped c "country"
+;;              (:for (Tuple c r) (complete-rows (Tuple country rev)))
+;;              (:acc count (counting-by r))
+;;              (:acc total (summing-by r))
+;;              (:acc mean (mean-by r)))
+;;
+;; is
+;;
+;;     (let ((groups (group-index)))
+;;       (loop (:for (Tuple c r) (complete-rows (Tuple country rev)))
+;;             (:let group (group-of! groups c))
+;;             (:acc count (counting-by groups (Tuple group r)))
+;;             (:acc total (summing-by groups (Tuple group r)))
+;;             (:acc mean (mean-by groups (Tuple group r)))
+;;             => (groups->table groups "country" [(Tuple "count" count)
+;;                                                 (Tuple "total" total)
+;;                                                 (Tuple "mean" mean)])))
+
+(: (-> Syntax bool))
+(defun (acc-clause? clause)
+  (match clause
+    ((SList (Cons (SKey k) _)) (= k :acc))
+    (_ #f)))
+
+;; An aggregate's collector is the real one for a group, `summing-by` or the
+;; caller's own: the clause puts the index first and the row's values in a
+;; Tuple after the group. One that keeps a single value for the whole loop is
+;; refused here, where the message can name the one that keeps it per group.
+(: (-> Syntax Syntax))
+(defun (grouped-collector collector)
+  (match collector
+    ((SSym s)
+     (let ((name (symbol->string s)))
+       (cond
+         ((= name "counting")
+          (syntax-error collector "grouped: 'counting' keeps one value for the whole loop. An aggregate keeps one for each group: write (counting-by element ...)."))
+         ((= name "summing")
+          (syntax-error collector "grouped: 'summing' keeps one value for the whole loop. An aggregate keeps one for each group: write (summing-by element ...)."))
+         ((= name "mean")
+          (syntax-error collector "grouped: 'mean' keeps one value for the whole loop. An aggregate keeps one for each group: write (mean-by element ...)."))
+         ((= name "listing")
+          (syntax-error collector "grouped: 'listing' keeps one list for the whole loop. An aggregate keeps one value for each group; for a list of each group's rows, write the loop with (:acc ...) and groups->table."))
+         (else collector))))
+    (_ (syntax-error collector "grouped: a collector is a name, such as summing-by or the caller's own."))))
+
+;; The collector of an aggregate, and its elements.
+(: (-> Syntax Syntax))
+(defun (collector-of spec)
+  (match spec
+    ((SList (Cons c _)) c)
+    (_ (syntax-error spec "grouped: an aggregate's collector is a name, as (summing-by element ...)."))))
+
+(: (-> Syntax (List Syntax)))
+(defun (collector-args spec)
+  (match spec
+    ((SList (Cons _ args)) args)
+    (_ Nil)))
+
+;; (:acc name (collector element ...) [#:when cond]) as the accumulator of its
+;; group's rows, the modifier if it has one.
+(: (-> Syntax Syntax Syntax Syntax))
+(defun (grouped-acc index group clause)
+  (match clause
+    ((SList (Cons _ (Cons name (Cons spec rest))))
+     (let ((acc #'(:acc ,name (,(grouped-collector (collector-of spec)) ,index
+                          (Tuple ,group ,@(collector-args spec))))))
+       (match rest
+         (Nil acc)
+         ((Cons modifier (Cons cond Nil))
+          #'(:acc ,name (,(grouped-collector (collector-of spec)) ,index
+                         (Tuple ,group ,@(collector-args spec)))
+                 ,modifier ,cond))
+         (_ (syntax-error
+             clause
+             "grouped: an accumulator is (:acc name (counting-by element ...) [#:when cond]), and the name is the column's title.")))))
+    (_ (syntax-error clause "grouped: an accumulator is (:acc name (counting-by element ...))."))))
+
+;; The clause that names the group of the row, before the first accumulator.
+(: (-> Syntax Syntax Syntax (List Syntax) (List Syntax)))
+(defun (grouped-clauses index group key clauses)
+  (match clauses
+    (Nil Nil)
+    ((Cons c rest)
+     (if (acc-clause? c)
+         (Cons #'(:let ,group (group-of! ,index ,key))
+               (Cons (grouped-acc index group c)
+                     (list-map (fun (d) (if (acc-clause? d) (grouped-acc index group d) d)) rest)))
+         (Cons c (grouped-clauses index group key rest))))))
+
+;; The name of an accumulator.
+(: (-> Syntax Syntax))
+(defun (acc-name clause)
+  (match clause
+    ((SList (Cons _ (Cons name _))) name)
+    (_ (syntax-error clause "grouped: an accumulator is (:acc name (counting-by element ...))."))))
+
+;; `=>`, as a form rather than inside a list: `(loop ... => result)` is
+;; clauses followed by the arrow and the expression, two forms.
+(: (-> Syntax))
+(defun (arrow)
+  (match #'(=> 0) ((SList (Cons a _)) a)))
+
+;; The loop itself, built as a form: its first clause is the caller's, so it
+;; cannot be a template. `loop` is an ordinary name here, which resolves where
+;; the expansion lands.
+(: (-> Syntax Syntax Syntax Syntax (List Syntax) Syntax))
+(defun (grouped-loop index group key title clauses)
+  (def items
+    (list-map (fun (n) #'(Tuple ,(title-of n) ,n))
+              (list-map acc-name (list-filter acc-clause? clauses))))
+  (SList (list-append
+          (list (SSym (string->symbol "loop")))
+          (list-append
+           (grouped-clauses index group key clauses)
+           (list (arrow) #'(groups->table ,index ,title [,@items]))))))
+
+(def/macro (grouped form inject compare)
+  (syntax-match form
+    ((_ key title clause ...)
+     (begin
+       (def g #'group)
+       (def index #'groups)
+       #'(let ((,index (group-index)))
+           ,(grouped-loop index g key title clause))))
+    (bad (syntax-error bad "grouped: (grouped key \"title\" (:for ...) (:acc name (collector element ...)) ...)."))))
