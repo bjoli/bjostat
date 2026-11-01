@@ -194,7 +194,11 @@
 ;; of steps that can fail is threaded with `try->` and unwrapped once with
 ;; this, or a `def` takes the `:panic` failure part, which does the same where
 ;; the language has it. The message is the one the Err has.
-(: (-> (Result TableError %a) %a))
+;;
+;; Any Result whose error is Displayed: a table's, a model's, a test's. A
+;; package that answers a Result of its own error type writes no unwrapper of
+;; its own — bjostat-plot's examples each had one before this.
+(: (-> (Result %e %a) %a) (where (Displayed %e)))
 (defun (or-panic r)
   (match r
     ((Ok v) v)
