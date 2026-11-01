@@ -108,6 +108,7 @@
   (clr-cells-ref (: Bjostat.CellsOps.Ref (-> (ClrCells %a) int %a)))
   (clr-cells-get (: Bjostat.CellsOps.Get (-> (ClrCells %a) int (Option %a))))
   (clr-cells-valid? (: Bjostat.CellsOps.IsValid (-> (ClrCells %a) int bool)))
+  (clr-cells-set (: Bjostat.CellsOps.Set (-> (ClrCells %a) int %a (ClrCells %a)) #:uses-type))
   (clr-cells-length (: Bjostat.CellsOps.Length (-> (ClrCells %a) int)))
   (clr-cells-null-count (: Bjostat.CellsOps.NullCount (-> (ClrCells %a) int)))
   (clr-cells-contiguous? (: Bjostat.CellsOps.IsContiguous (-> (ClrCells %a) bool)))
@@ -343,6 +344,30 @@
 
 (: (-> (Cells %a) int))
 (defun (cells-null-count c) (clr-cells-null-count (record-ref c clr)))
+
+;; A column as a collection `get`, `try-get`, `set` and `update` reach: a row
+;; by its index, as a `Vec`'s element is.
+;;
+;;     (get price 3)             ;; the value of row 3
+;;     (try-get price 3)         ;; None at a null
+;;     (set price 3 9.5)         ;; a new column with row 3 changed
+;;     (update price 3 (fun (p) (* 2.0 p)))
+;;
+;; `ref` is the unchecked read and `try-ref` the checked one, as they are for
+;; a `Vec` and a `Map`: `ref` is `cells-ref`, so it answers whatever Arrow
+;; keeps under a null, and `try-ref` is `cells-get`, which answers None there.
+;; An Arrow array cannot be written, so `ref-set` answers a new column: the
+;; table it came from is untouched.
+(impl (Refable (Cells %a))
+  (type %index int)
+  (type %out %a)
+  (defun (ref c i) (cells-ref c i))
+  (defun (try-ref c i) (cells-get c i)))
+
+(impl (Settable (Cells %a))
+  (type %index int)
+  (type %in %a)
+  (defun (ref-set c i v) (Cells (clr (clr-cells-set (record-ref c clr) i v)))))
 
 (: (-> Table string (Result TableError (Cells %a))))
 (defun (column-as t name)

@@ -86,6 +86,14 @@ are strings, and its codes are cells of ~int~. A group-by, a sort or a join
 on a category works on the codes. Every other Arrow type is ~(Other name)~ in
 the schema: a table holds it, prints it and writes it.
 
+*Reaching into a column.* A column is a collection as a ~Vec~ is, so ~get~,
+~try-get~, ~set~ and ~update~ read and write it by the index of a row:
+~(get price 3)~ is the value of row 3, ~(try-get price 3)~ the same as an
+~Option~, which answers ~None~ at a null where ~get~ answers whatever Arrow
+keeps there. A column cannot be written in place, so ~set~ and ~update~ answer
+a new column: ~(set price 3 9.5)~, and the table the column came from holds
+the old one.
+
 ** The module (bjostat csv)
 
 #+BEGIN_SRC scheme

@@ -296,6 +296,24 @@ public static class CellsOps
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsValid<T>(Cells<T> c, int i) => c.IsValid(i);
 
+    /// <summary>
+    /// The column with the value at <paramref name="i"/> replaced. An Arrow
+    /// array cannot be written, so this is a new one: every other cell keeps
+    /// its value and its nulls, and a cell that was null is valid afterwards.
+    /// </summary>
+    public static Cells<T> Set<T>(Cells<T> c, int i, T v)
+    {
+        if ((uint)i >= (uint)c.Length) throw new IndexOutOfRangeException();
+        var b = new Builder<T>(c.Length);
+        for (int j = 0; j < c.Length; j++)
+        {
+            if (j == i) b.Add(v);
+            else if (c.IsValid(j)) b.Add(c.Ref(j));
+            else b.AddNull();
+        }
+        return new Cells<T>(b.Build());
+    }
+
     public static int Length<T>(Cells<T> c) => c.Length;
 
     /// <summary>The first cell from <paramref name="i"/> on that is not null, or the length.</summary>

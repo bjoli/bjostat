@@ -583,4 +583,23 @@
                "2.6e-11\n"
                "0      \n"
                "-3e-09 \n"))
+
+  ;; A column as a collection: get, try-get, set and update reach a row by its
+  ;; index. `rating` has a null at row 1.
+  (def rating (: (ok (column-as t "rating")) (Cells int)))
+  (expect "get: the value at a row" (get rating 0) 5)
+  (expect "try-get: None at a null" (try-get rating 1) None)
+  (expect "try-get: Some at a value" (try-get rating 2) (Some 3))
+
+  (def edited (set rating 0 9))
+  (expect "set: the new column has the new value" (get edited 0) 9)
+  (expect "set: the rest of the column is as it was" (try-get edited 2) (Some 3))
+  (expect "set: a null stays a null" (try-get edited 1) None)
+  (expect "set: the column it came from is untouched" (get rating 0) 5)
+  (expect "set: the table's column too"
+          (get (: (ok (column-as t "rating")) (Cells int)) 0)
+          5)
+  (expect "set: a set cell is valid" (try-get (set rating 1 7) 1) (Some 7))
+  (expect "update: the value at a row" (get (update rating 2 (fun (r) (* 2 r))) 2) 6)
+  (expect "update: the column it came from is untouched" (get rating 2) 3)
   0)
