@@ -568,7 +568,13 @@ public static class Joins
     internal static IArrowArray[] TakeOrNull(RecordBatch t, int[] rows)
     {
         int n = rows.Length;
-        bool missing = rows.Any(r => r < 0);
+        bool missing = false;
+        for (int i = 0; i < n; i++)
+            if (rows[i] < 0)
+            {
+                missing = true;
+                break;
+            }
         if (!missing) return Enumerable.Range(0, t.ColumnCount).Select(Query.Take(t, rows, n).Column).ToArray();
 
         // The rows that are there, at their places; a missing row takes row 0,
@@ -579,7 +585,12 @@ public static class Joins
             for (int c = 0; c < columns.Length; c++) columns[c] = Nulls(t.Schema.GetFieldByIndex(c).DataType, n);
             return columns;
         }
-        var fixedRows = rows.Select(r => r < 0 ? 0 : r).ToArray();
+        var fixedRows = new int[n];
+        for (int i = 0; i < n; i++)
+        {
+            int r = rows[i];
+            fixedRows[i] = r < 0 ? 0 : r;
+        }
         var taken = Query.Take(t, fixedRows, n);
         for (int c = 0; c < columns.Length; c++)
             columns[c] = HideMissing(taken.Column(c), rows);
@@ -590,11 +601,15 @@ public static class Joins
     internal static IArrowArray HideMissing(IArrowArray a, int[] rows)
     {
         var data = a.Data;
+        var valid = data.NullCount == 0 || data.Buffers[0].IsEmpty ? ReadOnlySpan<byte>.Empty : data.Buffers[0].Span;
+        int offset = data.Offset;
         var bits = new byte[(rows.Length + 7) / 8];
         int nulls = 0;
         for (int i = 0; i < rows.Length; i++)
         {
-            if (rows[i] >= 0 && a.IsValid(i)) bits[i >> 3] |= (byte)(1 << (i & 7));
+            int bit = offset + i;
+            if (rows[i] >= 0 && (valid.IsEmpty || (valid[bit >> 3] & (1 << (bit & 7))) != 0))
+                bits[i >> 3] |= (byte)(1 << (i & 7));
             else nulls++;
         }
         var buffers = data.Buffers.ToArray();

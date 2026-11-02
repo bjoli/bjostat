@@ -11,6 +11,8 @@
 // A table that cannot be made is a TableProblem, whose message
 // (bjostat table) gives as an Err. Other exceptions are errors in this code.
 
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -39,73 +41,102 @@ public static class Reshape
     /// that. When each row has a group of its own, the other keys are not
     /// read. No row's keys are hashed together, and no two rows are compared.
     /// </remarks>
-    internal static int[] Groups(IArrowArray[] keys, int n, out List<int> firsts)
+    internal static int[] Groups(IArrowArray[] keys, int n, out List<int> firsts) =>
+        Groups(keys, n, out firsts, out _, false);
+
+    internal static int[] Groups(
+        IArrowArray[] keys,
+        int n,
+        out List<int> firsts,
+        out (int[] Ids, List<int> Firsts)?[] stringIds,
+        bool keepStringIds = true)
     {
-        int[] cur;
-        long card;
+        stringIds = new (int[] Ids, List<int> Firsts)?[keys.Length];
         if (keys.Length == 0)
         {
-            cur = new int[n];
-            card = 1;
+            firsts = n == 0 ? new List<int>() : new List<int> { 0 };
+            return new int[n];
+        }
+
+        var cur = Ids(keys[0], out int c0, out var firsts0, out stringIds[0]);
+        long card;
+        if (firsts0 != null)
+        {
+            firsts = firsts0;
+            card = firsts.Count;
         }
         else
         {
-            cur = Ids(keys[0], out int c0);
-            card = Compact(cur, c0);
-            // Once each row has a group of its own, no key splits one more.
-            for (int k = 1; k < keys.Length && card < n; k++)
-            {
-                var ids = Ids(keys[k], out int ck);
-                if (card * ck <= DenseLimit)
-                {
-                    for (int r = 0; r < n; r++) cur[r] = (int)(cur[r] * ck + ids[r]);
-                    card = Compact(cur, card * ck);
-                }
-                else
-                {
-                    var number = new Dictionary<long, int>();
-                    for (int r = 0; r < n; r++)
-                    {
-                        ref int id = ref CollectionsMarshal.GetValueRefOrAddDefault(number, (long)cur[r] * ck + ids[r], out bool there);
-                        if (!there) id = number.Count - 1;
-                        cur[r] = id;
-                    }
-                    card = number.Count;
-                }
-            }
+            if (keepStringIds && stringIds[0] != null) cur = (int[])cur.Clone();
+            card = Compact(cur, c0, out firsts);
         }
 
-        // The groups in the order of their first rows.
-        firsts = new List<int>();
-        var group = new int[card];
-        System.Array.Fill(group, -1);
-        for (int r = 0; r < n; r++)
+        // Once each row has a group of its own, no key splits one more.
+        for (int k = 1; k < keys.Length && card < n; k++)
         {
-            ref int g = ref group[cur[r]];
-            if (g < 0)
+            var ids = Ids(keys[k], out int ck, out _, out stringIds[k]);
+            if (k == 1 && keepStringIds && ReferenceEquals(cur, stringIds[0]?.Ids))
             {
-                g = firsts.Count;
-                firsts.Add(r);
+                var next = new int[n];
+                cur.AsSpan().CopyTo(next);
+                cur = next;
             }
-            cur[r] = g;
+            if (card * ck <= DenseLimit)
+            {
+                int stride = ck;
+                var number = new int[card * ck];
+                System.Array.Fill(number, -1);
+                firsts = new List<int>((int)card);
+                for (int r = 0; r < n; r++)
+                {
+                    ref int id = ref number[cur[r] * stride + ids[r]];
+                    if (id < 0)
+                    {
+                        id = firsts.Count;
+                        firsts.Add(r);
+                    }
+                    cur[r] = id;
+                }
+                card = firsts.Count;
+            }
+            else
+            {
+                var number = new Dictionary<long, int>((int)card);
+                firsts = new List<int>((int)card);
+                for (int r = 0; r < n; r++)
+                {
+                    ref int id = ref CollectionsMarshal.GetValueRefOrAddDefault(number, (long)cur[r] * ck + ids[r], out bool there);
+                    if (!there)
+                    {
+                        id = firsts.Count;
+                        firsts.Add(r);
+                    }
+                    cur[r] = id;
+                }
+                card = firsts.Count;
+            }
         }
         return cur;
     }
 
     // The ids numbered again from 0, in the order of their first rows, so
     // that there are as many as there are distinct ones. Answers how many.
-    private static int Compact(int[] ids, long card)
+    private static int Compact(int[] ids, long card, out List<int> firsts)
     {
         var number = new int[card];
         System.Array.Fill(number, -1);
-        int count = 0;
+        firsts = new List<int>();
         for (int r = 0; r < ids.Length; r++)
         {
             ref int id = ref number[ids[r]];
-            if (id < 0) id = count++;
+            if (id < 0)
+            {
+                id = firsts.Count;
+                firsts.Add(r);
+            }
             ids[r] = id;
         }
-        return count;
+        return firsts.Count;
     }
 
     // The most ids put together that index an array: 16 MB of ints.
@@ -118,10 +149,16 @@ public static class Reshape
     /// Categories.StringIds; an integer's its distance from the least when
     /// that range is small, and a number from a dictionary otherwise.
     /// </summary>
-    private static int[] Ids(IArrowArray a, out int card)
+    private static int[] Ids(
+        IArrowArray a,
+        out int card,
+        out List<int>? firsts,
+        out (int[] Ids, List<int> Firsts)? stringIds)
     {
         int n = a.Length;
         int[] ids;
+        firsts = null;
+        stringIds = null;
         switch (a)
         {
             case DictionaryArray d when Categories.Is(d):
@@ -129,56 +166,104 @@ public static class Reshape
                 card = d.Dictionary.Length;
                 break;
             case BooleanArray b:
+            {
                 ids = new int[n];
-                for (int r = 0; r < n; r++) ids[r] = b.GetValue(r) == true ? 1 : 0;
+                var bits = b.ValueBuffer.Span;
+                int off = b.Offset;
+                for (int r = 0; r < n; r++)
+                {
+                    int bit = off + r;
+                    ids[r] = (bits[bit >> 3] >> (bit & 7)) & 1;
+                }
                 card = 2;
                 break;
+            }
             case StringArray s:
-                ids = Categories.StringIds(s, out var firsts);
-                card = firsts.Count;
+                ids = Categories.StringIds(s, out var strFirsts);
+                card = strFirsts.Count;
+                stringIds = (ids, strFirsts);
+                if (s.NullCount == 0) firsts = strFirsts;
                 break;
-            case Int64Array l: ids = Integers(l.Values, a, x => x, out card); break;
-            case Int32Array i: ids = Integers(i.Values, a, x => x, out card); break;
-            case Int16Array i: ids = Integers(i.Values, a, x => x, out card); break;
-            case UInt8Array i: ids = Integers(i.Values, a, x => x, out card); break;
-            case UInt16Array i: ids = Integers(i.Values, a, x => x, out card); break;
-            case UInt32Array i: ids = Integers(i.Values, a, x => x, out card); break;
-            case UInt64Array i: ids = Integers(i.Values, a, x => unchecked((long)x), out card); break;
-            case Date32Array d: ids = Integers(d.Values, a, x => x, out card); break;
-            case TimestampArray t: ids = Integers(t.Values, a, x => x, out card); break;
-            case DoubleArray d:
-                ids = Numbered(d.Values, a, x => double.IsNaN(x) ? 0x7FF8_0000_0000_0001L : BitConverter.DoubleToInt64Bits(x == 0.0 ? 0.0 : x), out card);
-                break;
-            case FloatArray f:
-                ids = Numbered(f.Values, a, x => float.IsNaN(x) ? 0x7FC0_0001L : BitConverter.SingleToInt32Bits(x == 0.0f ? 0.0f : x), out card);
-                break;
+            case Int64Array l: ids = Integers(l.Values, a, out card, out firsts); break;
+            case Int32Array i: ids = Integers(i.Values, a, out card, out firsts); break;
+            case Int16Array i: ids = Integers(i.Values, a, out card, out firsts); break;
+            case UInt8Array i: ids = Integers(i.Values, a, out card, out firsts); break;
+            case UInt16Array i: ids = Integers(i.Values, a, out card, out firsts); break;
+            case UInt32Array i: ids = Integers(i.Values, a, out card, out firsts); break;
+            case UInt64Array i: ids = Integers(i.Values, a, out card, out firsts); break;
+            case Date32Array d: ids = Integers(d.Values, a, out card, out firsts); break;
+            case TimestampArray t: ids = Integers(t.Values, a, out card, out firsts); break;
+            case DoubleArray d: ids = Numbered(d.Values, a, out card, out firsts); break;
+            case FloatArray f: ids = Numbered(f.Values, a, out card, out firsts); break;
             default:
                 throw new ArgumentException($"(bjostat table): a column of {a.Data.DataType.Name} cannot be a key");
         }
         // The nulls: one id after the others.
         if (a.NullCount != 0)
         {
+            var valid = a.Data.Buffers[0].Span;
+            int off = a.Offset;
             for (int r = 0; r < n; r++)
-                if (a.IsNull(r)) ids[r] = card;
+            {
+                int bit = off + r;
+                if ((valid[bit >> 3] & (1 << (bit & 7))) == 0) ids[r] = card;
+            }
             card++;
+            firsts = null;
         }
         return ids;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long LongValue<T>(T x) where T : struct, INumber<T> =>
+        typeof(T) == typeof(ulong) ? unchecked((long)ulong.CreateTruncating(x)) : long.CreateTruncating(x);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static long KeyBits<T>(T x) where T : struct, INumber<T>
+    {
+        if (typeof(T) == typeof(double))
+        {
+            double d = double.CreateTruncating(x);
+            return double.IsNaN(d) ? 0x7FF8_0000_0000_0001L : BitConverter.DoubleToInt64Bits(d == 0.0 ? 0.0 : d);
+        }
+        if (typeof(T) == typeof(float))
+        {
+            float f = float.CreateTruncating(x);
+            return float.IsNaN(f) ? 0x7FC0_0001L : BitConverter.SingleToInt32Bits(f == 0.0f ? 0.0f : f);
+        }
+        return LongValue(x);
     }
 
     // The distance of each value from the least, when the values span fewer
     // than DenseLimit and fewer than four times the rows; otherwise numbers
     // from a dictionary. The values under nulls are left out of the range.
-    private static int[] Integers<T>(ReadOnlySpan<T> values, IArrowArray a, Func<T, long> value, out int card)
+    private static int[] Integers<T>(ReadOnlySpan<T> values, IArrowArray a, out int card, out List<int>? firsts)
+        where T : struct, INumber<T>
     {
         int n = values.Length;
-        bool nulls = a.NullCount != 0;
+        firsts = null;
         long least = long.MaxValue, most = long.MinValue;
-        for (int r = 0; r < n; r++)
+        if (a.NullCount == 0)
         {
-            if (nulls && a.IsNull(r)) continue;
-            long v = value(values[r]);
-            if (v < least) least = v;
-            if (v > most) most = v;
+            for (int r = 0; r < n; r++)
+            {
+                long v = LongValue(values[r]);
+                if (v < least) least = v;
+                if (v > most) most = v;
+            }
+        }
+        else
+        {
+            var valid = a.Data.Buffers[0].Span;
+            int off = a.Offset;
+            for (int r = 0; r < n; r++)
+            {
+                int bit = off + r;
+                if ((valid[bit >> 3] & (1 << (bit & 7))) == 0) continue;
+                long v = LongValue(values[r]);
+                if (v < least) least = v;
+                if (v > most) most = v;
+            }
         }
         if (least > most)
         {
@@ -188,27 +273,50 @@ public static class Reshape
         if ((ulong)(most - least) < (ulong)Math.Min(DenseLimit, 4L * n + 64))
         {
             var ids = new int[n];
+            // Null rows are overwritten with `card` in Ids right after.
             for (int r = 0; r < n; r++)
-                ids[r] = nulls && a.IsNull(r) ? 0 : (int)(value(values[r]) - least);
+                ids[r] = unchecked((int)(LongValue(values[r]) - least));
             card = (int)(most - least + 1);
             return ids;
         }
-        return Numbered(values, a, value, out card);
+        return Numbered(values, a, out card, out firsts);
     }
 
     // A number for each distinct value, in the order of their first rows.
-    private static int[] Numbered<T>(ReadOnlySpan<T> values, IArrowArray a, Func<T, long> value, out int card)
+    private static int[] Numbered<T>(ReadOnlySpan<T> values, IArrowArray a, out int card, out List<int>? firsts)
+        where T : struct, INumber<T>
     {
         int n = values.Length;
-        bool nulls = a.NullCount != 0;
         var ids = new int[n];
         var number = new Dictionary<long, int>();
-        for (int r = 0; r < n; r++)
+        var firstRows = new List<int>();
+        if (a.NullCount == 0)
         {
-            if (nulls && a.IsNull(r)) continue;
-            ref int id = ref CollectionsMarshal.GetValueRefOrAddDefault(number, value(values[r]), out bool there);
-            if (!there) id = number.Count - 1;
-            ids[r] = id;
+            for (int r = 0; r < n; r++)
+            {
+                ref int id = ref CollectionsMarshal.GetValueRefOrAddDefault(number, KeyBits(values[r]), out bool there);
+                if (!there)
+                {
+                    id = firstRows.Count;
+                    firstRows.Add(r);
+                }
+                ids[r] = id;
+            }
+            firsts = firstRows;
+        }
+        else
+        {
+            var valid = a.Data.Buffers[0].Span;
+            int off = a.Offset;
+            for (int r = 0; r < n; r++)
+            {
+                int bit = off + r;
+                if ((valid[bit >> 3] & (1 << (bit & 7))) == 0) continue;
+                ref int id = ref CollectionsMarshal.GetValueRefOrAddDefault(number, KeyBits(values[r]), out bool there);
+                if (!there) id = number.Count - 1;
+                ids[r] = id;
+            }
+            firsts = null;
         }
         card = number.Count;
         return ids;
@@ -406,15 +514,10 @@ public static class Reshape
     {
         if (namesFrom == valuesFrom) throw new TableProblem($"the names and the values are both from '{namesFrom}'.");
         int nc = Column(t, namesFrom), vc = Column(t, valuesFrom);
-        // The name of each row, null at a null.
-        Func<int, string?> nameAt = t.Column(nc) switch
-        {
-            StringArray s => r => s.IsNull(r) ? null : s.GetString(r),
-            DictionaryArray d when Categories.Is(d) =>
-                r => d.IsNull(r) ? null : System.Text.Encoding.UTF8.GetString(Categories.LevelBytes(d, r)),
-            _ => throw new TableProblem($"'{namesFrom}' is a column of {TypeText(t.Schema.GetFieldByIndex(nc).DataType)}; "
-                                        + "the names of columns have to be strings."),
-        };
+        var nameCol = t.Column(nc);
+        if (nameCol is not StringArray && !Categories.Is(nameCol))
+            throw new TableProblem($"'{namesFrom}' is a column of {TypeText(t.Schema.GetFieldByIndex(nc).DataType)}; "
+                                   + "the names of columns have to be strings.");
         var ids = Enumerable.Range(0, t.ColumnCount).Where(i => i != nc && i != vc).ToArray();
         foreach (int i in ids)
         {
@@ -427,27 +530,62 @@ public static class Reshape
         var groupOf = Groups(ids.Select(t.Column).ToArray(), n, out var firsts);
         int rows = firsts.Count;
 
+        // Each distinct name becomes a new column, in the order it first comes.
+        int[] colOf;
+        List<string> newNames;
+        if (nameCol is StringArray s)
+        {
+            if (s.NullCount != 0)
+            {
+                for (int r = 0; r < n; r++)
+                    if (s.IsNull(r))
+                        throw new TableProblem($"'{namesFrom}' has a null in row {r}, and a column needs a name.");
+            }
+            colOf = Categories.StringIds(s, out var nameFirsts);
+            newNames = new List<string>(nameFirsts.Count);
+            foreach (int r in nameFirsts) newNames.Add(s.GetString(r));
+        }
+        else
+        {
+            var d = (DictionaryArray)nameCol;
+            if (d.NullCount != 0)
+            {
+                for (int r = 0; r < n; r++)
+                    if (d.IsNull(r))
+                        throw new TableProblem($"'{namesFrom}' has a null in row {r}, and a column needs a name.");
+            }
+            var levels = (StringArray)d.Dictionary;
+            var codes = ((Int32Array)d.Indices).Values;
+            var codeToCol = new int[levels.Length];
+            System.Array.Fill(codeToCol, -1);
+            colOf = new int[n];
+            newNames = new List<string>();
+            for (int r = 0; r < n; r++)
+            {
+                ref int c = ref codeToCol[codes[r]];
+                if (c < 0)
+                {
+                    c = newNames.Count;
+                    newNames.Add(levels.GetString(codes[r]));
+                }
+                colOf[r] = c;
+            }
+        }
+
         // The row of each cell of each new column, -1 where no row gives one.
-        var nameIndex = new Dictionary<string, int>();
-        var cellRows = new List<int[]>();
-        var newNames = new List<string>();
+        var cellRows = new int[newNames.Count][];
+        for (int c = 0; c < cellRows.Length; c++)
+        {
+            cellRows[c] = new int[rows];
+            System.Array.Fill(cellRows[c], -1);
+        }
         for (int r = 0; r < n; r++)
         {
-            var name = nameAt(r)
-                ?? throw new TableProblem($"'{namesFrom}' has a null in row {r}, and a column needs a name.");
-            if (!nameIndex.TryGetValue(name, out int c))
-            {
-                c = cellRows.Count;
-                nameIndex[name] = c;
-                newNames.Add(name);
-                var cells = new int[rows];
-                System.Array.Fill(cells, -1);
-                cellRows.Add(cells);
-            }
+            int c = colOf[r];
             ref int cell = ref cellRows[c][groupOf[r]];
             if (cell >= 0)
                 throw new TableProblem($"rows {cell} and {r} have the same values in the other columns, "
-                                       + $"and both '{name}' in '{namesFrom}': a cell holds one value.");
+                                       + $"and both '{newNames[c]}' in '{namesFrom}': a cell holds one value.");
             cell = r;
         }
 

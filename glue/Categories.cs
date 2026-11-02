@@ -152,12 +152,16 @@ public static class Categories
             tables[p] = t;
         });
         var maps = Merged(s, tables, out firsts);
-        bool nulls = s.NullCount != 0;
+        int offset = s.Offset;
         Workers.For(parts, p =>
         {
             var map = maps[p];
+            var valid = s.NullCount == 0 ? ReadOnlySpan<byte>.Empty : s.NullBitmapBuffer.Span;
             for (int r = p * size, to = Math.Min(n, (p + 1) * size); r < to; r++)
-                if (!nulls || s.IsValid(r)) ids[r] = map[ids[r]];
+            {
+                int bit = offset + r;
+                if (valid.IsEmpty || (valid[bit >> 3] & (1 << (bit & 7))) != 0) ids[r] = map[ids[r]];
+            }
         });
         return ids;
     }
@@ -174,7 +178,7 @@ public static class Categories
     /// for both strings' bytes each time took 10 ms of the 32 of a
     /// categorize of 20 000 regions.
     /// </remarks>
-    private static int[] InByteOrder(StringArray s, List<int> firsts)
+    internal static int[] InByteOrder(StringArray s, List<int> firsts)
     {
         int k = firsts.Count;
         var offsets = s.ValueOffsets;
@@ -386,9 +390,15 @@ public static class Categories
     private static ArrowBuffer Validity(IArrowArray a)
     {
         if (a.NullCount == 0) return ArrowBuffer.Empty;
+        if (a.Offset == 0 && !a.Data.Buffers[0].IsEmpty) return a.Data.Buffers[0];
+        var valid = a.Data.Buffers[0].Span;
+        int offset = a.Offset;
         var bits = new byte[(a.Length + 7) / 8];
         for (int r = 0; r < a.Length; r++)
-            if (a.IsValid(r)) bits[r >> 3] |= (byte)(1 << (r & 7));
+        {
+            int bit = offset + r;
+            if ((valid[bit >> 3] & (1 << (bit & 7))) != 0) bits[r >> 3] |= (byte)(1 << (r & 7));
+        }
         return new ArrowBuffer(bits);
     }
 
