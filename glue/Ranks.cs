@@ -149,12 +149,15 @@ public static class Ranks
         long m = a + b, n = c + d, k = a + c;
         long lo = Math.Max(0, k - n), hi = Math.Min(k, m);
         int size = (int)(hi - lo + 1);
-        // ln of the hypergeometric probability of each x from lo to hi.
+        // ln of the hypergeometric probability of each x from lo to hi. The
+        // normalising term is the same for every x, and each LogChoose is three
+        // log gammas, so it is taken once rather than for each value.
+        double norm = LogChoose(m + n, k);
         var logp = new double[size];
         for (int i = 0; i < size; i++)
         {
             long x = lo + i;
-            logp[i] = LogChoose(m, x) + LogChoose(n, k - x) - LogChoose(m + n, k);
+            logp[i] = LogChoose(m, x) + LogChoose(n, k - x) - norm;
         }
         int at = (int)(a - lo);
         double less = 0, greater = 0, two = 0;
@@ -195,8 +198,14 @@ public static class Ranks
             }
             return sx / s;
         }
+        // The answer is exp of the midpoint, so a bracket of w wide is w
+        // relative on the ratio: 1e-13 is about as fine as the bisection can
+        // hold, since a double's own spacing near ±100 is 1.4e-14. Reaching it
+        // from a bracket of 200 wide takes some 51 steps, where 200 steps
+        // would narrow it to 2^-199 of itself — a hundred and fifty steps past
+        // anything the answer can show, each one walking the support twice.
         double left = -100, right = 100;
-        for (int i = 0; i < 200; i++)
+        for (int i = 0; i < 200 && right - left > 1e-13; i++)
         {
             double mid = 0.5 * (left + right);
             if (Mean(mid) < a) left = mid; else right = mid;
