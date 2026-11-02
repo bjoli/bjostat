@@ -124,16 +124,41 @@ public static class Sorting
         bool mayHaveNaN = typeof(T) == typeof(double) || typeof(T) == typeof(float);
         if (valid.IsEmpty && !mayHaveNaN && rowMap.IsEmpty)
         {
-            var bits = new ulong[n];
+            var bits = GC.AllocateUninitializedArray<ulong>(n);
             ulong first = Ordered(values[order[0]]);
             if (descending) first = ~first;
             ulong diff = 0;
-            for (int i = 0; i < n; i++)
+            int parts = Math.Min(n / PartKeys, Workers.Count);
+            if (parts >= 2)
             {
-                ulong k = Ordered(values[order[i]]);
-                if (descending) k = ~k;
-                bits[i] = k;
-                diff |= k ^ first;
+                int size = (n + parts - 1) / parts;
+                var diffs = new ulong[parts];
+                var valMem = a.ValueBuffer.Memory;
+                int valOff = a.Offset;
+                Workers.For(parts, p =>
+                {
+                    var vals = MemoryMarshal.Cast<byte, T>(valMem.Span).Slice(valOff);
+                    ulong d = 0;
+                    for (int i = p * size, to = Math.Min(n, i + size); i < to; i++)
+                    {
+                        ulong k = Ordered(vals[order[i]]);
+                        if (descending) k = ~k;
+                        bits[i] = k;
+                        d |= k ^ first;
+                    }
+                    diffs[p] = d;
+                });
+                for (int p = 0; p < parts; p++) diff |= diffs[p];
+            }
+            else
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    ulong k = Ordered(values[order[i]]);
+                    if (descending) k = ~k;
+                    bits[i] = k;
+                    diff |= k ^ first;
+                }
             }
             RadixSort(bits, n, order, diff);
             return;
@@ -189,18 +214,58 @@ public static class Sorting
         bool descending,
         (int[] Ids, List<int> Firsts)? knownIds)
     {
+        int n = order.Length;
+        var valid = a.NullCount == 0 ? ReadOnlySpan<byte>.Empty : a.NullBitmapBuffer.Span;
+        int offset = a.Offset;
+        if (valid.IsEmpty && rowMap.IsEmpty && knownIds == null)
+        {
+            var ranked = Categories.SortedStringIds(a, out _);
+            var bits = GC.AllocateUninitializedArray<ulong>(n);
+            ulong first = (uint)ranked[order[0]];
+            if (descending) first = ~first;
+            ulong diff = 0;
+            int parts = Math.Min(n / PartKeys, Workers.Count);
+            if (parts >= 2)
+            {
+                int size = (n + parts - 1) / parts;
+                var diffs = new ulong[parts];
+                Workers.For(parts, p =>
+                {
+                    ulong d = 0;
+                    for (int i = p * size, to = Math.Min(n, i + size); i < to; i++)
+                    {
+                        ulong k = (uint)ranked[order[i]];
+                        if (descending) k = ~k;
+                        bits[i] = k;
+                        d |= k ^ first;
+                    }
+                    diffs[p] = d;
+                });
+                for (int p = 0; p < parts; p++) diff |= diffs[p];
+            }
+            else
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    ulong k = (uint)ranked[order[i]];
+                    if (descending) k = ~k;
+                    bits[i] = k;
+                    diff |= k ^ first;
+                }
+            }
+            RadixSort(bits, n, order, diff);
+            return;
+        }
+
         var (ids, firsts) = knownIds ?? NumberStrings(a);
         // The rank of each distinct string.
         var byBytes = Categories.InByteOrder(a, firsts);
         var rank = new int[byBytes.Length];
         for (int i = 0; i < byBytes.Length; i++) rank[byBytes[i]] = i;
 
-        int n = order.Length;
-        var valid = a.NullCount == 0 ? ReadOnlySpan<byte>.Empty : a.NullBitmapBuffer.Span;
-        int offset = a.Offset;
         if (valid.IsEmpty && rowMap.IsEmpty)
         {
-            var bits = new ulong[n];
+            var bits = GC.AllocateUninitializedArray<ulong>(n);
             ulong first = (uint)rank[ids[order[0]]];
             if (descending) first = ~first;
             ulong diff = 0;

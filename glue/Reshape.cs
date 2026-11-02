@@ -49,7 +49,8 @@ public static class Reshape
         int n,
         out List<int> firsts,
         out (int[] Ids, List<int> Firsts)?[] stringIds,
-        bool keepStringIds = true)
+        bool keepStringIds = true,
+        bool needGroupIds = true)
     {
         stringIds = new (int[] Ids, List<int> Firsts)?[keys.Length];
         if (keys.Length == 0)
@@ -67,37 +68,55 @@ public static class Reshape
         }
         else
         {
-            if (keepStringIds && stringIds[0] != null) cur = (int[])cur.Clone();
-            card = Compact(cur, c0, out firsts);
+            bool needCur = needGroupIds || keys.Length > 1;
+            if (needCur && keepStringIds && stringIds[0] != null) cur = (int[])cur.Clone();
+            card = Compact(cur, c0, needCur, out firsts);
         }
 
         // Once each row has a group of its own, no key splits one more.
         for (int k = 1; k < keys.Length && card < n; k++)
         {
+            bool needCur = needGroupIds || k + 1 < keys.Length;
             var ids = Ids(keys[k], out int ck, out _, out stringIds[k]);
             if (k == 1 && keepStringIds && ReferenceEquals(cur, stringIds[0]?.Ids))
             {
-                var next = new int[n];
+                var next = GC.AllocateUninitializedArray<int>(n);
                 cur.AsSpan().CopyTo(next);
                 cur = next;
             }
             if (card * ck <= DenseLimit)
             {
                 int stride = ck;
-                var number = new int[card * ck];
-                System.Array.Fill(number, -1);
-                firsts = new List<int>((int)card);
-                for (int r = 0; r < n; r++)
+                int totalCard = (int)(card * ck);
+                if (totalCard <= ParallelCompactLimit && n >= 2 * PartRows)
                 {
-                    ref int id = ref number[cur[r] * stride + ids[r]];
-                    if (id < 0)
+                    int parts = Math.Min(n / PartRows, Workers.Count);
+                    int size = (n + parts - 1) / parts;
+                    var curArr = cur;
+                    Workers.For(parts, p =>
                     {
-                        id = firsts.Count;
-                        firsts.Add(r);
-                    }
-                    cur[r] = id;
+                        for (int r = p * size, to = Math.Min(n, r + size); r < to; r++)
+                            curArr[r] = curArr[r] * stride + ids[r];
+                    });
+                    card = CompactParallel(cur, totalCard, parts, size, needCur, out firsts);
                 }
-                card = firsts.Count;
+                else
+                {
+                    var number = new int[totalCard];
+                    System.Array.Fill(number, -1);
+                    firsts = new List<int>((int)card);
+                    for (int r = 0; r < n; r++)
+                    {
+                        ref int id = ref number[cur[r] * stride + ids[r]];
+                        if (id < 0)
+                        {
+                            id = firsts.Count;
+                            firsts.Add(r);
+                        }
+                        cur[r] = id;
+                    }
+                    card = firsts.Count;
+                }
             }
             else
             {
@@ -121,12 +140,18 @@ public static class Reshape
 
     // The ids numbered again from 0, in the order of their first rows, so
     // that there are as many as there are distinct ones. Answers how many.
-    private static int Compact(int[] ids, long card, out List<int> firsts)
+    private static int Compact(int[] ids, long card, bool needIds, out List<int> firsts)
     {
+        int n = ids.Length;
+        if (card <= ParallelCompactLimit && n >= 2 * PartRows)
+        {
+            int parts = Math.Min(n / PartRows, Workers.Count);
+            return CompactParallel(ids, (int)card, parts, (n + parts - 1) / parts, needIds, out firsts);
+        }
         var number = new int[card];
         System.Array.Fill(number, -1);
         firsts = new List<int>();
-        for (int r = 0; r < ids.Length; r++)
+        for (int r = 0; r < n; r++)
         {
             ref int id = ref number[ids[r]];
             if (id < 0)
@@ -134,13 +159,164 @@ public static class Reshape
                 id = firsts.Count;
                 firsts.Add(r);
             }
-            ids[r] = id;
+            if (needIds) ids[r] = id;
         }
         return firsts.Count;
     }
 
+    private static int CompactParallel(int[] ids, int card, int parts, int size, bool needIds, out List<int> firsts)
+    {
+        int n = ids.Length;
+        var firstSeen = GC.AllocateUninitializedArray<int>(card);
+        if (card >= PartRows)
+        {
+            int fillSize = (card + parts - 1) / parts;
+            Workers.For(parts, p =>
+            {
+                int from = p * fillSize, to = Math.Min(card, from + fillSize);
+                if (from < to) firstSeen.AsSpan(from, to - from).Fill(int.MaxValue);
+            });
+        }
+        else
+        {
+            System.Array.Fill(firstSeen, int.MaxValue);
+        }
+        Workers.For(parts, p =>
+        {
+            for (int r = p * size, to = Math.Min(n, r + size); r < to; r++)
+            {
+                int v = ids[r];
+                if (r < firstSeen[v]) InterlockedMin(ref firstSeen[v], r);
+            }
+        });
+        var partCounts = new int[parts];
+        Workers.For(parts, p =>
+        {
+            int c = 0;
+            for (int r = p * size, to = Math.Min(n, r + size); r < to; r++)
+                if (firstSeen[ids[r]] == r) c++;
+            partCounts[p] = c;
+        });
+        int count = 0;
+        for (int p = 0; p < parts; p++)
+        {
+            int c = partCounts[p];
+            partCounts[p] = count;
+            count += c;
+        }
+        var firstList = new List<int>(count);
+        CollectionsMarshal.SetCount(firstList, count);
+        Workers.For(parts, p =>
+        {
+            var firstSpan = CollectionsMarshal.AsSpan(firstList);
+            int id = partCounts[p];
+            if (needIds)
+            {
+                for (int r = p * size, to = Math.Min(n, r + size); r < to; r++)
+                {
+                    int v = ids[r];
+                    if (firstSeen[v] == r)
+                    {
+                        firstSpan[id] = r;
+                        firstSeen[v] = id;
+                        id++;
+                    }
+                }
+            }
+            else
+            {
+                for (int r = p * size, to = Math.Min(n, r + size); r < to; r++)
+                    if (firstSeen[ids[r]] == r)
+                        firstSpan[id++] = r;
+            }
+        });
+        if (needIds)
+        {
+            Workers.For(parts, p =>
+            {
+                for (int r = p * size, to = Math.Min(n, r + size); r < to; r++)
+                    ids[r] = firstSeen[ids[r]];
+            });
+        }
+        firsts = firstList;
+        return count;
+    }
+
+    private static void InterlockedMin(ref int target, int value)
+    {
+        int current = Volatile.Read(ref target);
+        while (value < current)
+        {
+            int prev = Interlocked.CompareExchange(ref target, value, current);
+            if (prev == current) break;
+            current = prev;
+        }
+    }
+
     // The most ids put together that index an array: 16 MB of ints.
-    private const long DenseLimit = 1 << 22;
+    internal const long DenseLimit = 1 << 22;
+    private const int ParallelCompactLimit = 1 << 22;
+    private const int PartRows = 1 << 14;
+
+    /// <summary>
+    /// For <see cref="Counts.Count"/>: an id for each row's value in the
+    /// column, from 0 to <paramref name="card"/> - 1 in <c>table-sort</c>
+    /// order (with nulls at <paramref name="card"/> - 1), or null when the
+    /// column's values are not dense or are floats.
+    /// </summary>
+    internal static int[]? TrySortedIds(IArrowArray a, out int card)
+    {
+        int n = a.Length;
+        int[]? ids;
+        bool nullsDone = false;
+        switch (a)
+        {
+            case DictionaryArray d when Categories.Is(d):
+                ids = ((Int32Array)d.Indices).Values.ToArray();
+                card = d.Dictionary.Length;
+                break;
+            case BooleanArray b:
+            {
+                ids = new int[n];
+                var bits = b.ValueBuffer.Span;
+                int off = b.Offset;
+                for (int r = 0; r < n; r++)
+                {
+                    int bit = off + r;
+                    ids[r] = (bits[bit >> 3] >> (bit & 7)) & 1;
+                }
+                card = 2;
+                break;
+            }
+            case StringArray s:
+                return Categories.SortedStringIds(s, out card);
+            case Int64Array l: ids = TryDenseIntegers(l.Values, a, out card, out nullsDone); break;
+            case Int32Array i: ids = TryDenseIntegers(i.Values, a, out card, out nullsDone); break;
+            case Int16Array i: ids = TryDenseIntegers(i.Values, a, out card, out nullsDone); break;
+            case UInt8Array i: ids = TryDenseIntegers(i.Values, a, out card, out nullsDone); break;
+            case UInt16Array i: ids = TryDenseIntegers(i.Values, a, out card, out nullsDone); break;
+            case UInt32Array i: ids = TryDenseIntegers(i.Values, a, out card, out nullsDone); break;
+            case UInt64Array i: ids = TryDenseIntegers(i.Values, a, out card, out nullsDone); break;
+            case Date32Array d: ids = TryDenseIntegers(d.Values, a, out card, out nullsDone); break;
+            case TimestampArray t: ids = TryDenseIntegers(t.Values, a, out card, out nullsDone); break;
+            default:
+                card = 0;
+                return null;
+        }
+        if (ids == null) return null;
+        if (a.NullCount != 0 && !nullsDone)
+        {
+            var valid = a.Data.Buffers[0].Span;
+            int off = a.Offset;
+            for (int r = 0; r < n; r++)
+            {
+                int bit = off + r;
+                if ((valid[bit >> 3] & (1 << (bit & 7))) == 0) ids[r] = card;
+            }
+            card++;
+        }
+        return ids;
+    }
 
     /// <summary>
     /// An id for each row's value in the column, from 0 to
@@ -159,6 +335,7 @@ public static class Reshape
         int[] ids;
         firsts = null;
         stringIds = null;
+        bool nullsDone = false;
         switch (a)
         {
             case DictionaryArray d when Categories.Is(d):
@@ -184,22 +361,22 @@ public static class Reshape
                 stringIds = (ids, strFirsts);
                 if (s.NullCount == 0) firsts = strFirsts;
                 break;
-            case Int64Array l: ids = Integers(l.Values, a, out card, out firsts); break;
-            case Int32Array i: ids = Integers(i.Values, a, out card, out firsts); break;
-            case Int16Array i: ids = Integers(i.Values, a, out card, out firsts); break;
-            case UInt8Array i: ids = Integers(i.Values, a, out card, out firsts); break;
-            case UInt16Array i: ids = Integers(i.Values, a, out card, out firsts); break;
-            case UInt32Array i: ids = Integers(i.Values, a, out card, out firsts); break;
-            case UInt64Array i: ids = Integers(i.Values, a, out card, out firsts); break;
-            case Date32Array d: ids = Integers(d.Values, a, out card, out firsts); break;
-            case TimestampArray t: ids = Integers(t.Values, a, out card, out firsts); break;
+            case Int64Array l: ids = Integers(l.Values, a, out card, out firsts, out nullsDone); break;
+            case Int32Array i: ids = Integers(i.Values, a, out card, out firsts, out nullsDone); break;
+            case Int16Array i: ids = Integers(i.Values, a, out card, out firsts, out nullsDone); break;
+            case UInt8Array i: ids = Integers(i.Values, a, out card, out firsts, out nullsDone); break;
+            case UInt16Array i: ids = Integers(i.Values, a, out card, out firsts, out nullsDone); break;
+            case UInt32Array i: ids = Integers(i.Values, a, out card, out firsts, out nullsDone); break;
+            case UInt64Array i: ids = Integers(i.Values, a, out card, out firsts, out nullsDone); break;
+            case Date32Array d: ids = Integers(d.Values, a, out card, out firsts, out nullsDone); break;
+            case TimestampArray t: ids = Integers(t.Values, a, out card, out firsts, out nullsDone); break;
             case DoubleArray d: ids = Numbered(d.Values, a, out card, out firsts); break;
             case FloatArray f: ids = Numbered(f.Values, a, out card, out firsts); break;
             default:
                 throw new ArgumentException($"(bjostat table): a column of {a.Data.DataType.Name} cannot be a key");
         }
         // The nulls: one id after the others.
-        if (a.NullCount != 0)
+        if (a.NullCount != 0 && !nullsDone)
         {
             var valid = a.Data.Buffers[0].Span;
             int off = a.Offset;
@@ -237,13 +414,75 @@ public static class Reshape
     // The distance of each value from the least, when the values span fewer
     // than DenseLimit and fewer than four times the rows; otherwise numbers
     // from a dictionary. The values under nulls are left out of the range.
-    private static int[] Integers<T>(ReadOnlySpan<T> values, IArrowArray a, out int card, out List<int>? firsts)
+    private static int[] Integers<T>(
+        ReadOnlySpan<T> values,
+        IArrowArray a,
+        out int card,
+        out List<int>? firsts,
+        out bool nullsDone)
+        where T : struct, INumber<T>
+    {
+        firsts = null;
+        var dense = TryDenseIntegers(values, a, out card, out nullsDone);
+        if (dense != null) return dense;
+        return Numbered(values, a, out card, out firsts);
+    }
+
+    private static int[]? TryDenseIntegers<T>(
+        ReadOnlySpan<T> values,
+        IArrowArray a,
+        out int card,
+        out bool nullsDone)
         where T : struct, INumber<T>
     {
         int n = values.Length;
-        firsts = null;
+        nullsDone = false;
         long least = long.MaxValue, most = long.MinValue;
-        if (a.NullCount == 0)
+        int parts = n < 2 * PartRows ? 1 : Math.Min(n / PartRows, Workers.Count);
+        if (parts >= 2)
+        {
+            int size = (n + parts - 1) / parts;
+            var mins = new long[parts];
+            var maxs = new long[parts];
+            var valMem = a.Data.Buffers[1].Memory;
+            int valOff = a.Data.Offset;
+            var validMem = a.NullCount == 0 ? ReadOnlyMemory<byte>.Empty : a.Data.Buffers[0].Memory;
+            Workers.For(parts, p =>
+            {
+                var span = MemoryMarshal.Cast<byte, T>(valMem.Span).Slice(valOff);
+                var valid = validMem.Span;
+                long lo = long.MaxValue, hi = long.MinValue;
+                int from = p * size, to = Math.Min(n, from + size);
+                if (valid.IsEmpty)
+                {
+                    for (int r = from; r < to; r++)
+                    {
+                        long v = LongValue(span[r]);
+                        if (v < lo) lo = v;
+                        if (v > hi) hi = v;
+                    }
+                }
+                else
+                {
+                    for (int r = from; r < to; r++)
+                    {
+                        int bit = valOff + r;
+                        if ((valid[bit >> 3] & (1 << (bit & 7))) == 0) continue;
+                        long v = LongValue(span[r]);
+                        if (v < lo) lo = v;
+                        if (v > hi) hi = v;
+                    }
+                }
+                mins[p] = lo;
+                maxs[p] = hi;
+            });
+            for (int p = 0; p < parts; p++)
+            {
+                if (mins[p] < least) least = mins[p];
+                if (maxs[p] > most) most = maxs[p];
+            }
+        }
+        else if (a.NullCount == 0)
         {
             for (int r = 0; r < n; r++)
             {
@@ -272,14 +511,47 @@ public static class Reshape
         }
         if ((ulong)(most - least) < (ulong)Math.Min(DenseLimit, 4L * n + 64))
         {
-            var ids = new int[n];
-            // Null rows are overwritten with `card` in Ids right after.
+            int c = (int)(most - least + 1);
+            var ids = GC.AllocateUninitializedArray<int>(n);
+            if (parts >= 2)
+            {
+                int size = (n + parts - 1) / parts;
+                var valMem = a.Data.Buffers[1].Memory;
+                int valOff = a.Data.Offset;
+                var validMem = a.NullCount == 0 ? ReadOnlyMemory<byte>.Empty : a.Data.Buffers[0].Memory;
+                long baseVal = least;
+                Workers.For(parts, p =>
+                {
+                    var span = MemoryMarshal.Cast<byte, T>(valMem.Span).Slice(valOff);
+                    var valid = validMem.Span;
+                    int from = p * size, to = Math.Min(n, from + size);
+                    if (valid.IsEmpty)
+                    {
+                        for (int r = from; r < to; r++)
+                            ids[r] = unchecked((int)(LongValue(span[r]) - baseVal));
+                    }
+                    else
+                    {
+                        for (int r = from; r < to; r++)
+                        {
+                            int bit = valOff + r;
+                            ids[r] = (valid[bit >> 3] & (1 << (bit & 7))) == 0
+                                ? c
+                                : unchecked((int)(LongValue(span[r]) - baseVal));
+                        }
+                    }
+                });
+                nullsDone = a.NullCount != 0;
+                card = nullsDone ? c + 1 : c;
+                return ids;
+            }
             for (int r = 0; r < n; r++)
                 ids[r] = unchecked((int)(LongValue(values[r]) - least));
-            card = (int)(most - least + 1);
+            card = c;
             return ids;
         }
-        return Numbered(values, a, out card, out firsts);
+        card = 0;
+        return null;
     }
 
     // A number for each distinct value, in the order of their first rows.
@@ -361,7 +633,7 @@ public static class Reshape
     {
         var names = keys.Length == 0 ? t.Schema.FieldsList.Select(f => f.Name).ToArray() : keys;
         var columns = KeyColumns(t, names).Select(t.Column).ToArray();
-        Groups(columns, t.Length, out var firsts);
+        Groups(columns, t.Length, out var firsts, out _, false, needGroupIds: false);
         if (firsts.Count == t.Length) return t;
         return Query.Take(t, firsts.ToArray(), firsts.Count);
     }
@@ -663,11 +935,29 @@ public static class Reshape
             var d = p.Data;
             var from = d.Buffers[which];
             if (which == 0 && (d.NullCount == 0 || from.IsEmpty))
-                for (int i = 0; i < d.Length; i++, at++) bits[at >> 3] |= (byte)(1 << (at & 7));
+            {
+                int i = 0;
+                if ((at & 7) == 0 && d.Length >= 8)
+                {
+                    int wholeBytes = d.Length >> 3;
+                    bits.AsSpan(at >> 3, wholeBytes).Fill(0xFF);
+                    i = wholeBytes << 3;
+                    at += i;
+                }
+                for (; i < d.Length; i++, at++) bits[at >> 3] |= (byte)(1 << (at & 7));
+            }
             else
             {
                 var span = from.Span;
-                for (int i = 0; i < d.Length; i++, at++)
+                int i = 0;
+                if ((at & 7) == 0 && (d.Offset & 7) == 0 && d.Length >= 8)
+                {
+                    int wholeBytes = d.Length >> 3;
+                    span.Slice(d.Offset >> 3, wholeBytes).CopyTo(bits.AsSpan(at >> 3));
+                    i = wholeBytes << 3;
+                    at += i;
+                }
+                for (; i < d.Length; i++, at++)
                 {
                     int j = d.Offset + i;
                     bits[at >> 3] |= (byte)(((span[j >> 3] >> (j & 7)) & 1) << (at & 7));
@@ -694,8 +984,11 @@ public static class Reshape
         {
             var d = p.Data;
             var o = MemoryMarshal.Cast<byte, int>(d.Buffers[1].Span).Slice(d.Offset, d.Length + 1);
-            int first = o[0], length = o[d.Length] - first;
-            for (int i = 0; i < d.Length; i++) offsets[at + i] = end + o[i] - first;
+            int first = o[0], length = o[d.Length] - first, delta = end - first;
+            if (delta == 0)
+                o.Slice(0, d.Length).CopyTo(offsets.Slice(at));
+            else
+                for (int i = 0; i < d.Length; i++) offsets[at + i] = o[i] + delta;
             d.Buffers[2].Span.Slice(first, length).CopyTo(bytes.AsSpan(end));
             at += d.Length;
             end += length;
@@ -749,7 +1042,7 @@ public static class Reshape
 
     // The rows of a part of an interleaved copy: a multiple of 8, so that
     // each part writes whole bytes of the valid bitmap.
-    private const int InterleavePart = 1 << 16;
+    private const int InterleavePart = 1 << 14;
 
     // Whether a column of the type is copied by Interleaved: numbers, dates
     // and timestamps, a value in a fixed number of whole bytes.
@@ -788,13 +1081,28 @@ public static class Reshape
                 }
                 if (valid != null)
                 {
-                    var c = cols[j];
-                    for (int i = from; i < to; i++)
-                        if (c.IsValid(i))
+                    if (data.NullCount == 0 || data.Buffers[0].IsEmpty)
+                    {
+                        for (int i = from; i < to; i++)
                         {
                             int bit = i * k + j;
                             valid[bit >> 3] |= (byte)(1 << (bit & 7));
                         }
+                    }
+                    else
+                    {
+                        var srcValid = data.Buffers[0].Span;
+                        int off = data.Offset;
+                        for (int i = from; i < to; i++)
+                        {
+                            int srcBit = off + i;
+                            if ((srcValid[srcBit >> 3] & (1 << (srcBit & 7))) != 0)
+                            {
+                                int bit = i * k + j;
+                                valid[bit >> 3] |= (byte)(1 << (bit & 7));
+                            }
+                        }
+                    }
                 }
             }
         });

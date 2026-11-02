@@ -12,6 +12,8 @@
 // order of the levels is the order of a sort: the levels given, or the
 // strings in the order of their code points.
 
+using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -60,45 +62,38 @@ public static class Categories
     private static DictionaryArray FromStrings(StringArray s, string[] given, string name)
     {
         int n = s.Length;
-        var ids = StringIds(s, out var firsts);
-
-        // The level of each distinct string.
-        string[] levels;
-        var levelOf = new int[firsts.Count];
-        if (given.Length == 0)
+        StringArray? dictionary = null;
+        var codeBytes = NumberToBytes(s, out _, firsts =>
         {
-            var byBytes = InByteOrder(s, firsts);
-            levels = byBytes.Select(id => s.GetString(firsts[id])).ToArray();
-            for (int l = 0; l < byBytes.Length; l++) levelOf[byBytes[l]] = l;
-        }
-        else
-        {
-            levels = given;
-            var index = new Dictionary<string, int>(StringComparer.Ordinal);
-            for (int l = 0; l < given.Length; l++) index[given[l]] = l;
-            for (int id = 0; id < firsts.Count; id++)
+            var levelOf = new int[firsts.Count];
+            if (given.Length == 0)
             {
-                var text = s.GetString(firsts[id]);
-                if (!index.TryGetValue(text, out levelOf[id]))
-                    throw new TableProblem($"'{text}' in row {firsts[id]} of '{name}' is not one of the levels.");
+                var byBytes = InByteOrder(s, firsts);
+                var firstRows = new int[byBytes.Length];
+                for (int l = 0; l < byBytes.Length; l++)
+                {
+                    int id = byBytes[l];
+                    levelOf[id] = l;
+                    firstRows[l] = firsts[id];
+                }
+                dictionary = TakeStrings(s, firstRows);
             }
-        }
-
-        // The code of each row, 0 at a null, in parts on the workers, the
-        // null bits read from the bitmap itself.
-        var codes = new byte[n * sizeof(int)];
-        int offset = s.Offset;
-        Workers.For((n + PartRows - 1) / PartRows, p =>
-        {
-            var span = MemoryMarshal.Cast<byte, int>(codes.AsSpan());
-            var valid = s.NullCount == 0 ? ReadOnlySpan<byte>.Empty : s.NullBitmapBuffer.Span;
-            for (int r = p * PartRows, to = Math.Min(n, r + PartRows); r < to; r++)
+            else
             {
-                int bit = offset + r;
-                span[r] = !valid.IsEmpty && (valid[bit >> 3] & (1 << (bit & 7))) == 0 ? 0 : levelOf[ids[r]];
+                var index = new Dictionary<string, int>(given.Length, StringComparer.Ordinal);
+                for (int l = 0; l < given.Length; l++) index[given[l]] = l;
+                for (int id = 0; id < firsts.Count; id++)
+                {
+                    var text = s.GetString(firsts[id]);
+                    if (!index.TryGetValue(text, out levelOf[id]))
+                        throw new TableProblem($"'{text}' in row {firsts[id]} of '{name}' is not one of the levels.");
+                }
+                dictionary = new StringArray.Builder().AppendRange(given).Build();
             }
+            return levelOf;
         });
-        return Make(new ArrowBuffer(codes), Validity(s), s.NullCount, n, levels);
+        var data = new ArrayData(Type, n, s.NullCount, 0, new[] { Validity(s), new ArrowBuffer(codeBytes) }, null, dictionary!.Data);
+        return new DictionaryArray(data);
     }
 
     /// <summary>
@@ -113,11 +108,37 @@ public static class Categories
     {
         var s = (StringArray)a;
         int n = s.Length;
-        var ids = StringIds(s, out var firsts);
-        var levels = new string[firsts.Count];
-        for (int k = 0; k < levels.Length; k++) levels[k] = s.GetString(firsts[k]);
-        var codes = MemoryMarshal.AsBytes(ids.AsSpan()).ToArray();
-        return Make(new ArrowBuffer(codes), Validity(s), s.NullCount, n, levels);
+        var codeBytes = NumberToBytes(s, out var firsts, null);
+        var dictionary = TakeStrings(s, CollectionsMarshal.AsSpan(firsts));
+        var data = new ArrayData(Type, n, s.NullCount, 0, new[] { Validity(s), new ArrowBuffer(codeBytes) }, null, dictionary.Data);
+        return new DictionaryArray(data);
+    }
+
+    // The strings at the rows of s, copied directly as UTF-8 bytes without
+    // making a C# string of each.
+    private static StringArray TakeStrings(StringArray s, ReadOnlySpan<int> rows)
+    {
+        int k = rows.Length;
+        var offsets = s.ValueOffsets;
+        var bytes = s.ValueBuffer.Span;
+        var newOffsetBytes = GC.AllocateUninitializedArray<byte>((k + 1) * sizeof(int));
+        var newOffsets = MemoryMarshal.Cast<byte, int>(newOffsetBytes.AsSpan());
+        int total = 0;
+        newOffsets[0] = 0;
+        for (int i = 0; i < k; i++)
+        {
+            int r = rows[i];
+            total += offsets[r + 1] - offsets[r];
+            newOffsets[i + 1] = total;
+        }
+        var newBytes = GC.AllocateUninitializedArray<byte>(total);
+        for (int i = 0; i < k; i++)
+        {
+            int r = rows[i];
+            int start = offsets[r];
+            bytes.Slice(start, offsets[r + 1] - start).CopyTo(newBytes.AsSpan(newOffsets[i]));
+        }
+        return new StringArray(k, new ArrowBuffer(newOffsetBytes), new ArrowBuffer(newBytes), ArrowBuffer.Empty, 0);
     }
 
     /// <summary>
@@ -130,14 +151,71 @@ public static class Categories
     internal static int[] StringIds(StringArray s, out List<int> firsts)
     {
         int n = s.Length;
-        var ids = new int[n];
-        int parts = Math.Min(n / PartRows, 4 * Workers.Count);
+        var ids = s.NullCount == 0 ? GC.AllocateUninitializedArray<int>(n) : new int[n];
+        NumberCore(s, ids, null, out firsts, null);
+        return ids;
+    }
+
+    /// <summary>
+    /// A number for each distinct string in the order of their UTF-8 bytes
+    /// (0 to <paramref name="card"/> - 1, or with nulls at <paramref name="card"/> - 1),
+    /// numbered in a single pass over the rows.
+    /// </summary>
+    internal static int[] SortedStringIds(StringArray s, out int card)
+    {
+        int n = s.Length;
+        var ids = GC.AllocateUninitializedArray<int>(n);
+        int distinct = 0;
+        NumberCore(s, ids, null, out _, firsts =>
+        {
+            distinct = firsts.Count;
+            var byBytes = InByteOrder(s, firsts);
+            var rank = new int[byBytes.Length];
+            for (int l = 0; l < byBytes.Length; l++) rank[byBytes[l]] = l;
+            return rank;
+        }, nullValue: -1);
+        card = s.NullCount == 0 ? distinct : distinct + 1;
+        return ids;
+    }
+
+    private static byte[] NumberToBytes(StringArray s, out List<int> firsts, Func<List<int>, int[]>? remap)
+    {
+        int n = s.Length;
+        var bytes = s.NullCount == 0 ? GC.AllocateUninitializedArray<byte>(n * sizeof(int)) : new byte[n * sizeof(int)];
+        NumberCore(s, null, bytes, out firsts, remap);
+        return bytes;
+    }
+
+    private static void NumberCore(
+        StringArray s,
+        int[]? intIds,
+        byte[]? byteIds,
+        out List<int> firsts,
+        Func<List<int>, int[]>? remap,
+        int nullValue = 0)
+    {
+        int n = s.Length;
+        int parts = n < 2 * PartRows ? 1 : Math.Min(n / PartRows, Workers.Count);
         if (parts < 2)
         {
+            var span = intIds != null ? intIds.AsSpan() : MemoryMarshal.Cast<byte, int>(byteIds.AsSpan());
             var one = new StringIdTable(s);
-            one.Number(0, n, ids);
-            firsts = one.Firsts;
-            return ids;
+            one.Number(0, n, span);
+            firsts = new List<int>(one.Entries.Count);
+            foreach (ref readonly var e in CollectionsMarshal.AsSpan(one.Entries)) firsts.Add(e.First);
+            int nv = nullValue < 0 ? firsts.Count : nullValue;
+            if (remap != null)
+            {
+                var levelOf = remap(firsts);
+                var valid = s.NullCount == 0 ? ReadOnlySpan<byte>.Empty : s.NullBitmapBuffer.Span;
+                int off = s.Offset;
+                for (int r = 0; r < n; r++)
+                {
+                    int bit = off + r;
+                    span[r] = !valid.IsEmpty && (valid[bit >> 3] & (1 << (bit & 7))) == 0 ? nv : levelOf[span[r]];
+                }
+            }
+            return;
         }
         // Each part numbers its rows on a worker; then the parts' strings are
         // numbered for the whole column, the parts in order, so that the
@@ -147,63 +225,128 @@ public static class Categories
         var tables = new StringIdTable[parts];
         Workers.For(parts, p =>
         {
+            var span = intIds != null ? intIds.AsSpan() : MemoryMarshal.Cast<byte, int>(byteIds.AsSpan());
             var t = new StringIdTable(s);
-            t.Number(p * size, Math.Min(n, (p + 1) * size), ids);
+            t.Number(p * size, Math.Min(n, (p + 1) * size), span);
             tables[p] = t;
         });
         var maps = Merged(s, tables, out firsts);
+        int nullCode = nullValue < 0 ? firsts.Count : nullValue;
+        if (remap != null)
+        {
+            var levelOf = remap(firsts);
+            for (int p = 0; p < parts; p++)
+            {
+                var map = maps[p];
+                for (int k = 0; k < map.Length; k++) map[k] = levelOf[map[k]];
+            }
+        }
         int offset = s.Offset;
         Workers.For(parts, p =>
         {
+            var span = intIds != null ? intIds.AsSpan() : MemoryMarshal.Cast<byte, int>(byteIds.AsSpan());
             var map = maps[p];
             var valid = s.NullCount == 0 ? ReadOnlySpan<byte>.Empty : s.NullBitmapBuffer.Span;
-            for (int r = p * size, to = Math.Min(n, (p + 1) * size); r < to; r++)
+            if (valid.IsEmpty)
             {
-                int bit = offset + r;
-                if (valid.IsEmpty || (valid[bit >> 3] & (1 << (bit & 7))) != 0) ids[r] = map[ids[r]];
+                for (int r = p * size, to = Math.Min(n, (p + 1) * size); r < to; r++)
+                    span[r] = map[span[r]];
+            }
+            else
+            {
+                for (int r = p * size, to = Math.Min(n, (p + 1) * size); r < to; r++)
+                {
+                    int bit = offset + r;
+                    span[r] = (valid[bit >> 3] & (1 << (bit & 7))) == 0 ? nullCode : map[span[r]];
+                }
             }
         });
-        return ids;
+    }
+
+    private readonly struct ByteKey(ulong p0, ulong p1, int len, int id) : IComparable<ByteKey>
+    {
+        public readonly ulong P0 = p0;
+        public readonly ulong P1 = p1;
+        public readonly int Len = len;
+        public readonly int Id = id;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int CompareTo(ByteKey other)
+        {
+            int c = P0.CompareTo(other.P0);
+            if (c != 0) return c;
+            c = P1.CompareTo(other.P1);
+            if (c != 0) return c;
+            return Len.CompareTo(other.Len);
+        }
     }
 
     /// <summary>
     /// The numbers of the strings whose first rows are <paramref name="firsts"/>,
     /// in the order of the strings' bytes.
     /// </summary>
-    /// <remarks>
-    /// Each string is first a number of its first 8 bytes, the first byte
-    /// highest and zeros after a shorter string, whose order is that of the
-    /// bytes; two strings with the same 8 bytes are compared by all their
-    /// bytes, read from the column's buffer. A comparison that asked Arrow
-    /// for both strings' bytes each time took 10 ms of the 32 of a
-    /// categorize of 20 000 regions.
-    /// </remarks>
     internal static int[] InByteOrder(StringArray s, List<int> firsts)
     {
         int k = firsts.Count;
         var offsets = s.ValueOffsets;
         var bytes = s.ValueBuffer.Span;
-        var start = new int[k];
-        var length = new int[k];
-        var keys = new (ulong Prefix, int Id)[k];
+        ref byte byteRef = ref MemoryMarshal.GetReference(bytes);
+        int safeEnd = bytes.Length - 16;
+        var keys = new ByteKey[k];
+        int maxLen = 0;
         for (int id = 0; id < k; id++)
         {
             int r = firsts[id];
-            start[id] = offsets[r];
-            length[id] = offsets[r + 1] - offsets[r];
-            ulong prefix = 0;
-            int take = Math.Min(8, length[id]);
-            for (int i = 0; i < take; i++) prefix |= (ulong)bytes[start[id] + i] << (56 - 8 * i);
-            keys[id] = (prefix, id);
+            int st = offsets[r];
+            int len = offsets[r + 1] - st;
+            if (len > maxLen) maxLen = len;
+            ulong p0 = 0, p1 = 0;
+            if (st <= safeEnd)
+            {
+                ulong raw0 = BinaryPrimitives.ReverseEndianness(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref byteRef, st)));
+                if (len < 8)
+                {
+                    p0 = len == 0 ? 0 : raw0 & (~0UL << ((8 - len) * 8));
+                }
+                else
+                {
+                    p0 = raw0;
+                    ulong raw1 = BinaryPrimitives.ReverseEndianness(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref byteRef, st + 8)));
+                    p1 = len >= 16 ? raw1 : (len == 8 ? 0 : raw1 & (~0UL << ((16 - len) * 8)));
+                }
+            }
+            else
+            {
+                int take0 = Math.Min(8, len);
+                for (int i = 0; i < take0; i++) p0 |= (ulong)bytes[st + i] << (56 - 8 * i);
+                int take1 = Math.Min(16, len);
+                for (int i = 8; i < take1; i++) p1 |= (ulong)bytes[st + i] << (56 - 8 * (i - 8));
+            }
+            keys[id] = new ByteKey(p0, p1, len, id);
         }
-        var memory = s.ValueBuffer.Memory;
-        System.Array.Sort(keys, (a, b) =>
+        if (maxLen <= 16)
         {
-            int c = a.Prefix.CompareTo(b.Prefix);
-            if (c != 0) return c;
-            var all = memory.Span;
-            return all.Slice(start[a.Id], length[a.Id]).SequenceCompareTo(all.Slice(start[b.Id], length[b.Id]));
-        });
+            keys.AsSpan().Sort();
+        }
+        else
+        {
+            var offMem = s.ValueOffsetsBuffer.Memory;
+            int offSlice = s.Offset;
+            var memory = s.ValueBuffer.Memory;
+            System.Array.Sort(keys, (a, b) =>
+            {
+                int c = a.P0.CompareTo(b.P0);
+                if (c != 0) return c;
+                c = a.P1.CompareTo(b.P1);
+                if (c != 0) return c;
+                if (a.Len <= 16 && b.Len <= 16) return a.Len.CompareTo(b.Len);
+                var offs = MemoryMarshal.Cast<byte, int>(offMem.Span).Slice(offSlice);
+                var all = memory.Span;
+                int ra = firsts[a.Id], rb = firsts[b.Id];
+                int sa = offs[ra], sb = offs[rb];
+                return all.Slice(sa, a.Len).SequenceCompareTo(all.Slice(sb, b.Len));
+            });
+        }
         var order = new int[k];
         for (int i = 0; i < k; i++) order[i] = keys[i].Id;
         return order;
@@ -219,16 +362,6 @@ public static class Categories
     /// each number. Numbered so, the strings are in the order of their first
     /// rows.
     /// </summary>
-    /// <remarks>
-    /// The strings of all the parts are put in buckets by their hashes, and
-    /// each bucket is merged on a worker, the parts in their order, so that
-    /// the first time a string is met is its first row: the parts are in the
-    /// order of the rows, and a part's strings are in the order of their first
-    /// rows. A string is in one bucket, so each bucket writes other places of
-    /// the maps. Then the strings of all the buckets are numbered in the
-    /// order of their first rows. Merged on one thread, the strings of 20 000
-    /// regions in 15 parts took 10.5 ms of the 32 of a categorize.
-    /// </remarks>
     private static int[][] Merged(StringArray s, StringIdTable[] tables, out List<int> firsts)
     {
         int parts = tables.Length;
@@ -237,11 +370,11 @@ public static class Categories
         var inBucket = new List<int>[parts][];
         Workers.For(parts, p =>
         {
-            var t = tables[p];
-            maps[p] = new int[t.Firsts.Count];
+            var entries = CollectionsMarshal.AsSpan(tables[p].Entries);
+            maps[p] = new int[entries.Length];
             var lists = new List<int>[MergeBuckets];
             for (int b = 0; b < MergeBuckets; b++) lists[b] = new List<int>();
-            for (int k = 0; k < t.Hashes.Count; k++) lists[Bucket(t.Hashes[k])].Add(k);
+            for (int k = 0; k < entries.Length; k++) lists[Bucket(entries[k].Hash)].Add(k);
             inBucket[p] = lists;
         });
         var merged = new StringIdTable[MergeBuckets];
@@ -250,38 +383,46 @@ public static class Categories
             var table = new StringIdTable(s);
             for (int p = 0; p < parts; p++)
             {
-                var t = tables[p];
+                var entries = CollectionsMarshal.AsSpan(tables[p].Entries);
                 var map = maps[p];
-                foreach (int k in inBucket[p][b]) map[k] = table.IdOf(t.Firsts[k], t.Hashes[k]);
+                var bucketList = CollectionsMarshal.AsSpan(inBucket[p][b]);
+                for (int i = 0; i < bucketList.Length; i++)
+                {
+                    int k = bucketList[i];
+                    map[k] = table.IdOf(in entries[k]);
+                }
             }
             merged[b] = table;
         });
         // The strings of all the buckets in the order of their first rows,
         // each row once: that order gives their numbers.
         int count = 0;
-        foreach (var table in merged) count += table.Firsts.Count;
-        var order = new long[count];
-        var places = new int[count];
+        foreach (var table in merged) count += table.Entries.Count;
+        var packed = GC.AllocateUninitializedArray<ulong>(count);
         for (int b = 0, i = 0; b < MergeBuckets; b++)
-            for (int e = 0; e < merged[b].Firsts.Count; e++, i++)
-            {
-                order[i] = merged[b].Firsts[e];
-                places[i] = (b << 24) | e;
-            }
-        System.Array.Sort(order, places);
+        {
+            var entries = CollectionsMarshal.AsSpan(merged[b].Entries);
+            for (int e = 0; e < entries.Length; e++, i++)
+                packed[i] = ((ulong)(uint)entries[e].First << 32) | (uint)((b << 24) | e);
+        }
+        packed.AsSpan().Sort();
         var number = new int[MergeBuckets][];
-        for (int b = 0; b < MergeBuckets; b++) number[b] = new int[merged[b].Firsts.Count];
+        for (int b = 0; b < MergeBuckets; b++) number[b] = new int[merged[b].Entries.Count];
         firsts = new List<int>(count);
+        CollectionsMarshal.SetCount(firsts, count);
+        var firstSpan = CollectionsMarshal.AsSpan(firsts);
         for (int i = 0; i < count; i++)
         {
-            number[places[i] >> 24][places[i] & 0xFF_FFFF] = i;
-            firsts.Add((int)order[i]);
+            ulong v = packed[i];
+            int place = (int)(uint)v;
+            number[place >> 24][place & 0xFF_FFFF] = i;
+            firstSpan[i] = (int)(v >> 32);
         }
         Workers.For(parts, p =>
         {
-            var t = tables[p];
+            var entries = CollectionsMarshal.AsSpan(tables[p].Entries);
             var map = maps[p];
-            for (int k = 0; k < map.Length; k++) map[k] = number[Bucket(t.Hashes[k])][map[k]];
+            for (int k = 0; k < map.Length; k++) map[k] = number[Bucket(entries[k].Hash)][map[k]];
         });
         return maps;
     }
@@ -289,7 +430,7 @@ public static class Categories
     private static int Bucket(int hash) => (int)((uint)hash >> 26);
 
     // The fewest rows of a part when the strings of a column are numbered.
-    private const int PartRows = 1 << 16;
+    private const int PartRows = 1 << 14;
 
     /// <summary>
     /// Numbers for the distinct strings of a column, by open addressing over
@@ -298,8 +439,16 @@ public static class Categories
     /// </summary>
     private sealed class StringIdTable(StringArray s)
     {
-        public readonly List<int> Firsts = new();
-        public readonly List<int> Hashes = new();
+        public readonly struct Entry(int first, int hash, int len, ulong w0, ulong w1)
+        {
+            public readonly int First = first;
+            public readonly int Hash = hash;
+            public readonly int Len = len;
+            public readonly ulong W0 = w0;
+            public readonly ulong W1 = w1;
+        }
+
+        public readonly List<Entry> Entries = new();
         private int _mask = 63;
         private int[] _table = Filled(64);
 
@@ -319,65 +468,132 @@ public static class Categories
             return t;
         }
 
-        public static int Hash(ReadOnlySpan<byte> v)
+        // Two 8-byte words that cover all bytes of a string of at most 16
+        // bytes (its first 8 and last 8), and a fast multiply-xor hash of
+        // them: a hit on a string of at most 16 bytes compares the two words
+        // in registers without reading the column's offsets or bytes again.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static (int Hash, ulong W0, ulong W1) Key(ref byte p, int len)
         {
-            var hc = new HashCode();
-            hc.AddBytes(v);
-            return hc.ToHashCode();
+            ulong w0, w1;
+            if (len >= 8)
+            {
+                w0 = Unsafe.ReadUnaligned<ulong>(ref p);
+                w1 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref p, len - 8));
+            }
+            else if (len >= 4)
+            {
+                w0 = Unsafe.ReadUnaligned<uint>(ref p) | ((ulong)Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref p, len - 4)) << 32);
+                w1 = 0;
+            }
+            else if (len > 0)
+            {
+                w0 = p | ((ulong)Unsafe.Add(ref p, len >> 1) << 8) | ((ulong)Unsafe.Add(ref p, len - 1) << 16);
+                w1 = 0;
+            }
+            else
+            {
+                w0 = 0;
+                w1 = 0;
+            }
+            ulong h = (w0 ^ (ulong)len) * 0x9E3779B97F4A7C15UL;
+            h = (h ^ (h >> 32) ^ w1) * 0xBF58476D1CE4E5B9UL;
+            return ((int)(h ^ (h >> 32)), w0, w1);
         }
 
         /// <summary>Numbers the rows from..to into ids; a null is left as it is.</summary>
-        public void Number(int from, int to, int[] ids)
+        public void Number(int from, int to, Span<int> ids)
         {
             var offsets = Offsets;
             var bytes = _bytes.Span;
+            ref int offRef = ref MemoryMarshal.GetReference(offsets);
+            ref byte byteRef = ref MemoryMarshal.GetReference(bytes);
             var valid = s.NullCount == 0 ? ReadOnlySpan<byte>.Empty : s.NullBitmapBuffer.Span;
-            for (int r = from; r < to; r++)
+            if (valid.IsEmpty)
             {
-                if (!valid.IsEmpty)
+                for (int r = from; r < to; r++)
+                {
+                    int start = Unsafe.Add(ref offRef, r);
+                    int len = Unsafe.Add(ref offRef, r + 1) - start;
+                    var (h, w0, w1) = Key(ref Unsafe.Add(ref byteRef, start), len);
+                    ids[r] = IdOf(r, h, len, w0, w1, start, ref offRef, bytes);
+                }
+            }
+            else
+            {
+                for (int r = from; r < to; r++)
                 {
                     int bit = _offset + r;
                     if ((valid[bit >> 3] & (1 << (bit & 7))) == 0) continue;
+                    int start = Unsafe.Add(ref offRef, r);
+                    int len = Unsafe.Add(ref offRef, r + 1) - start;
+                    var (h, w0, w1) = Key(ref Unsafe.Add(ref byteRef, start), len);
+                    ids[r] = IdOf(r, h, len, w0, w1, start, ref offRef, bytes);
                 }
-                int start = offsets[r];
-                var v = bytes.Slice(start, offsets[r + 1] - start);
-                ids[r] = IdOf(r, Hash(v), v, offsets, bytes);
             }
         }
 
-        /// <summary>The number of the string of row r, whose hash is h; a new one when it is new.</summary>
-        public int IdOf(int r, int h)
+        /// <summary>The number of the string of <paramref name="entry"/>; a new one when it is new.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int IdOf(in Entry entry)
         {
-            var offsets = Offsets;
-            var bytes = _bytes.Span;
-            int start = offsets[r];
-            return IdOf(r, h, bytes.Slice(start, offsets[r + 1] - start), offsets, bytes);
-        }
-
-        private int IdOf(int r, int h, ReadOnlySpan<byte> v, ReadOnlySpan<int> offsets, ReadOnlySpan<byte> bytes)
-        {
-            int i = h & _mask, id;
+            int i = entry.Hash & _mask, id;
+            var entries = CollectionsMarshal.AsSpan(Entries);
             while ((id = _table[i]) >= 0)
             {
-                if (Hashes[id] == h)
+                ref readonly var e = ref entries[id];
+                if (e.Len == entry.Len && e.W0 == entry.W0 && e.W1 == entry.W1)
                 {
-                    int first = Firsts[id], start = offsets[first];
-                    if (bytes.Slice(start, offsets[first + 1] - start).SequenceEqual(v)) return id;
+                    if (entry.Len <= 16 || SameMiddle(e.First, entry.First, entry.Len)) return id;
                 }
                 i = (i + 1) & _mask;
             }
-            id = Firsts.Count;
-            Firsts.Add(r);
-            Hashes.Add(h);
-            _table[i] = id;
-            if (Firsts.Count * 2 > _mask)
+            return Insert(i, entry);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private int IdOf(int r, int h, int len, ulong w0, ulong w1, int start, ref int offRef, ReadOnlySpan<byte> bytes)
+        {
+            int i = h & _mask, id;
+            var entries = CollectionsMarshal.AsSpan(Entries);
+            while ((id = _table[i]) >= 0)
+            {
+                ref readonly var e = ref entries[id];
+                if (e.Len == len && e.W0 == w0 && e.W1 == w1)
+                {
+                    if (len <= 16) return id;
+                    int firstStart = Unsafe.Add(ref offRef, e.First);
+                    if (bytes.Slice(firstStart + 8, len - 16).SequenceEqual(bytes.Slice(start + 8, len - 16)))
+                        return id;
+                }
+                i = (i + 1) & _mask;
+            }
+            return Insert(i, new Entry(r, h, len, w0, w1));
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private bool SameMiddle(int firstA, int firstB, int len)
+        {
+            var offsets = Offsets;
+            var bytes = _bytes.Span;
+            return bytes.Slice(offsets[firstA] + 8, len - 16).SequenceEqual(bytes.Slice(offsets[firstB] + 8, len - 16));
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private int Insert(int slot, Entry entry)
+        {
+            int id = Entries.Count;
+            Entries.Add(entry);
+            _table[slot] = id;
+            if (Entries.Count * 2 > _mask)
             {
                 // Twice the room, and each id where its hash puts it.
                 _mask = _mask * 2 + 1;
                 _table = Filled(_mask + 1);
-                for (int k = 0; k < Hashes.Count; k++)
+                var entries = CollectionsMarshal.AsSpan(Entries);
+                for (int k = 0; k < entries.Length; k++)
                 {
-                    int j = Hashes[k] & _mask;
+                    int j = entries[k].Hash & _mask;
                     while (_table[j] >= 0) j = (j + 1) & _mask;
                     _table[j] = k;
                 }

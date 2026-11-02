@@ -40,7 +40,11 @@
 (import (bjostat query))
 
 (import/extern
-  (clr-quantiles (: Bjostat.Stats.Quantiles (-> (MutableVec double) (Array double) (Array double)))))
+  (clr-quantiles (: Bjostat.Stats.Quantiles (-> (MutableVec double) (Array double) (Array double))))
+  (clr-summarize (: Bjostat.Stats.Summarize (-> (MutableVec double) (Array double))))
+  (stats-grow (: Bjostat.Stats.Grow (-> (MutableVec double) int (MutableVec double))))
+  (stats-span (: Bjostat.Stats.Span (-> (MutableVec double) int int (Span double))))
+  (stats-no-none! (: Bjostat.Stats.NoNone (-> (MutableVec double) int void))))
 
 ;; ===========================================================================
 ;; Mean and variance, in one pass
@@ -207,6 +211,14 @@
       ((Some qs) (Some (array-ref qs 0)))
       (None None))))
 
+(impl (BlockCollector Quantile)
+  (type %value double)
+  (type %acc (MutableVec double))
+  (defun (block-count c acc) (mutablevec-length acc))
+  (defun (block-grow c acc n) (stats-grow acc n))
+  (defun (block-span c acc start n) (stats-span acc start n))
+  (defun (block-none! c acc i) (stats-no-none! acc i)))
+
 ;; The quantiles at several p, from one sort.
 (type (: Quantiles #:opaque (Struct (: ps (Vec double)))))
 
@@ -224,6 +236,14 @@
       ((Some qs) (Some (array->vec qs)))
       (None None))))
 
+(impl (BlockCollector Quantiles)
+  (type %value double)
+  (type %acc (MutableVec double))
+  (defun (block-count c acc) (mutablevec-length acc))
+  (defun (block-grow c acc n) (stats-grow acc n))
+  (defun (block-span c acc start n) (stats-span acc start n))
+  (defun (block-none! c acc i) (stats-no-none! acc i)))
+
 ;; The median: the quantile at 0.5.
 (type (: Median (Union median)))
 
@@ -237,6 +257,14 @@
     (match (quantiles-of acc (vec->array [0.5]))
       ((Some qs) (Some (array-ref qs 0)))
       (None None))))
+
+(impl (BlockCollector Median)
+  (type %value double)
+  (type %acc (MutableVec double))
+  (defun (block-count c acc) (mutablevec-length acc))
+  (defun (block-grow c acc n) (stats-grow acc n))
+  (defun (block-span c acc start n) (stats-span acc start n))
+  (defun (block-none! c acc i) (stats-no-none! acc i)))
 
 ;; ===========================================================================
 ;; Summary
@@ -252,25 +280,34 @@
 ;; The summary of the values, or None when there are none.
 (type (: Summarizing (Union summarizing)))
 
-(type (: SummaryAcc #:opaque (Struct (: values (MutableVec double)) (: moments Moments))))
+(type (: SummaryAcc #:opaque (Struct (: values (MutableVec double)))))
 
 (impl (Collector Summarizing)
   (type %elem double)
   (type %acc SummaryAcc)
   (type %out (Option Summary))
-  (defun (collector-init c) (SummaryAcc (values (mutablevec)) (moments no-moments)))
+  (defun (collector-init c) (SummaryAcc (values (mutablevec))))
   (defun (collector-step c acc x)
     (mutablevec-add! (record-ref acc values) x)
-    (SummaryAcc (values (record-ref acc values)) (moments (moments-add (record-ref acc moments) x))))
+    acc)
   (defun (collector-finish c acc)
-    (def m (record-ref acc moments))
-    (match (quantiles-of (record-ref acc values) (vec->array [0.0 0.25 0.5 0.75 1.0]))
-      ((Some q)
-       (Some (Summary (count (record-ref m n))
-                      (min (array-ref q 0)) (q1 (array-ref q 1)) (median (array-ref q 2))
-                      (mean (moments-mean m)) (q3 (array-ref q 3)) (max (array-ref q 4))
-                      (sd (match (moments-variance m) ((Some v) (Some (sqrt v))) (None None))))))
-      (None None))))
+    (def vs (record-ref acc values))
+    (def n (mutablevec-length vs))
+    (if (= n 0)
+        None
+        (let ((q (clr-summarize vs)))
+          (Some (Summary (count (cast long n))
+                         (min (array-ref q 0)) (q1 (array-ref q 1)) (median (array-ref q 2))
+                         (mean (array-ref q 3)) (q3 (array-ref q 4)) (max (array-ref q 5))
+                         (sd (if (< n 2) None (Some (array-ref q 6))))))))))
+
+(impl (BlockCollector Summarizing)
+  (type %value double)
+  (type %acc SummaryAcc)
+  (defun (block-count c acc) (mutablevec-length (record-ref acc values)))
+  (defun (block-grow c acc n) (SummaryAcc (values (stats-grow (record-ref acc values) n))))
+  (defun (block-span c acc start n) (stats-span (record-ref acc values) start n))
+  (defun (block-none! c acc i) (stats-no-none! (record-ref acc values) i)))
 
 (: (-> double string))
 (defun (number-text x) (displayed x))
