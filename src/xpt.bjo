@@ -1,0 +1,54 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/src/xpt.bjo — the module (bjostat xpt): SAS transport files of
+;; version 5 (XPORT, .xpt) into tables. NHANES and the FDA publish their data
+;; so.
+;;
+;;     (def (Ok demo) (read-xpt "DEMO_J.xpt") :propagate)
+;;     (def (Ok vars) (xpt-variables "DEMO_J.xpt") :propagate)
+;;
+;; A number is a column of double, as SAS has no other number; text is a
+;; column of string. A number of a date format is a column of dates, and one
+;; of a datetime format a column of timestamps with no zone. A missing value,
+;; '.' or .A to .Z, is a null, and so is text of blanks only. The reading is in
+;; glue/Xpt.cs.
+
+(export read-xpt xpt-variables xpt-members)
+
+(import (std prelude))
+(import (bjostat table))
+
+(import/extern
+  (clr-read (: Bjostat.Xpt.Read (-> string string Table) #:exceptions (Bjostat.TableProblem)))
+  (clr-variables (: Bjostat.Xpt.Variables (-> string string Table) #:exceptions (Bjostat.TableProblem)))
+  (clr-members (: Bjostat.Xpt.Members (-> string (Array string)) #:exceptions (Bjostat.TableProblem))))
+
+(: (-> (Result System.Exception %a) (Result TableError %a)))
+(defun (problem-or r)
+  (match r
+    ((Ok v) (Ok v))
+    ((Err e) (Err (TableError (message (.-Message e)))))))
+
+;; The table of the dataset `#:member` of the file, or of its first when no
+;; member is named. A file that does not open, or is not a transport file of
+;; version 5, is an Err that says so.
+(: (-> string (#:member string) (Result TableError Table)))
+(defun (read-xpt path #:member "")
+  (problem-or (clr-read path member)))
+
+;; A table of a row for each variable of the dataset: name, label, type (of
+;; its column), length (in bytes, in the file) and format (SAS's). NHANES's
+;; names are short, and the labels say what they are: RIDAGEYR is "Age in
+;; years at screening".
+(: (-> string (#:member string) (Result TableError Table)))
+(defun (xpt-variables path #:member "")
+  (problem-or (clr-variables path member)))
+
+;; The names of the datasets of the file. A file of NHANES has one.
+(: (-> string (Result TableError (Vec string))))
+(defun (xpt-members path)
+  (match (problem-or (clr-members path))
+    ((Ok a) (Ok (array->vec a)))
+    ((Err e) (Err e))))

@@ -1,0 +1,115 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/xpt.bjo — SAS transport files: numbers, short numbers,
+;; missing values, text, dates, the padding, members and the errors.
+;;
+;;     bjo run tests/xpt.bjo
+;;
+;; Every line should start with "ok:". tests/data/small.xpt is written by
+;; tests/data/make_xpt.py, which says what is in it.
+
+(import (std prelude))
+(import (std simpletest))
+(import (std datetime))
+(import (bjostat table))
+(import (bjostat xpt))
+
+(import/extern (temp-dir (: System.IO.Path.GetTempPath (-> string))))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: (-> (Result TableError %a) string))
+(defun (error-of r)
+  (match r
+    ((Ok _) "no error")
+    ((Err e) (displayed e))))
+
+(: (-> Table (Vec string)))
+(defun (types-of t)
+  (vec-map (fun (p) (str (fst p) ":" (displayed (snd p)))) (table-schema t)))
+
+(: (-> Table string (Vec (Option double))))
+(defun (doubles-of t name)
+  (def c (ok (doubles t name)))
+  {vecing (column-ref c i) (:for i (range 0 (column-length c)))})
+
+(: (-> Table string (Vec (Option string))))
+(defun (strings-of t name)
+  (def c (ok (strings t name)))
+  {vecing (string-column-ref c i) (:for i (range 0 (string-column-length c)))})
+
+(: (-> (Option %a) %a))
+(defun (there o)
+  (match o
+    ((Some x) x)
+    (None (panic! "no such date or time"))))
+
+(: string)
+(def small "tests/data/small.xpt")
+
+(defun (main)
+  ;; Numbers
+  (def t (ok (read-xpt small)))
+  (expect "the names" (table-names t) ["ID" "X" "SHORT" "NAME" "D" "DT"])
+  (expect "the types" (types-of t)
+          ["ID:double" "X:double" "SHORT:double" "NAME:string" "D:date" "DT:datetime"])
+  (expect "the rows" (table-row-count t) 4)
+  (expect "IBM floats" (doubles-of t "ID") [(Some 1.0) (Some 2.0) (Some 3.0) (Some 4.0)])
+  (expect "a negative, '.' and .A missing"
+          (doubles-of t "X") [(Some 1.0) (Some -118.625) None None])
+  (expect "numbers of 4 bytes" (doubles-of t "SHORT") [(Some 1.0) (Some 0.5) (Some 100.0) (Some -1.0)])
+
+  ;; Text
+  (expect "text, the blanks dropped, Latin-1, blanks a null"
+          (strings-of t "NAME") [(Some "ab") None (Some "é") (Some "abcdef")])
+
+  ;; Dates
+  (expect "days since 1960"
+          {vecing d (:for d (ok (date-cells t "D")))}
+          [(date 1960 1 1) (date 2020 1 1) None (date 1959 12 31)])
+  (expect "seconds since 1960"
+          {vecing d (:for d (ok (datetime-cells t "DT")))}
+          [(datetime 1960 1 1)
+           (Some (+milliseconds (there (datetime 1970 1 1 #:seconds 1)) 500L))
+           None None])
+
+  ;; The variables
+  (def vars (ok (xpt-variables small)))
+  (expect "a row for each variable" (strings-of vars "name") (vec-map Some (table-names t)))
+  (expect "the labels" (vec-ref (strings-of vars "label") 2) (Some "A number of 4 bytes"))
+  (expect "the types of the columns" (strings-of vars "type")
+          [(Some "double") (Some "double") (Some "double") (Some "string") (Some "date") (Some "datetime")])
+  (expect "the lengths" (column-sum (ok (ints vars "length"))) 42)
+  (expect "the formats" (strings-of vars "format") [None None None None (Some "DATE") (Some "DATETIME")])
+
+  ;; Members, and the padding
+  (expect "the members" (xpt-members small) (Ok ["TEST" "LETTERS"]))
+  (def letters (ok (read-xpt small #:member "letters")))
+  (expect "a member by name, its rows of blanks in the padding left out"
+          (strings-of letters "C") [(Some "a") None (Some "c")])
+  (expect "a member that is not there"
+          (error-of (read-xpt small #:member "NOPE"))
+          "tests/data/small.xpt has no member 'NOPE'. Its members are: TEST, LETTERS.")
+
+  ;; Errors
+  (expect "a file that is not there"
+          (string-starts-with? (error-of (read-xpt "tests/data/none.xpt")) "tests/data/none.xpt: ")
+          #t)
+  (def csv-path (path-combine (temp-dir) "bjostat-test-not.xpt"))
+  (file-write-text csv-path "a,b\n1,2\n")
+  (expect "a file of another format"
+          (string-ends-with? (error-of (read-xpt csv-path))
+                             "is not a SAS transport file of version 5: it does not start with the library header. A file of SAS's CPORT, or a .sas7bdat, is another format.")
+          #t)
+  (def v8-path (path-combine (temp-dir) "bjostat-test-v8.xpt"))
+  (file-write-text v8-path "HEADER RECORD*******LIBV8   HEADER RECORD!!!!!!!000000000000000000000000000000  ")
+  (expect "version 8"
+          (string-ends-with? (error-of (read-xpt v8-path))
+                             "is a SAS transport file of version 8, and read-xpt reads version 5, the format of NHANES. Version 8 has long names; save the dataset with the XPORT engine, or as CSV.")
+          #t))

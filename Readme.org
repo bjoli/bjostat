@@ -144,6 +144,44 @@ that does not fit them sends the file back to one thread, which widens the
 column or says what is wrong, with its line. The file of the comparison,
 26 MB, reads in 68 ms this way, against 186 on one thread.
 
+** The module (bjostat xpt)
+
+SAS transport files of version 5 (XPORT, ~.xpt~), the format of [[https://wwwn.cdc.gov/nchs/nhanes/][NHANES]]
+and of the FDA:
+
+#+BEGIN_SRC scheme
+(import (bjostat xpt))
+
+(def (Ok demo) (read-xpt "DEMO_J.xpt") :propagate)
+(def (Ok vars) (xpt-variables "DEMO_J.xpt") :propagate)
+#+END_SRC
+
+| Function | What it does |
+|----------+--------------|
+| ~(read-xpt path [#:member name])~ | The table of a dataset of the file, the first unless one is named |
+| ~(xpt-variables path [#:member name])~ | A row for each variable: name, label, type, length, format |
+| ~(xpt-members path)~ | The names of the datasets; a file of NHANES has one |
+
+*Types.* SAS has numbers and text. A number is a column of ~double~, also
+one that holds whole numbers, as ~SEQN~; text is ~string~, its trailing
+blanks dropped, read as Latin-1. A number of a date format (~DATE9.~,
+~MMDDYY10.~ …) is a column of dates, and one of a datetime format a column
+of timestamps with no zone.
+
+*Nulls.* A missing number, ~.~ or ~.A~ to ~.Z~, is a null, and so is text of
+blanks, which SAS cannot tell from a missing one. NHANES has codes of its
+own for an answer that is not one, as 7 and 9 or 77 and 99 for "refused" and
+"don't know"; they are numbers, and the codebook of each file says which.
+
+*Labels.* NHANES's names are short. ~xpt-variables~ says what they are:
+~RIDAGEYR~ is "Age in years at screening".
+
+*Size.* The file is read 80 bytes at a time through a buffer, so the size of
+a file is not a limit, only that of the table.
+
+Version 8, with long names, is refused, with a message that says so; so is
+SAS's own ~.sas7bdat~.
+
 ** An example: some questions to 167 countries
 
 Kaggle's [[https://www.kaggle.com/datasets/manusmitajha/countrydatacsv][Country data]] has, for each country, child mortality, trade and
@@ -523,6 +561,7 @@ bjo run tests/distributions.bjo
 bjo run tests/models.bjo
 bjo run tests/hypothesis.bjo
 bjo run tests/columns.bjo
+bjo run tests/xpt.bjo      # tests/data/make_xpt.py writes its file
 #+END_SRC
 
 The benchmarks:
