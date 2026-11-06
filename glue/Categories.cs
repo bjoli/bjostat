@@ -449,8 +449,13 @@ public static class Categories
         }
 
         public readonly List<Entry> Entries = new();
-        private int _mask = 63;
-        private int[] _table = Filled(64);
+        // 256 slots at first, 1 KB: two of a few strings then share a home
+        // slot less often (4 strings: about 2 % of hashes against 9 % in
+        // 64), and a few strings are most of what a column of categories
+        // has. Each row of such a column is a hit, so a shared slot costs a
+        // probe more on a part of every column's rows.
+        private int _mask = 255;
+        private int[] _table = Filled(256);
 
         // The column's offsets, bytes and valid bits, read directly: through
         // Arrow's GetBytes and IsNull each row was a call that also tested
@@ -472,6 +477,16 @@ public static class Categories
         // bytes (its first 8 and last 8), and a fast multiply-xor hash of
         // them: a hit on a string of at most 16 bytes compares the two words
         // in registers without reading the column's offsets or bytes again.
+        //
+        // A product carries a change of a bit only to higher bits, and the
+        // bytes that differ between strings such as "region-12345" are the
+        // high bytes of w1. So w1's product is rotated before the two words
+        // meet, and the sum is multiplied once more after its high half is
+        // folded in. The low bits pick the slot and the top 6 bits the
+        // bucket of a merge (Bucket), so both have to depend on every byte.
+        // Before, w1 was xored in before one multiply only: 20 000 strings
+        // "region-N" took 218 of 65 536 slots, 49 probes a row, and a
+        // categorize of the wide file took 124 ms on one thread.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static (int Hash, ulong W0, ulong W1) Key(ref byte p, int len)
         {
@@ -496,8 +511,9 @@ public static class Categories
                 w0 = 0;
                 w1 = 0;
             }
-            ulong h = (w0 ^ (ulong)len) * 0x9E3779B97F4A7C15UL;
-            h = (h ^ (h >> 32) ^ w1) * 0xBF58476D1CE4E5B9UL;
+            ulong h = ((w0 ^ (ulong)len) * 0x9E3779B97F4A7C15UL)
+                      ^ System.Numerics.BitOperations.RotateLeft(w1 * 0xBF58476D1CE4E5B9UL, 32);
+            h = (h ^ (h >> 32)) * 0x9E3779B97F4A7C15UL;
             return ((int)(h ^ (h >> 32)), w0, w1);
         }
 

@@ -35,7 +35,7 @@ for f in ["compare", "compare-wide"]:
         c["group by string, sum, group-of!"] = c.get("group by string, sum")
         c["group by string, sum"] = c.get("group by string, sum, string-groups")
     print(f"== {f}")
-    print("| Operation | bjostat, 24 workers | bjostat, 1 worker | Polars, 1 | pandas | data.table | dplyr | Polars, 24 |")
+    print("| Operation | bjostat, all compute threads | bjostat, 1 compute thread | Polars, 1 | pandas | data.table | dplyr | Polars, 24 |")
     print("|-----+-----+-----+-----+-----+-----+-----+-----|")
     for op in ops:
         print("| " + op + " | " + " | ".join(fmt(c.get(op)) for c in cols) + " |")
@@ -58,4 +58,4 @@ for f in ["compare", "compare-wide"]:
         if one[0] == min(vals): fastest += 1
         if one[0] == max(vals): slowest += 1; slow_ops.append(op)
         if cols[0].get(op) < cols[6].get(op): faster24 += 1
-    print(f, "one thread: fastest", fastest, "slowest", slowest, slow_ops, "| all workers faster than Polars 24:", faster24, "of", len(ops))
+    print(f, "one thread: fastest", fastest, "slowest", slowest, slow_ops, "| all compute threads faster than Polars 24:", faster24, "of", len(ops))

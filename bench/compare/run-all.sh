@@ -11,10 +11,10 @@ out=${1:-scratch/compare-runs}
 mkdir -p "$out"
 for f in compare compare-wide; do
   csv=scratch/$f.csv
-  echo "== bjostat all workers $f $(date +%T)"
+  echo "== bjostat all compute threads $f $(date +%T)"
   COMPARE_CSV=$csv bjo bench bench/compare.bjo --all -N 20 > "$out/bjostat-all-$f.txt" 2>&1
-  echo "== bjostat 1 worker $f $(date +%T)"
-  BJOSTAT_WORKERS=1 COMPARE_CSV=$csv bjo bench bench/compare.bjo --all -N 20 > "$out/bjostat-1-$f.txt" 2>&1
+  echo "== bjostat 1 compute thread $f $(date +%T)"
+  BJOLANG_COMPUTE_THREADS=1 COMPARE_CSV=$csv bjo bench bench/compare.bjo --all -N 20 > "$out/bjostat-1-$f.txt" 2>&1
   echo "== polars 24 $f $(date +%T)"
   scratch/venv/bin/python bench/compare/polars_bench.py $csv > "$out/polars-24-$f.txt" 2>&1
   echo "== polars 1 $f $(date +%T)"

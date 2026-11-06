@@ -767,6 +767,30 @@ loops before anything else, as they change the Collector trait:
      16 ms. ~bjo bench~ shows more memory for these (the thread that
      measures now makes the arrays the workers fill); the program uses
      no more.
+
+   Fixed, November 6: the hash of the string ids (~Categories.StringIdTable~,
+   ~Key~) put 20 000 strings "region-N" of the wide file in 218 of 65 536
+   slots, 49 probes a row. The bytes that differ are the high bytes of the
+   last word, and a product carries a change only to higher bits. Now that
+   word's product is rotated before the two words meet, and the sum is
+   multiplied again: 17 184 slots, 1.1 probes a row (simulated in Python;
+   strings of a shared prefix, as "customer-account-000123", were as bad
+   before). The table starts at 256 slots, not 64: with the new hash "south"
+   and "west" shared a slot in 64, which made the narrow file's categorize
+   4.4 to 7.1 ms on one thread. Measured, old and new alternated, two runs
+   each, all compute threads (23):
+   - Wide file, less time: categorize 24.3-25.0 to 8.49-9.05 ms, a group
+     by a string with ~string-groups~ 31.7-33.3 to 15.2-15.5, a crosstab
+     59.0-60.6 to 27.7-28.5, a count by a string and a long 32.2-33.3 to
+     18.5-18.9, a distinct by them 31.3-33.3 to 18.9-19.2, a sort by a
+     string 60.2-60.3 to 42.5-43.3. Categorize on one thread 116 to 11.0
+     ms (one run each), against Polars on one thread 26.8-27.2.
+   - Narrow file: every row overlaps; categorize on one thread 4.38-4.44
+     to 4.57-4.58 ms, the hash's third multiply.
+   - Still behind Polars on 24 threads, 2.91 ms: all the compute threads
+     take 8.5-9.1 ms against 11.0 on one. Each part numbers most of the
+     20 000 strings into a table of its own, and the merge numbers them
+     again; not examined further.
 3. *CSV fields as spans.* bjostat reads the narrow file in 68.0 ms in
    chunks on the workers (186 on one thread), Polars in 71.6 on one thread
    and in 16.9 on 24; the wide one in 178, 215 and 34.8. ~(text csv)~ makes
