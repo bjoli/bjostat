@@ -316,6 +316,14 @@ public static class CellsOps
 
     public static int Length<T>(Cells<T> c) => c.Length;
 
+    /// <summary>
+    /// The cells from <paramref name="from"/> to <paramref name="to"/>, over
+    /// Arrow's slice of the same buffers. The valid bits are copied, an
+    /// eighth of a byte for each cell.
+    /// </summary>
+    public static Cells<T> Slice<T>(Cells<T> c, int from, int to) =>
+        new(ArrowArrayFactory.Slice(c.Array, from, to - from));
+
     /// <summary>The first cell from <paramref name="i"/> on that is not null, or the length.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int NextValid<T>(Cells<T> c, int i) => c.NextValid(i);

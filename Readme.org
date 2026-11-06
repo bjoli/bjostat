@@ -135,14 +135,15 @@ that meets a decimal after the guess becomes a column of ~double~ instead.
 A number is in the plain form: no white space, no thousands separators, ~.~
 as the decimal point.
 
-*Speed.* The rows are read by ~(text csv)~, one at a time. A field becomes a
+*Speed.* A file of 4 MB or more with a header is read in chunks of whole
+rows on bjostat's workers, each field a span of its chunk's bytes; a file
+that does not fit what its first rows say is read again on one thread,
+which widens the column or says what is wrong, with its line. On one
+thread the rows are read by ~(text csv)~, one at a time: a field becomes a
 number from its UTF-8 bytes, and a string is kept as its bytes. A file of
-1 000 000 rows and five columns, 26 MB, reads in about 175 ms, against
-95 ms for ~(text csv)~ reading the rows alone (~bench/csv.bjo~). A file of 4 MB or more with a header is read in chunks of whole rows
-on bjostat's workers, the first one guessing the types as above; a chunk
-that does not fit them sends the file back to one thread, which widens the
-column or says what is wrong, with its line. The file of the comparison,
-26 MB, reads in 68 ms this way, against 186 on one thread.
+1 000 000 rows and five columns, 26 MB, reads in about 28 ms in chunks and
+128 ms on one thread, against 64 ms for ~(text csv)~ reading the rows
+alone (~bench/csv.bjo~, on a Ryzen 9 7900).
 
 ** The module (bjostat xpt)
 
@@ -369,10 +370,10 @@ takes columns of dates and timestamps as it takes columns of numbers: a
 ~date-cells~ column gives a ~Date~, and the kinds mix freely. Columns
 of two lengths give the rows of the shorter.
 
-They are as fast as ~:when-let~ where there are nulls. Where there are none,
-~:when-let~ is faster, as the loop then reads the columns as arrays: of a
-million rows, measured (~bench/nulls.bjo~), about 2.5 ms against 4.3 ms, of
-one column and of two.
+~skip-nulls~ is as fast as ~:when-let~, with nulls or without.
+~complete-rows~ is slower: of a million rows of two columns, about 3.1 ms
+against 2.1 with one null in ten, and 3.8 against 2.2 without
+(~bench/nulls.bjo~, on a Ryzen 9 7900).
 
 ** The module (bjostat stats)
 
@@ -396,6 +397,66 @@ out by the loop, where R needs ~na.rm = TRUE~:
 
 Each is None of too few values: the mean of none, the variance of fewer than
 two. A quantile of values with a NaN is NaN.
+
+** Loops in parts
+
+A loop runs on several cores with ~in-parallel~ of Bjolang's ~(std parallel)~:
+the rows are cut into parts, a function runs the loop on each part, and the
+parts' results are combined in the order of the parts.
+
+#+BEGIN_SRC scheme
+(import (std parallel))
+
+(: (-> Table (Tuple Moments CoMoments)))
+(defun (part u)
+  (def price (: (or-panic (column-as u "price")) (Cells double)))
+  (def qty (: (or-panic (column-as u "qty")) (Cells long)))
+  (loop (:for (Tuple p q) (complete-rows (Tuple price qty)))
+        (:acc m (moments p))
+        (:acc c (co-moments (Tuple p (cast double q))))))
+
+(def (Tuple m c) (in-parallel (table-rows t) part #:size 65536))
+(moments-standard-deviation m)    ; as (standard-deviation p) in one loop
+(co-moments-correlation c)
+#+END_SRC
+
+| What | Parts |
+|------+-------|
+| ~(table-rows t)~ | Tables, slices of ~t~ |
+| cells, ~date-cells~, ~datetime-cells~, ~instant-cells~ | Cells of the same kind |
+| ~(skip-nulls c)~, ~(complete-rows (Tuple …))~ | The same over slices of the columns |
+| ~(cells-slice c from to)~ | One slice, by hand |
+
+A part is a slice, not a copy, and a part's row 0 is its first row. The cuts
+are at multiples of 64 rows, so a part's loop is a vector loop where the
+whole column's is. With ~#:size~ the cuts depend only on the rows, so a
+result is the same on every machine; without it they depend on the number
+of compute threads, and a sum of doubles can differ in its last digits.
+
+*Results that combine.* A part's result has to be ~Combinable~: a vector, a
+list, a string, a set, a tuple of such, or one of these:
+
+| Collector | Result | Finished by |
+|-----------+--------+-------------|
+| ~(moments x)~ | ~Moments~ | ~moments-count~, ~moments-mean~, ~moments-variance~, ~moments-standard-deviation~ |
+| ~(co-moments (Tuple x y))~ | ~CoMoments~ | ~co-moments-count~, ~co-moments-covariance~, ~co-moments-correlation~ |
+| ~(values x)~ | ~Values~ | ~values-count~, ~values-quantile~, ~values-quantiles~, ~values-median~, ~values-summary~ |
+
+A number is not ~Combinable~, since it may be a sum, a count or a maximum.
+Sum the results of ~(in-parts …)~, which returns one result for each part.
+Two parts' moments combine exactly, but for rounding: the variance in parts
+agrees with the one-thread loop to about 1e-12, and a covariance near 0 to
+1e-12 of sd(x) sd(y).
+
+*The function of a part* is a named function with a signature. A lambda's
+parameter does not get the part's type yet, so arithmetic on its values
+fails to type (Bjolang's Todo.org). The function runs on another thread: it
+may not write a ~GroupIndex~, a ~MutableVec~ or a ~MutableMap~ made outside
+it.
+
+Of a million rows on 24 threads, the standard deviation of a column takes
+3.29 ms in one loop and 0.29 ms as ~moments~ in parts (~bench/parallel.bjo~,
+Ryzen 9 7900).
 
 ** The module (bjostat distributions)
 
@@ -562,6 +623,7 @@ bjo run tests/models.bjo
 bjo run tests/hypothesis.bjo
 bjo run tests/columns.bjo
 bjo run tests/xpt.bjo      # tests/data/make_xpt.py writes its file
+bjo run tests/parallel.bjo
 #+END_SRC
 
 The benchmarks:
@@ -570,6 +632,7 @@ The benchmarks:
 bjo bench bench/csv.bjo --all
 bjo bench bench/query.bjo --all
 bjo bench bench/nulls.bjo --all
+bjo bench bench/parallel.bjo --all
 python3 bench/compare/make_data.py scratch/compare.csv   # the file of the next four
 bjo bench bench/compare.bjo --all
 POLARS_MAX_THREADS=1 python3 bench/compare/polars_bench.py scratch/compare.csv
@@ -586,5 +649,5 @@ COMPARE_CSV=scratch/compare-wide.csv bjo bench bench/compare.bjo --all
 python3 bench/compare/polars_bench.py scratch/compare-wide.csv   # and the others
 #+END_SRC
 
-The results, against Polars, pandas, data.table and dplyr, are in
-[[file:plan.org][plan.org]].
+The results against Polars are in [[file:plan.org][plan.org]]; those against pandas,
+data.table and dplyr too are in its history, at commit fdf6187.

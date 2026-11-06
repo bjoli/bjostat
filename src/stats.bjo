@@ -31,9 +31,18 @@
   ;; The accumulators, opaque
   Moments CoMoments SummaryAcc
   ;; Moments, for other modules' collectors
-  no-moments moments-add moments-count moments-mean moments-variance)
+  no-moments moments-add moments-count moments-mean moments-variance
+  ;; Results that combine, for loops in parts (std parallel)
+  MomentsOf moments-standard-deviation
+  CoMomentsOf co-moments-count co-moments-covariance co-moments-correlation
+  Values ValuesOf values-count values-quantile values-quantiles values-median values-summary)
 
 (import (std prelude))
+(import (std combine))
+
+;; Combinable, for the results of `moments`, `co-moments` and `values`. A
+;; re-exported method carries its trait to importers.
+(re-export combine combine-all)
 
 (import (std mutable vec))
 (import (bjostat table))
@@ -78,6 +87,41 @@
   (def s1 (record-ref m s1))
   (if (< n 2.0) None (Some (max 0.0 (/ (- (record-ref m s2) (/ (* s1 s1) n)) (- n 1.0))))))
 
+(: (-> Moments (Option double)))
+(defun (moments-standard-deviation m)
+  (match (moments-variance m)
+    ((Some v) (Some (sqrt v)))
+    (None None)))
+
+;; The moments of the values `a` was made of, then those of `b`. `b`'s sums
+;; are moved to `a`'s first value: exact, as each is a sum of differences.
+(impl (Combinable Moments)
+  (defun (combine a b)
+    (cond
+      ((= (record-ref b n) 0L) a)
+      ((= (record-ref a n) 0L) b)
+      (else
+       (let* ((nb (cast double (record-ref b n)))
+              (d (- (record-ref b k) (record-ref a k)))
+              (s1b (record-ref b s1)))
+         (Moments (n (+ (record-ref a n) (record-ref b n)))
+                  (k (record-ref a k))
+                  (s1 (+ (record-ref a s1) (+ s1b (* nb d))))
+                  (s2 (+ (record-ref a s2)
+                         (+ (record-ref b s2) (+ (* 2.0 (* d s1b)) (* nb (* d d))))))))))))
+
+;; The moments themselves, for a loop whose parts are combined: finished by
+;; `moments-mean`, `moments-variance` and `moments-standard-deviation`.
+(type (: MomentsOf (Union moments)))
+
+(impl (Collector MomentsOf)
+  (type %elem double)
+  (type %acc Moments)
+  (type %out Moments)
+  (defun (collector-init c) no-moments)
+  (defun (collector-step c m x) (moments-add m x))
+  (defun (collector-finish c m) m))
+
 (type (: Mean (Union mean)))
 
 (impl (Collector Mean)
@@ -107,10 +151,7 @@
   (type %out (Option double))
   (defun (collector-init c) no-moments)
   (defun (collector-step c m x) (moments-add m x))
-  (defun (collector-finish c m)
-    (match (moments-variance m)
-      ((Some v) (Some (sqrt v)))
-      (None None))))
+  (defun (collector-finish c m) (moments-standard-deviation m)))
 
 ;; ===========================================================================
 ;; Covariance and correlation, in one pass
@@ -153,6 +194,61 @@
          (max 0.0 (- (record-ref m syy) (/ (* sy sy) n)))
          (- (record-ref m sxy) (/ (* sx sy) n))))
 
+(: (-> CoMoments long))
+(defun (co-moments-count m) (record-ref m n))
+
+;; The covariance of a sample; None for fewer than two pairs.
+(: (-> CoMoments (Option double)))
+(defun (co-moments-covariance m)
+  (def n (record-ref m n))
+  (def (_ _ sxy) (centred m))
+  (if (< n 2L) None (Some (/ sxy (cast double (- n 1L))))))
+
+;; Pearson's correlation; None for fewer than two pairs, and when one side
+;; has the same value in each pair.
+(: (-> CoMoments (Option double)))
+(defun (co-moments-correlation m)
+  (def (sxx syy sxy) (centred m))
+  (if (or (< (record-ref m n) 2L) (= sxx 0.0) (= syy 0.0))
+      None
+      (Some (/ sxy (sqrt (* sxx syy))))))
+
+;; As `Moments`: `b`'s sums moved to `a`'s first pair.
+(impl (Combinable CoMoments)
+  (defun (combine a b)
+    (cond
+      ((= (record-ref b n) 0L) a)
+      ((= (record-ref a n) 0L) b)
+      (else
+       (let* ((nb (cast double (record-ref b n)))
+              (dx (- (record-ref b kx) (record-ref a kx)))
+              (dy (- (record-ref b ky) (record-ref a ky)))
+              (sxb (record-ref b sx))
+              (syb (record-ref b sy)))
+         (CoMoments (n (+ (record-ref a n) (record-ref b n)))
+                    (kx (record-ref a kx)) (ky (record-ref a ky))
+                    (sx (+ (record-ref a sx) (+ sxb (* nb dx))))
+                    (sy (+ (record-ref a sy) (+ syb (* nb dy))))
+                    (sxx (+ (record-ref a sxx)
+                            (+ (record-ref b sxx) (+ (* 2.0 (* dx sxb)) (* nb (* dx dx))))))
+                    (syy (+ (record-ref a syy)
+                            (+ (record-ref b syy) (+ (* 2.0 (* dy syb)) (* nb (* dy dy))))))
+                    (sxy (+ (record-ref a sxy)
+                            (+ (record-ref b sxy)
+                               (+ (* dx syb) (+ (* dy sxb) (* nb (* dx dy)))))))))))))
+
+;; The moments of pairs themselves, for a loop whose parts are combined:
+;; finished by `co-moments-covariance` and `co-moments-correlation`.
+(type (: CoMomentsOf (Union co-moments)))
+
+(impl (Collector CoMomentsOf)
+  (type %elem (Tuple double double))
+  (type %acc CoMoments)
+  (type %out CoMoments)
+  (defun (collector-init c) no-co-moments)
+  (defun (collector-step c m xy) (co-moments-add m xy))
+  (defun (collector-finish c m) m))
+
 (type (: Covariance (Union covariance)))
 
 (impl (Collector Covariance)
@@ -161,10 +257,7 @@
   (type %out (Option double))
   (defun (collector-init c) no-co-moments)
   (defun (collector-step c m xy) (co-moments-add m xy))
-  (defun (collector-finish c m)
-    (def n (record-ref m n))
-    (def (_ _ sxy) (centred m))
-    (if (< n 2L) None (Some (/ sxy (cast double (- n 1L)))))))
+  (defun (collector-finish c m) (co-moments-covariance m)))
 
 ;; Pearson's correlation. None for fewer than two pairs, and when one side
 ;; has the same value in each pair, as R's `cor` is NA then.
@@ -176,11 +269,7 @@
   (type %out (Option double))
   (defun (collector-init c) no-co-moments)
   (defun (collector-step c m xy) (co-moments-add m xy))
-  (defun (collector-finish c m)
-    (def (sxx syy sxy) (centred m))
-    (if (or (< (record-ref m n) 2L) (= sxx 0.0) (= syy 0.0))
-        None
-        (Some (/ sxy (sqrt (* sxx syy)))))))
+  (defun (collector-finish c m) (co-moments-correlation m)))
 
 ;; ===========================================================================
 ;; Quantiles
@@ -290,16 +379,19 @@
   (defun (collector-step c acc x)
     (mutablevec-add! (record-ref acc values) x)
     acc)
-  (defun (collector-finish c acc)
-    (def vs (record-ref acc values))
-    (def n (mutablevec-length vs))
-    (if (= n 0)
-        None
-        (let ((q (clr-summarize vs)))
-          (Some (Summary (count (cast long n))
-                         (min (array-ref q 0)) (q1 (array-ref q 1)) (median (array-ref q 2))
-                         (mean (array-ref q 3)) (q3 (array-ref q 4)) (max (array-ref q 5))
-                         (sd (if (< n 2) None (Some (array-ref q 6))))))))))
+  (defun (collector-finish c acc) (summary-of (record-ref acc values))))
+
+;; The summary of the values, reordered in place; None of none.
+(: (-> (MutableVec double) (Option Summary)))
+(defun (summary-of vs)
+  (def n (mutablevec-length vs))
+  (if (= n 0)
+      None
+      (let ((q (clr-summarize vs)))
+        (Some (Summary (count (cast long n))
+                       (min (array-ref q 0)) (q1 (array-ref q 1)) (median (array-ref q 2))
+                       (mean (array-ref q 3)) (q3 (array-ref q 4)) (max (array-ref q 5))
+                       (sd (if (< n 2) None (Some (array-ref q 6)))))))))
 
 (impl (BlockCollector Summarizing)
   (type %value double)
@@ -308,6 +400,69 @@
   (defun (block-grow c acc n) (SummaryAcc (values (stats-grow (record-ref acc values) n))))
   (defun (block-span c acc start n) (stats-span (record-ref acc values) start n))
   (defun (block-none! c acc i) (stats-no-none! (record-ref acc values) i)))
+
+;; ===========================================================================
+;; Values, for quantiles of a loop in parts
+;; ===========================================================================
+
+;; The values a loop collected, in the order of their rows. Immutable, so
+;; that it combines: the values of `a`, then those of `b`.
+(type (: Values #:opaque (Struct (: xs (IArray double)))))
+
+(impl (Combinable Values)
+  (defun (combine a b) (Values (xs (combine (record-ref a xs) (record-ref b xs)))))
+  (defun (combine-all vs) (Values (xs (combine-all (vec-map (fun (v) (record-ref v xs)) vs))))))
+
+;; The values themselves, for a loop whose parts are combined: finished by
+;; `values-quantile`, `values-quantiles`, `values-median` and `values-summary`.
+(type (: ValuesOf (Union values)))
+
+(impl (Collector ValuesOf)
+  (type %elem double)
+  (type %acc (MutableVec double))
+  (type %out Values)
+  (defun (collector-init c) (mutablevec))
+  (defun (collector-step c acc x) (mutablevec-add! acc x) acc)
+  (defun (collector-finish c acc) (Values (xs (mutablevec->iarray acc)))))
+
+(impl (BlockCollector ValuesOf)
+  (type %value double)
+  (type %acc (MutableVec double))
+  (defun (block-count c acc) (mutablevec-length acc))
+  (defun (block-grow c acc n) (stats-grow acc n))
+  (defun (block-span c acc start n) (stats-span acc start n))
+  (defun (block-none! c acc i) (stats-no-none! acc i)))
+
+(: (-> Values long))
+(defun (values-count v) (cast long (iarray-length (record-ref v xs))))
+
+;; A copy, which the selections of the quantiles reorder.
+(: (-> Values (MutableVec double)))
+(defun (values-copy v)
+  (def xs (record-ref v xs))
+  (def out (mutablevec-with-capacity (iarray-length xs)))
+  (loop (:for i (range 0 (iarray-length xs)))
+        (:do (mutablevec-add! out (iarray-ref xs i))))
+  out)
+
+;; As `quantile`: at p, 0 to 1; NaN when a value is NaN; None of none.
+(: (-> Values double (Option double)))
+(defun (values-quantile v p)
+  (match (quantiles-of (values-copy v) (vec->array [p]))
+    ((Some qs) (Some (array-ref qs 0)))
+    (None None)))
+
+(: (-> Values (Vec double) (Option (Vec double))))
+(defun (values-quantiles v ps)
+  (match (quantiles-of (values-copy v) (vec->array ps))
+    ((Some qs) (Some (array->vec qs)))
+    (None None)))
+
+(: (-> Values (Option double)))
+(defun (values-median v) (values-quantile v 0.5))
+
+(: (-> Values (Option Summary)))
+(defun (values-summary v) (summary-of (values-copy v)))
 
 (: (-> double string))
 (defun (number-text x) (displayed x))

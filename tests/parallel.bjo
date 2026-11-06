@@ -1,0 +1,160 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/tests/parallel.bjo — loops in parts with (std parallel): the parts
+;; of a table and of cells, and the collectors whose results combine, against
+;; the same loop on one thread.
+;;
+;;     bjo run tests/parallel.bjo
+;;
+;; Every line should start with "ok:".
+
+(import (std prelude))
+(import (std simpletest))
+(import (std parallel))
+(import (bjostat table))
+(import (bjostat stats))
+
+;; Within 1e-12 of the other, relative to its size.
+(: (-> double double bool))
+(defun (near? a b)
+  (<= (abs (- a b)) (* 1e-12 (max 1.0 (abs b)))))
+
+(: (-> (Option double) (Option double) bool))
+(defun (near-option? a b)
+  (match (Tuple a b)
+    ((Tuple (Some x) (Some y)) (near? x y))
+    ((Tuple None None) #t)
+    (_ #f)))
+
+;; `n` rows: a price near 1e6, so that the moments' shifts matter, null at
+;; every 7th row from 3; a quantity, null at every 11th row from 5.
+(: (-> int Table))
+(defun (sales n)
+  (or-panic
+    (make-table
+      [(named "price" (array->column {arraying (+ 1e6 (* 0.37 (cast double (% i 1000)))) (:for i (range 0 n))}
+                                     #:valid {arraying (not (= (% i 7) 3)) (:for i (range 0 n))}))
+       (named "qty" (array->column {arraying (cast long (% i 13)) (:for i (range 0 n))}
+                                   #:valid {arraying (not (= (% i 11) 5)) (:for i (range 0 n))}))])))
+
+(: (-> Table (Cells double)))
+(defun (prices t) (or-panic (column-as t "price")))
+
+(: (-> Table (Cells long)))
+(defun (qtys t) (or-panic (column-as t "qty")))
+
+;; The function of a part of a table: its statistics, unfinished.
+(: (-> Table (Tuple Moments CoMoments Values (Vec double))))
+(defun (table-part u)
+  (loop (:for p* (prices u)) (:for q* (qtys u))
+        (:when-let (Some p) p*) (:when-let (Some q) q*)
+        (:acc m (moments p))
+        (:acc c (co-moments (Tuple p (cast double q))))
+        (:acc v (values p))
+        (:acc ps (vecing p))))
+
+;; Of a part of the cells of one column.
+(: (-> (Cells double) Moments))
+(defun (cells-part c)
+  (loop (:for p* c) (:when-let (Some p) p*) (:acc m (moments p))))
+
+(: (-> (NotNull (Cells double)) Values))
+(defun (not-null-part c)
+  (loop (:for p c) (:acc v (values p))))
+
+(: (-> (CompleteRows (Tuple (Cells double) (Cells long))) CoMoments))
+(defun (rows-part r)
+  (loop (:for (Tuple p q) r) (:acc c (co-moments (Tuple p (cast double q))))))
+
+(: (-> Table int))
+(defun (rows-of u) (table-row-count u))
+
+;; The parts of `n` rows and the loop on one thread give the same results.
+(: (-> int int void))
+(defun (check-rows n size)
+  (def t (sales n))
+  (def label (str (int->string n) " rows, parts of " (int->string size)))
+  (def (Tuple m1 c1 v1 ps1) (table-part t))
+  (def (Tuple m c v ps) (in-parallel (table-rows t) table-part #:size size))
+  (expect (str "a table's parts, the values in order: " label) ps ps1)
+  (expect (str "moments, the count: " label) (moments-count m) (moments-count m1))
+  (expect-true (str "moments, the mean: " label)
+               (or (= (moments-count m1) 0L) (near? (moments-mean m) (moments-mean m1))))
+  (expect-true (str "moments, the variance: " label)
+               (near-option? (moments-variance m) (moments-variance m1)))
+  (expect-true (str "moments, the standard deviation: " label)
+               (near-option? (moments-standard-deviation m) (moments-standard-deviation m1)))
+  (expect (str "co-moments, the count: " label) (co-moments-count c) (co-moments-count c1))
+  ;; A covariance's rounding is relative to sd(x) sd(y), not to itself: it
+  ;; is a difference of sums of that size.
+  (def scale (match (Tuple (co-moments-correlation c1) (co-moments-covariance c1))
+               ((Tuple (Some r) (Some cv)) (if (= r 0.0) 1.0 (abs (/ cv r))))
+               (_ 1.0)))
+  (expect-true (str "co-moments, the covariance: " label)
+               (match (Tuple (co-moments-covariance c) (co-moments-covariance c1))
+                 ((Tuple (Some a) (Some b)) (<= (abs (- a b)) (* 1e-12 (max 1.0 scale))))
+                 ((Tuple None None) #t)
+                 (_ #f)))
+  (expect-true (str "co-moments, the correlation: " label)
+               (near-option? (co-moments-correlation c) (co-moments-correlation c1)))
+  (expect (str "values, the quantiles: " label)
+          (values-quantiles v [0.0 0.1 0.25 0.5 0.9 1.0])
+          (values-quantiles v1 [0.0 0.1 0.25 0.5 0.9 1.0]))
+  (expect (str "values, the median: " label) (values-median v) (values-median v1))
+  (expect (str "values, the summary: " label) (values-summary v) (values-summary v1))
+  ;; The parts of cells, of skip-nulls and of complete-rows.
+  (def price (prices t))
+  (expect-true (str "the parts of cells: " label)
+               (near-option? (moments-variance (in-parallel price cells-part #:size size))
+                             (moments-variance (cells-part price))))
+  (expect (str "the parts of skip-nulls: " label)
+          (values-quantiles (in-parallel (skip-nulls price) not-null-part #:size size) [0.5])
+          (values-quantiles (not-null-part (skip-nulls price)) [0.5]))
+  (def rows (complete-rows (Tuple price (qtys t))))
+  (expect-true (str "the parts of complete-rows: " label)
+               (near-option? (co-moments-correlation (in-parallel rows rows-part #:size size))
+                             (co-moments-correlation (rows-part rows)))))
+
+(defun (main)
+  (loop (:for n [0 1 63 64 65 1000 (+ (* 3 65536) 7)])
+        (:do (check-rows n 64)
+             (check-rows n 1000)))
+  (check-rows 200000 65536)
+
+  ;; Where the cuts fall.
+  (def t (sales 1000))
+  (def sizes (in-parts (table-rows t) rows-of #:size 100))
+  (expect "parts of a table: ceil(1000 / 100) parts" (vec-length sizes) 10)
+  (expect "parts of a table: each row once" (loop (:for k sizes) (:acc s (summing k))) 1000)
+  (expect-true "parts of a table: every inner cut at a multiple of 64 rows"
+               (loop (:for i (range 0 (- (vec-length sizes) 1)))
+                     (:with at 0 (+ at (vec-ref sizes i)))
+                     (:acc ok (folding #t (and ok (= 0 (% (+ at (vec-ref sizes i)) 64)))))))
+  (expect "the same cuts with #:size whatever #:parts says"
+          (in-parts (table-rows t) rows-of #:size 100 #:parts 3)
+          sizes)
+  (expect "a table of no rows is one empty part"
+          (in-parts (table-rows (sales 0)) rows-of)
+          [0])
+  (expect "fewer rows than 64 are one part"
+          (in-parts (table-rows (sales 50)) rows-of #:parts 8)
+          [50])
+  (expect "a part of cells is a slice of the column"
+          (cells-length (cells-slice (prices t) 64 128))
+          64)
+  (expect "a slice keeps the nulls of its rows"
+          (cells-valid? (cells-slice (prices t) 7 20) 3)
+          #f)
+
+  ;; Moments combined by hand.
+  (expect "the moments of no values combine to the other's"
+          (moments-count (combine (loop (:for x []) (:acc m (moments x)))
+                                  (loop (:for x [1.0 2.0]) (:acc m (moments x)))))
+          2L)
+  (expect-true "moments of two parts with far apart values"
+               (near-option? (moments-variance (combine (loop (:for x [1.0 2.0 3.0]) (:acc m (moments x)))
+                                                        (loop (:for x [1e8 (+ 1e8 1.0)]) (:acc m (moments x)))))
+                             (moments-variance (loop (:for x [1.0 2.0 3.0 1e8 (+ 1e8 1.0)]) (:acc m (moments x))))))
+  0)

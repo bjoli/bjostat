@@ -35,7 +35,7 @@
   string-column-length string-column-null-count string-column-ref
 
   ;; Cells: a column at the type its use gives
-  Cells column-as cells-ref cells-get cells-valid? cells-length cells-null-count
+  Cells column-as cells-ref cells-get cells-valid? cells-length cells-null-count cells-slice
   DateCells DateTimeCells InstantCells date-cells datetime-cells instant-cells
   RowSource NotNull skip-nulls CompleteRows RowColumns complete-rows
   cells-window window-rows lowest-bit
@@ -45,7 +45,7 @@
 
   ;; Making tables
   array->column array->string-column named named-strings named-any make-table
-  table-select table-slice
+  table-select table-slice TableRows table-rows
   SortKey table-sort
   inner-join left-join semi-join anti-join
   table-distinct table-append pivot-longer pivot-wider
@@ -68,6 +68,11 @@
 (import (std prelude))
 (import (only (std datetime) Date DateTime Instant unix-days->date unix-microseconds->instant
               instant->utc-datetime))
+(import (std parallel))
+
+;; Chunkable, for the parts of tables and cells. A re-exported method carries
+;; its trait to importers.
+(re-export chunk-size chunks)
 
 (import/class
   (Table (: Apache.Arrow.RecordBatch))
@@ -110,6 +115,7 @@
   (clr-cells-valid? (: Bjostat.CellsOps.IsValid (-> (ClrCells %a) int bool)))
   (clr-cells-set (: Bjostat.CellsOps.Set (-> (ClrCells %a) int %a (ClrCells %a)) #:uses-type))
   (clr-cells-length (: Bjostat.CellsOps.Length (-> (ClrCells %a) int)))
+  (clr-cells-slice (: Bjostat.CellsOps.Slice (-> (ClrCells %a) int int (ClrCells %a))))
   (clr-cells-null-count (: Bjostat.CellsOps.NullCount (-> (ClrCells %a) int)))
   (clr-cells-contiguous? (: Bjostat.CellsOps.IsContiguous (-> (ClrCells %a) bool)))
   (clr-cells-values (: Bjostat.CellsOps.Values (-> (ClrCells %a) (RoSpan %a))))
@@ -345,6 +351,11 @@
 (: (-> (Cells %a) int))
 (defun (cells-null-count c) (clr-cells-null-count (record-ref c clr)))
 
+;; The rows from `from` to `to`, over the same Arrow buffers. Raises
+;; ArgumentOutOfRangeException when the range is outside the column.
+(: (-> (Cells %a) int int (Cells %a)))
+(defun (cells-slice c from to) (Cells (clr (clr-cells-slice (record-ref c clr) from to))))
+
 ;; A column as a collection `get`, `try-get`, `set` and `update` reach: a row
 ;; by its index, as a `Vec`'s element is.
 ;;
@@ -503,7 +514,9 @@
   (: source-valid? (-> %c int bool))
   (: source-ref (-> %c int %cell))
   (: source-next-valid (-> %c int int))
-  (: source-cells (-> %c (ClrCells %read))))
+  (: source-cells (-> %c (ClrCells %read)))
+  ;; The rows from `from` to `to`, without a copy of the values.
+  (: source-slice (-> %c int int %c)))
 
 (impl (RowSource (Cells %a))
   (type %cell %a)
@@ -513,7 +526,8 @@
   (defun (source-valid? c i) (cells-valid? c i))
   (defun (source-ref c i) (cells-ref c i))
   (defun (source-next-valid c i) (clr-cells-next-valid (record-ref c clr) i))
-  (defun (source-cells c) (record-ref c clr)))
+  (defun (source-cells c) (record-ref c clr))
+  (defun (source-slice c from to) (cells-slice c from to)))
 
 (impl (RowSource DateCells)
   (type %cell Date)
@@ -525,7 +539,8 @@
     (option-ref (time-cell (record-ref c days) i
                            (fun (n) (in-calendar (unix-days->date (cast long n)))))))
   (defun (source-next-valid c i) (clr-cells-next-valid (record-ref c days) i))
-  (defun (source-cells c) (record-ref c days)))
+  (defun (source-cells c) (record-ref c days))
+  (defun (source-slice c from to) (DateCells (days (clr-cells-slice (record-ref c days) from to)))))
 
 (impl (RowSource DateTimeCells)
   (type %cell DateTime)
@@ -537,7 +552,8 @@
     (option-ref (time-cell (record-ref c micros) i
                            (fun (us) (instant->utc-datetime (in-calendar (unix-microseconds->instant us)))))))
   (defun (source-next-valid c i) (clr-cells-next-valid (record-ref c micros) i))
-  (defun (source-cells c) (record-ref c micros)))
+  (defun (source-cells c) (record-ref c micros))
+  (defun (source-slice c from to) (DateTimeCells (micros (clr-cells-slice (record-ref c micros) from to)))))
 
 (impl (RowSource InstantCells)
   (type %cell Instant)
@@ -549,7 +565,8 @@
     (option-ref (time-cell (record-ref c micros) i
                            (fun (us) (in-calendar (unix-microseconds->instant us))))))
   (defun (source-next-valid c i) (clr-cells-next-valid (record-ref c micros) i))
-  (defun (source-cells c) (record-ref c micros)))
+  (defun (source-cells c) (record-ref c micros))
+  (defun (source-slice c from to) (InstantCells (micros (clr-cells-slice (record-ref c micros) from to)))))
 
 ;; The values of a column that are not null, as Julia's skipmissing: for a loop
 ;; over one column. Next to another column it would not stay on its row.
@@ -608,7 +625,9 @@
   (: row-values (-> %t int %row))
   ;; The first complete row from `i` on, or `length`, the length of the
   ;; shortest column.
-  (: row-next-complete (-> %t int int int)))
+  (: row-next-complete (-> %t int int int))
+  ;; Each column's rows from `from` to `to`.
+  (: row-columns-slice (-> %t int int %t)))
 
 (impl (RowColumns (Tuple %a %b)) (where (RowSource %a) (RowSource %b))
   (type %row (Tuple (assoc RowSource cell %a) (assoc RowSource cell %b)))
@@ -626,7 +645,10 @@
     (Tuple (source-ref a i) (source-ref b i)))
   (defun (row-next-complete t length i)
     (def (a b) t)
-    (clr-next-complete-2 (source-cells a) (source-cells b) length i)))
+    (clr-next-complete-2 (source-cells a) (source-cells b) length i))
+  (defun (row-columns-slice t from to)
+    (def (a b) t)
+    (Tuple (source-slice a from to) (source-slice b from to))))
 
 (impl (RowColumns (Tuple %a %b %c)) (where (RowSource %a) (RowSource %b) (RowSource %c))
   (type %row (Tuple (assoc RowSource cell %a) (assoc RowSource cell %b) (assoc RowSource cell %c)))
@@ -644,7 +666,10 @@
     (Tuple (source-ref a i) (source-ref b i) (source-ref c i)))
   (defun (row-next-complete t length i)
     (def (a b c) t)
-    (clr-next-complete-3 (source-cells a) (source-cells b) (source-cells c) length i)))
+    (clr-next-complete-3 (source-cells a) (source-cells b) (source-cells c) length i))
+  (defun (row-columns-slice t from to)
+    (def (a b c) t)
+    (Tuple (source-slice a from to) (source-slice b from to) (source-slice c from to))))
 
 (impl (RowColumns (Tuple %a %b %c %d))
   (where (RowSource %a) (RowSource %b) (RowSource %c) (RowSource %d))
@@ -665,7 +690,10 @@
     (Tuple (source-ref a i) (source-ref b i) (source-ref c i) (source-ref d i)))
   (defun (row-next-complete t length i)
     (def (a b c d) t)
-    (clr-next-complete-4 (source-cells a) (source-cells b) (source-cells c) (source-cells d) length i)))
+    (clr-next-complete-4 (source-cells a) (source-cells b) (source-cells c) (source-cells d) length i))
+  (defun (row-columns-slice t from to)
+    (def (a b c d) t)
+    (Tuple (source-slice a from to) (source-slice b from to) (source-slice c from to) (source-slice d from to))))
 
 (impl (RowColumns (Tuple %a %b %c %d %e))
   (where (RowSource %a) (RowSource %b) (RowSource %c) (RowSource %d) (RowSource %e))
@@ -690,7 +718,10 @@
   (defun (row-next-complete t length i)
     (def (a b c d e) t)
     (clr-next-complete-5 (source-cells a) (source-cells b) (source-cells c) (source-cells d)
-                         (source-cells e) length i)))
+                         (source-cells e) length i))
+  (defun (row-columns-slice t from to)
+    (def (a b c d e) t)
+    (Tuple (source-slice a from to) (source-slice b from to) (source-slice c from to) (source-slice d from to) (source-slice e from to))))
 
 (impl (RowColumns (Tuple %a %b %c %d %e %f))
   (where (RowSource %a) (RowSource %b) (RowSource %c) (RowSource %d) (RowSource %e) (RowSource %f))
@@ -718,7 +749,10 @@
   (defun (row-next-complete t length i)
     (def (a b c d e f) t)
     (clr-next-complete-6 (source-cells a) (source-cells b) (source-cells c) (source-cells d)
-                         (source-cells e) (source-cells f) length i)))
+                         (source-cells e) (source-cells f) length i))
+  (defun (row-columns-slice t from to)
+    (def (a b c d e f) t)
+    (Tuple (source-slice a from to) (source-slice b from to) (source-slice c from to) (source-slice d from to) (source-slice e from to) (source-slice f from to))))
 
 (: (-> %t (CompleteRows %t)) (where (RowColumns %t)))
 (defun (complete-rows columns)
@@ -817,6 +851,93 @@
     ((> to n) (refuse (str "a slice to " (int->string to) " ends past the last of " (int->string n) " rows.")))
     ((> from to) (refuse (str "a slice from " (int->string from) " to " (int->string to) " ends before it starts.")))
     (else (Ok (clr-slice t from to)))))
+
+;; ===========================================================================
+;; Parts, for (std parallel)
+;; ===========================================================================
+
+;; `table-rows` of a table, a column of cells, `skip-nulls` and
+;; `complete-rows` are `Chunkable`: `in-parallel` runs a function on parts of their rows.
+;;
+;; - A part is a slice: no copy of the values. A part's row 0 is the first
+;;   row of the part.
+;; - Inner cuts are at multiples of 64 rows, so that a part's valid bitmap
+;;   starts at a whole byte and a loop over it is a vector loop where the
+;;   whole column's is.
+;; - The cuts depend only on the number of rows and the number of parts
+;;   asked for: with `#:size`, only on the rows.
+
+;; The cuts of `n` rows into about `k` parts: 0, the inner cuts, `n`.
+;; Increasing; `[0 0]` for no rows.
+(: (-> int int (Vec int)))
+(defun (row-cuts n k)
+  (def m (max 1 (min k (+ (/ n 64) 1))))
+  (let go ((i 1) (last 0) (acc [0]))
+    (if (>= i m)
+        (vec-add acc n)
+        (let ((c (* 64 (/ (cast int (/ (* (cast long n) (cast long i)) (cast long m))) 64))))
+          (if (and (> c last) (< c n))
+              (go (+ i 1) c (vec-add acc c))
+              (go (+ i 1) last acc))))))
+
+;; `(slice from to)` for each part of `n` rows cut into about `k`.
+(: (-> int int (-> int int %p) (Vec %p)))
+(defun (row-parts n k slice)
+  (def cuts (row-cuts n k))
+  (loop (:for i (range 0 (- (vec-length cuts) 1)))
+        (:acc parts (vecing (slice (vec-ref cuts i) (vec-ref cuts (+ i 1)))))))
+
+;; The rows of a table, for `in-parallel`: a part is a table. `Table` is a
+;; .NET type, which cannot be Chunkable itself.
+(type (: TableRows #:opaque (Struct (: table Table))))
+
+(: (-> Table TableRows))
+(defun (table-rows t) (TableRows (table t)))
+
+(impl (Chunkable TableRows)
+  (type %chunk Table)
+  (defun (chunk-size r) (table-row-count (record-ref r table)))
+  (defun (chunks r k)
+    (def t (record-ref r table))
+    (row-parts (table-row-count t) k (fun (from to) (clr-slice t from to)))))
+
+(impl (Chunkable (Cells %a))
+  (type %chunk (Cells %a))
+  (defun (chunk-size c) (cells-length c))
+  (defun (chunks c k) (row-parts (cells-length c) k (fun (from to) (cells-slice c from to)))))
+
+(impl (Chunkable DateCells)
+  (type %chunk DateCells)
+  (defun (chunk-size c) (source-length c))
+  (defun (chunks c k) (row-parts (source-length c) k (fun (from to) (source-slice c from to)))))
+
+(impl (Chunkable DateTimeCells)
+  (type %chunk DateTimeCells)
+  (defun (chunk-size c) (source-length c))
+  (defun (chunks c k) (row-parts (source-length c) k (fun (from to) (source-slice c from to)))))
+
+(impl (Chunkable InstantCells)
+  (type %chunk InstantCells)
+  (defun (chunk-size c) (source-length c))
+  (defun (chunks c k) (row-parts (source-length c) k (fun (from to) (source-slice c from to)))))
+
+;; Cut by rows, nulls included: a part holds the values of its rows that are
+;; not null.
+(impl (Chunkable (NotNull %c)) (where (RowSource %c))
+  (type %chunk (NotNull %c))
+  (defun (chunk-size s) (source-length (record-ref s source)))
+  (defun (chunks s k)
+    (def c (record-ref s source))
+    (row-parts (source-length c) k (fun (from to) (NotNull (source (source-slice c from to)))))))
+
+;; Cut by rows of the shortest column.
+(impl (Chunkable (CompleteRows %t)) (where (RowColumns %t))
+  (type %chunk (CompleteRows %t))
+  (defun (chunk-size r) (record-ref r length))
+  (defun (chunks r k)
+    (def cols (record-ref r columns))
+    (row-parts (record-ref r length) k
+               (fun (from to) (complete-rows (row-columns-slice cols from to))))))
 
 ;; A column to sort by, and the direction.
 (type (: SortKey (Union (: ascending string) (: descending string))))

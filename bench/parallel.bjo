@@ -16,8 +16,11 @@
 ;; - B, spawn/thread: a thread of its own for each part, which costs more to
 ;;   make than a part of a millisecond takes.
 ;; - C, computing-each: bjostat's workers, threads made once, all the parts
-;;   one event, which the caller waits for by colour. No pump is held. This
-;;   is the way; bench/latency.bjo measures how it treats other fibers.
+;;   one event, which the caller waits for by colour. No pump is held.
+;;   bench/latency.bjo measures how it treats other fibers.
+;; - D, (std parallel): `in-parts` over `table-rows`, parts of 65 536 rows,
+;;   on its compute threads. And a standard deviation: `standard-deviation`
+;;   on one thread against `moments` in parts, combined.
 ;;
 ;; Do not start the parts from a module-level def: they read the module's
 ;; values while the module is set up, and wait for it, as it waits for them.
@@ -26,6 +29,8 @@
 (import (std bench))
 (import (bjostat table))
 (import (bjostat query))
+(import (bjostat stats))
+(import (only (std parallel) in-parts in-parallel))
 
 
 (: int) (def rows 1000000)
@@ -48,7 +53,7 @@
 (: (-> int int Table))
 (defun (part parts k)
   (def size (/ (+ rows (- parts 1)) parts))
-  (table-slice t #:from (* k size) #:to (min rows (* (+ k 1) size))))
+  (or-panic (table-slice t #:from (min rows (* k size)) #:to (min rows (* (+ k 1) size)))))
 
 (: (-> (Result Exception double) double))
 (defun (ok-sum r) (match r ((Ok v) v) ((Err e) (raise e))))
@@ -78,6 +83,26 @@
 (defun (on-pool parts)
   (loop (:for x (computed (computing-each parts (fun (k) (revenue (part parts k)))))) (:acc (summing x))))
 
+;; D: (std parallel), parts by rows.
+(: (-> double))
+(defun (in-std-parts)
+  (vec-fold + 0.0 (in-parts (table-rows t) revenue #:size 65536)))
+
+(: (-> Table (Cells double)))
+(defun (prices u) (match (column-as u "price") ((Ok c) c) ((Err e) (panic! (displayed e)))))
+
+(: (-> Table Moments))
+(defun (price-moments u)
+  (loop (:for p* (prices u)) (:when-let (Some p) p*) (:acc (moments p))))
+
+(: (-> (Option double)))
+(defun (sd-one-thread)
+  (loop (:for p* (prices t)) (:when-let (Some p) p*) (:acc (standard-deviation p))))
+
+(: (-> (Option double)))
+(defun (sd-in-parts)
+  (moments-standard-deviation (in-parallel (table-rows t) price-moments #:size 65536)))
+
 (def/bench "1 thread" (revenue t))
 (def/bench "fibers, 8 parts" (on-fibers 8))
 (def/bench "spawn/thread, 8 parts" (on-threads 8))
@@ -85,5 +110,8 @@
 (def/bench "fibers, 12 parts" (on-fibers 12))
 (def/bench "spawn/thread, 12 parts" (on-threads 12))
 (def/bench "computing, 12 parts" (on-pool 12))
+(def/bench "in-parts, 65536 rows a part" (in-std-parts))
+(def/bench "sd, 1 thread" (sd-one-thread))
+(def/bench "sd, moments in parts" (sd-in-parts))
 
 (run-benches)
