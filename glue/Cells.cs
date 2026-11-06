@@ -21,6 +21,7 @@ using System.Buffers;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
 using Apache.Arrow;
 using BjoString;
 
@@ -213,6 +214,51 @@ public sealed unsafe class Cells<T>
         return ThrowNoValues();
     }
 
+    /// <summary>
+    /// The values <paramref name="i"/> to <paramref name="i"/> + 3 (doubles,
+    /// longs) or + 7 (floats, ints), as a vector: a load of (std simd)'s
+    /// SimdSource. Under a null the value is unspecified. Raises
+    /// ArgumentOutOfRangeException when a whole vector does not fit, as
+    /// (std simd)'s loads do. No call that returns, as in <see cref="Ref"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Vector256<T> Load256(int i)
+    {
+        if ((uint)i > (uint)(Length - Vector256<T>.Count)) ThrowLoad(i, Vector256<T>.Count);
+        return Unsafe.ReadUnaligned<Vector256<T>>(ref At(i));
+    }
+
+    /// <summary>As <see cref="Load256"/>, of half as many values.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Vector128<T> Load128(int i)
+    {
+        if ((uint)i > (uint)(Length - Vector128<T>.Count)) ThrowLoad(i, Vector128<T>.Count);
+        return Unsafe.ReadUnaligned<Vector128<T>>(ref At(i));
+    }
+
+    // The first byte of value i, in the array or at the pointer. One address
+    // and then one load: with a load on each path the JIT joined the two
+    // vectors through the stack.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ref byte At(int i)
+    {
+        if (_bytes != null)
+            return ref Unsafe.Add(ref MemoryMarshal.GetArrayDataReference(_bytes), _start + i * Unsafe.SizeOf<T>());
+        if (_pointer == null) ThrowNoBuffer();
+        return ref Unsafe.AsRef<byte>(_pointer + (nint)i * Unsafe.SizeOf<T>());
+    }
+
+    // These only throw, and are not NoInlining, so that the JIT sees that a
+    // call of one does not return: see ThrowNoValues.
+    private void ThrowLoad(int i, int lanes) =>
+        throw new ArgumentOutOfRangeException(nameof(i),
+            $"(bjostat table): {lanes} values from row {i} of a column of {Length}");
+
+    private void ThrowNoBuffer() => throw NoValues();
+
+    private InvalidOperationException NoValues() =>
+        new($"(bjostat table): the buffer of a column of {typeof(T).Name} is shorter than its {Length} values");
+
     // Not NoInlining: the JIT finds that a call does not return by reading
     // the callee's body when it considers inlining it.
     [System.Diagnostics.CodeAnalysis.DoesNotReturn]
@@ -301,6 +347,21 @@ public static class CellsOps
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static T Ref<T>(Cells<T> c, int i) => c.Ref(i);
+
+    // The loads of (std simd)'s SimdSource, and its lanes.
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector256<T> Load256<T>(Cells<T> c, int i) => c.Load256(i);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector128<T> Load128<T>(Cells<T> c, int i) => c.Load128(i);
+
+    public static int Lanes256<T>(Cells<T> _) => Vector256<T>.Count;
+
+    public static int Lanes128<T>(Cells<T> _) => Vector128<T>.Count;
+
+    /// <summary>The cells of a column whose type the caller knows to be T.</summary>
+    public static Cells<T> OfColumn<T>(PrimitiveArray<T> a) where T : struct, IEquatable<T> => new(a);
 
     /// <summary>The value at the index, or None at a null.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

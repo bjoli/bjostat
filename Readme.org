@@ -417,14 +417,17 @@ numbers, with the nulls left out, in one call:
 | ~(column-variance c)~, ~(column-standard-deviation c)~ | As ~variance~ and ~standard-deviation~ |
 | ~(column-covariance x y)~, ~(column-correlation x y)~ | As ~covariance~ and ~correlation~, of the rows where neither is null |
 | ~(column-moments c)~, ~(column-co-moments x y)~ | The ~Moments~ and ~CoMoments~, to finish or combine |
+| ~(cells-moments c)~, ~(cells-co-moments x y)~ | The same of cells, as ~column-as~ gives them |
 
-They add with vector instructions, 8 values at a time. The order of the
-additions is fixed, so a result is the same on every machine; it differs
-from a loop's only in the last digits. A million rows: the standard
-deviation 0.34 to 0.45 ms against 0.83 for the loop, and Polars's 0.48 on
-one thread; the correlation of a column of doubles and one of longs 0.56 to
-0.80 ms against 1.87 and Polars's 1.09. A loop is still the way to a
-statistic of some rows, or of values computed from the columns.
+They add with vector instructions, 8 values at a time, in Bjolang with
+~(std simd)~: the cells of a column of numbers are a ~SimdSource~. The order
+of the additions is fixed, so a result is the same on every machine, with
+AVX2 or without it; it differs from a loop's only in the last digits. A
+million rows: the standard deviation 0.19 ms against 0.83 for the loop, and
+Polars's 0.48 on one thread; the correlation of a column of doubles and one
+of longs 0.47 to 0.51 ms against 1.87 and Polars's 1.09. With nulls in both
+columns the correlation takes 0.91 ms (Polars 3.57). A loop is still the way
+to a statistic of some rows, or of values computed from the columns.
 
 ** Loops in parts
 

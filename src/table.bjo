@@ -35,7 +35,7 @@
   string-column-length string-column-null-count string-column-ref
 
   ;; Cells: a column at the type its use gives
-  Cells column-as cells-ref cells-get cells-valid? cells-length cells-null-count cells-slice
+  Cells column-as column->cells cells-ref cells-get cells-valid? cells-length cells-null-count cells-slice
   DateCells DateTimeCells InstantCells date-cells datetime-cells instant-cells
   RowSource NotNull skip-nulls CompleteRows RowColumns complete-rows
   cells-window window-rows lowest-bit
@@ -69,6 +69,11 @@
 (import (only (std datetime) Date DateTime Instant unix-days->date unix-microseconds->instant
               instant->utc-datetime))
 (import (std parallel))
+(import (only (std simd) Simd128 Simd256))
+
+;; SimdSource, for the cells of a column of numbers: the re-exported methods
+;; carry the trait to importers, as `chunk-size` carries Chunkable.
+(re-export simd128-load simd256-load simd128-lanes simd256-lanes simd-source-length)
 
 ;; Chunkable, for the parts of tables and cells. A re-exported method carries
 ;; its trait to importers.
@@ -137,6 +142,11 @@
   ;; 57 rows at a time in the valid bitmaps.
   (clr-cells-next-valid (: Bjostat.CellsOps.NextValid (-> (ClrCells %a) int int)))
   (clr-cells-window (: Bjostat.CellsOps.Window (-> (ClrCells %a) int int long)))
+  (clr-cells-of-column (: Bjostat.CellsOps.OfColumn (-> (Column %a) (ClrCells %a))))
+  (clr-cells-load256 (: Bjostat.CellsOps.Load256 (-> (ClrCells %a) int (Simd256 %a))))
+  (clr-cells-load128 (: Bjostat.CellsOps.Load128 (-> (ClrCells %a) int (Simd128 %a))))
+  (clr-cells-lanes256 (: Bjostat.CellsOps.Lanes256 (-> (ClrCells %a) int)))
+  (clr-cells-lanes128 (: Bjostat.CellsOps.Lanes128 (-> (ClrCells %a) int)))
   (lowest-bit (: Bjostat.CellsOps.LowestBit (-> long int)))
   (clr-next-complete-2 (: Bjostat.CellsOps.NextComplete (-> (ClrCells %a) (ClrCells %b) int int int)))
   (clr-next-complete-3 (: Bjostat.CellsOps.NextComplete (-> (ClrCells %a) (ClrCells %b) (ClrCells %c) int int int)))
@@ -393,6 +403,9 @@
   (type %in %a)
   (defun (ref-set c i v) (Cells (clr (clr-cells-set (record-ref c clr) i v)))))
 
+(: (-> (Column %a) (Cells %a)))
+(defun (column->cells c) (Cells (clr (clr-cells-of-column c))))
+
 (: (-> Table string (Result TableError (Cells %a))))
 (defun (column-as t name)
   (def (Ok c) (find-column t name) :propagate)
@@ -426,6 +439,19 @@
   (defun (contiguous? c) (clr-cells-contiguous? (record-ref c clr)))
   (defun (contiguous-values c) (clr-cells-values (record-ref c clr)))
   (defun (contiguous-valid c) (clr-cells-valid (record-ref c clr))))
+
+;; The cells of a column of numbers are a source of (std simd)'s vectors:
+;; `(simd256-load c i)` is the values of rows i to i + 3 (doubles, longs) or
+;; i + 7 (floats, ints). Under a null a lane's value is unspecified; the
+;; valid bits are `cells-window`'s. A load has no call that returns, so a
+;; loop's vectors stay in registers (glue/Cells.cs).
+(impl (SimdSource (Cells %a)) (where (Lane %a))
+  (type %elem %a)
+  (defun (simd128-load c i) (clr-cells-load128 (record-ref c clr) i))
+  (defun (simd256-load c i) (clr-cells-load256 (record-ref c clr) i))
+  (defun (simd128-lanes c) (clr-cells-lanes128 (record-ref c clr)))
+  (defun (simd256-lanes c) (clr-cells-lanes256 (record-ref c clr)))
+  (defun (simd-source-length c) (cells-length c)))
 
 ;; Columns of dates and timestamps, as values of (std datetime). A column of
 ;; dates holds days since 1970-01-01, and one of timestamps microseconds since

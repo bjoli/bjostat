@@ -37,7 +37,7 @@
   CoMomentsOf co-moments-count co-moments-covariance co-moments-correlation
   Values ValuesOf values-count values-quantile values-quantiles values-median values-summary
   ;; Of a whole column at once, with vector instructions
-  column-moments column-variance column-standard-deviation
+  ColumnNumber cells-moments cells-co-moments column-moments column-variance column-standard-deviation
   column-co-moments column-covariance column-correlation)
 
 (import (std prelude))
@@ -51,15 +51,15 @@
 (import (bjostat table))
 (import (bjostat query))
 (import (only (std parallel) computing-each))
+(import (std simd))
+(import (std maths))
 
 (import/extern
   (clr-quantiles (: Bjostat.Stats.Quantiles (-> (MutableVec double) (Array double) (Array double))))
   (clr-summarize (: Bjostat.Stats.Summarize (-> (MutableVec double) (Array double))))
   (stats-grow (: Bjostat.Stats.Grow (-> (MutableVec double) int (MutableVec double))))
   (stats-span (: Bjostat.Stats.Span (-> (MutableVec double) int int (Span double))))
-  (stats-no-none! (: Bjostat.Stats.NoNone (-> (MutableVec double) int void)))
-  (clr-column-moments (: Bjostat.ColumnStats.Moments (-> (Column %a) (Array double))))
-  (clr-column-co-moments (: Bjostat.ColumnStats.CoMoments (-> (Column %a) (Column %b) (Array double)))))
+  (stats-no-none! (: Bjostat.Stats.NoNone (-> (MutableVec double) int void))))
 
 ;; ===========================================================================
 ;; Mean and variance, in one pass
@@ -159,27 +159,172 @@
   (defun (collector-step c m x) (moments-add m x))
   (defun (collector-finish c m) (moments-standard-deviation m)))
 
+;; ---------------------------------------------------------------------------
+;; Whole columns, with vector instructions
+;; ---------------------------------------------------------------------------
+;;
+;; The column functions make the sums of `moments` and `co-moments` of a whole
+;; column and finish them with the collectors' own functions, so they differ
+;; from a loop only in the order of the additions. The order is fixed, so that
+;; a result is the same on every machine: the value of row r goes to lane
+;; r % 8, each lane adds its values in row order, and the lanes are added
+;; ((0 + 1) + (2 + 3)) + ((4 + 5) + (6 + 7)) (`lanes-total`). Rows in whole
+;; blocks of 8 are two `Float64x4`; the rows after the last block, and all of
+;; them without AVX2, go to an array of the 8 lanes one at a time: the same
+;; additions. A null adds +0.0 to its lane in both.
+
+;; The loads of ColumnNumber, as functions of this module: an importer that
+;; inlines an implementation's method checks its body where it is, and
+;; (std simd)'s methods may be unbound there (see v4-add).
+(: (-> (Cells double) int Float64x4))
+(defun (load-doubles-of-doubles c i) (simd256-load c i))
+(: (-> (Cells long) int Float64x4))
+(defun (load-doubles-of-longs c i) (simd256-int->float (simd256-load c i)))
+(: (-> (Cells int) int Float64x4))
+(defun (load-doubles-of-ints c i)
+  (simd256-of (cast double (cells-ref c i)) (cast double (cells-ref c (+ i 1)))
+              (cast double (cells-ref c (+ i 2))) (cast double (cells-ref c (+ i 3)))))
+(: (-> (Cells float) int Float64x4))
+(defun (load-doubles-of-floats c i)
+  (simd256-of (cast double (cells-ref c i)) (cast double (cells-ref c (+ i 1)))
+              (cast double (cells-ref c (+ i 2))) (cast double (cells-ref c (+ i 3)))))
+
+;; How the values of a column of numbers become doubles: 4 at a time, for a
+;; vector, and one at a time. A double is loaded as it is and a long is
+;; converted 4 at a time, as (cast double x) converts one; the other types are
+;; read one value at a time into the vector.
+(def/trait (ColumnNumber %a)
+  (: load-doubles (-> (Cells %a) int Float64x4))
+  (: cell-double (-> (Cells %a) int double)))
+
+(impl (ColumnNumber double)
+  (defun (load-doubles c i) (load-doubles-of-doubles c i))
+  (defun (cell-double c i) (cells-ref c i)))
+
+(impl (ColumnNumber long)
+  (defun (load-doubles c i) (load-doubles-of-longs c i))
+  (defun (cell-double c i) (cast double (cells-ref c i))))
+
+(impl (ColumnNumber int)
+  (defun (load-doubles c i) (load-doubles-of-ints c i))
+  (defun (cell-double c i) (cast double (cells-ref c i))))
+
+(impl (ColumnNumber float)
+  (defun (load-doubles c i) (load-doubles-of-floats c i))
+  (defun (cell-double c i) (cast double (cells-ref c i))))
+
+;; For each 4 valid bits, the lanes of a Float64x4 that are all ones where the
+;; bit is set: `simd-and` with one keeps the lanes of the valid rows.
+(: (Array Float64x4))
+(def lane-masks
+  {arraying (simd-bits->float64
+              (: (simd256-of (if (= (bitwise-and m 1) 0) 0L -1L) (if (= (bitwise-and m 2) 0) 0L -1L)
+                             (if (= (bitwise-and m 4) 0) 0L -1L) (if (= (bitwise-and m 8) 0) 0L -1L))
+                 Int64x4))
+            (:for m (range 0 16))})
+
+;; The 8 lanes of an array added in the fixed order.
+(: (-> (Array double) double))
+(defun (lanes-total s)
+  (+ (+ (+ (array-ref s 0) (array-ref s 1)) (+ (array-ref s 2) (array-ref s 3)))
+     (+ (+ (array-ref s 4) (array-ref s 5)) (+ (array-ref s 6) (array-ref s 7)))))
+
+;; The rows of the whole blocks of 8, for the vectors: none without AVX2.
+(: (-> int int))
+(defun (vector-rows n)
+  (if simd256-accelerated? (* 8 (/ n 8)) 0))
+
+;; Adds `d` to lane `lane` of `s`.
+(: (-> (Array double) int double void))
+(defun (lane-add! s lane d) #:inline
+  (array-set! s lane (+ (array-ref s lane) d)))
+
+;; The vector operations of the kernels below, as functions of this module.
+;; A body that an importer specialises (cells-moments, at its own types) is
+;; checked in the importer, where a trait method of a module it does not
+;; import, as (std simd)'s `simd-add`, is unbound and the copy is declined:
+;; then every call passes a dictionary, and the loop calls through it. A
+;; function of this module is named with its module there. Not #:inline: an
+;; inline body is spliced with the same names. .NET inlines them.
+(: (-> Float64x4 Float64x4 Float64x4))
+(defun (v4-add a b) (simd-add a b))
+(: (-> Float64x4 Float64x4 Float64x4))
+(defun (v4-sub a b) (simd-sub a b))
+(: (-> Float64x4 Float64x4 Float64x4))
+(defun (v4-mul a b) (simd-mul a b))
+(: (-> Float64x4 Float64x4 Float64x4))
+(defun (v4-and a b) (simd-and a b))
+(: (-> Float64x4 (Array double) int void))
+(defun (v4-store! v a i) (simd-store! v a i))
+(: (-> double Float64x4))
+(defun (v4-splat x) (simd256-splat x))
+(: (-> Float64x4))
+(defun (v4-zero) (simd256-zero))
+(: (-> long int))
+(defun (bits-count bits) (popcount (cast int bits)))
+
+;; The moments of the values of cells of numbers that are not null.
+(: (-> (Cells %a) Moments) (where (ColumnNumber %a)))
+(defun (cells-moments c)
+  (def n (cells-length c))
+  (def first (source-next-valid c 0))
+  (if (>= first n)
+      no-moments
+      ;; The arrays are made before the vectors: a vector that lives across a
+      ;; call is kept on the stack.
+      (let* ((s1 (make-array 8 #:fill 0.0))
+             (s2 (make-array 8 #:fill 0.0))
+             (k (cell-double c first))
+             (kv (v4-splat k))
+             (nulls? (> (cells-null-count c) 0))
+             (masks lane-masks)
+             (blocks (vector-rows n))
+             (in-blocks
+              (let go ((i 0) (count 0L)
+                       (s1a (v4-zero)) (s1b (v4-zero))
+                       (s2a (v4-zero)) (s2b (v4-zero)))
+                (if (>= i blocks)
+                    (begin
+                      (v4-store! s1a s1 0) (v4-store! s1b s1 4)
+                      (v4-store! s2a s2 0) (v4-store! s2b s2 4)
+                      count)
+                    (let* ((bits (if nulls? (bitwise-and (cells-window c n i) 255L) 255L))
+                           (d0 (v4-sub (load-doubles c i) kv))
+                           (d1 (v4-sub (load-doubles c (+ i 4)) kv))
+                           (d0 (if nulls? (v4-and d0 (array-ref masks (cast int (bitwise-and bits 15L)))) d0))
+                           (d1 (if nulls? (v4-and d1 (array-ref masks (cast int (shift-right bits 4)))) d1)))
+                      (go (+ i 8) (+ count (cast long (bits-count bits)))
+                          (v4-add s1a d0) (v4-add s1b d1)
+                          (v4-add s2a (v4-mul d0 d0)) (v4-add s2b (v4-mul d1 d1))))))))
+        (def count
+          (let tail ((i blocks) (count 0L))
+            (if (>= i n)
+                count
+                (let* ((lane (bitwise-and i 7))
+                       (valid? (cells-valid? c i))
+                       (d (if valid? (- (cell-double c i) k) 0.0)))
+                  (begin
+                    (lane-add! s1 lane d)
+                    (lane-add! s2 lane (* d d))
+                    (tail (+ i 1) (if valid? (+ count 1L) count)))))))
+        (Moments (n (+ in-blocks count)) (k k) (s1 (lanes-total s1)) (s2 (lanes-total s2))))))
+
 ;; The moments of the values of a column of numbers that are not null, as
-;; `moments` collects them, of the whole column at once (glue/ColumnStats.cs):
+;; `moments` collects them, of the whole column at once:
 ;;
 ;;     (column-standard-deviation (or-panic (doubles t "price")))
 ;;
-;; The sums are added in 8 lanes with vector instructions, in an order that
-;; is the same on every machine, so a result is too. It differs from the
-;; loop's only in the order of the additions: in the last digits. For a
-;; column of doubles or longs; another type of number is added one value at a
-;; time, in the same order.
-(: (-> (Column %a) Moments))
-(defun (column-moments c)
-  (def v (clr-column-moments c))
-  (Moments (n (cast long (array-ref v 0))) (k (array-ref v 1)) (s1 (array-ref v 2)) (s2 (array-ref v 3))))
+;; It differs from the loop's only in the order of the additions: in the last
+;; digits.
+(: (-> (Column %a) Moments) (where (ColumnNumber %a)))
+(defun (column-moments c) (cells-moments (column->cells c)))
 
 ;; The variance of a sample, as `variance`; None for fewer than two values.
-(: (-> (Column %a) (Option double)))
+(: (-> (Column %a) (Option double)) (where (ColumnNumber %a)))
 (defun (column-variance c) (moments-variance (column-moments c)))
 
 ;; As `standard-deviation`; None for fewer than two values.
-(: (-> (Column %a) (Option double)))
+(: (-> (Column %a) (Option double)) (where (ColumnNumber %a)))
 (defun (column-standard-deviation c) (moments-standard-deviation (column-moments c)))
 
 ;; ===========================================================================
@@ -300,25 +445,104 @@
   (defun (collector-step c m xy) (co-moments-add m xy))
   (defun (collector-finish c m) (co-moments-correlation m)))
 
+;; The moments of the pairs of cells of numbers where neither is null, of
+;; the rows of the shorter: as `cells-moments`, with five sums.
+(: (-> (Cells %a) (Cells %b) CoMoments) (where (ColumnNumber %a) (ColumnNumber %b)))
+(defun (cells-co-moments x y)
+  (def n (min (cells-length x) (cells-length y)))
+  (def first
+    (let find ((i 0))
+      (if (or (>= i n) (and (cells-valid? x i) (cells-valid? y i))) i (find (+ i 1)))))
+  (if (>= first n)
+      no-co-moments
+      ;; The arrays first, as in cells-moments.
+      (let* ((sx (make-array 8 #:fill 0.0)) (sy (make-array 8 #:fill 0.0))
+             (sxx (make-array 8 #:fill 0.0)) (syy (make-array 8 #:fill 0.0)) (sxy (make-array 8 #:fill 0.0))
+             (kx (cell-double x first))
+             (ky (cell-double y first))
+             (kxv (v4-splat kx))
+             (kyv (v4-splat ky))
+             (x-nulls? (> (cells-null-count x) 0))
+             (y-nulls? (> (cells-null-count y) 0))
+             (nulls? (or x-nulls? y-nulls?))
+             (masks lane-masks)
+             (blocks (vector-rows n))
+             (zero (v4-zero))
+             (in-blocks
+              (let go ((i 0) (count 0L)
+                       (sxa zero) (sxb zero) (sya zero) (syb zero)
+                       (sxxa zero) (sxxb zero) (syya zero) (syyb zero) (sxya zero) (sxyb zero))
+                (if (>= i blocks)
+                    (begin
+                      (v4-store! sxa sx 0) (v4-store! sxb sx 4)
+                      (v4-store! sya sy 0) (v4-store! syb sy 4)
+                      (v4-store! sxxa sxx 0) (v4-store! sxxb sxx 4)
+                      (v4-store! syya syy 0) (v4-store! syyb syy 4)
+                      (v4-store! sxya sxy 0) (v4-store! sxyb sxy 4)
+                      count)
+                    (let* ((bits (bitwise-and (if x-nulls? (cells-window x n i) 255L)
+                                              (if y-nulls? (cells-window y n i) 255L)
+                                              255L))
+                           (lo (cast int (bitwise-and bits 15L)))
+                           (hi (cast int (shift-right bits 4)))
+                           ;; Rows i to i + 3 into lanes 0-3, all five sums,
+                           ;; before rows i + 4 to i + 7 are loaded: fewer
+                           ;; vectors are live at once than the 16 registers.
+                           ;; A mask is read where it is used, for the same
+                           ;; reason.
+                           (dx0 (v4-sub (load-doubles x i) kxv))
+                           (dx0 (if nulls? (v4-and dx0 (array-ref masks lo)) dx0))
+                           (dy0 (v4-sub (load-doubles y i) kyv))
+                           (dy0 (if nulls? (v4-and dy0 (array-ref masks lo)) dy0))
+                           (sxa (v4-add sxa dx0))
+                           (sya (v4-add sya dy0))
+                           (sxxa (v4-add sxxa (v4-mul dx0 dx0)))
+                           (syya (v4-add syya (v4-mul dy0 dy0)))
+                           (sxya (v4-add sxya (v4-mul dx0 dy0)))
+                           (dx1 (v4-sub (load-doubles x (+ i 4)) kxv))
+                           (dx1 (if nulls? (v4-and dx1 (array-ref masks hi)) dx1))
+                           (dy1 (v4-sub (load-doubles y (+ i 4)) kyv))
+                           (dy1 (if nulls? (v4-and dy1 (array-ref masks hi)) dy1)))
+                      (go (+ i 8) (+ count (cast long (bits-count bits)))
+                          sxa (v4-add sxb dx1)
+                          sya (v4-add syb dy1)
+                          sxxa (v4-add sxxb (v4-mul dx1 dx1))
+                          syya (v4-add syyb (v4-mul dy1 dy1))
+                          sxya (v4-add sxyb (v4-mul dx1 dy1))))))))
+        (def count
+          (let tail ((i blocks) (count 0L))
+            (if (>= i n)
+                count
+                (let* ((lane (bitwise-and i 7))
+                       (valid? (and (cells-valid? x i) (cells-valid? y i)))
+                       (dx (if valid? (- (cell-double x i) kx) 0.0))
+                       (dy (if valid? (- (cell-double y i) ky) 0.0)))
+                  (begin
+                    (lane-add! sx lane dx)
+                    (lane-add! sy lane dy)
+                    (lane-add! sxx lane (* dx dx))
+                    (lane-add! syy lane (* dy dy))
+                    (lane-add! sxy lane (* dx dy))
+                    (tail (+ i 1) (if valid? (+ count 1L) count)))))))
+        (CoMoments (n (+ in-blocks count)) (kx kx) (ky ky)
+                   (sx (lanes-total sx)) (sy (lanes-total sy))
+                   (sxx (lanes-total sxx)) (syy (lanes-total syy)) (sxy (lanes-total sxy))))))
+
 ;; The moments of the pairs of two columns of numbers where neither is null,
 ;; as `co-moments` collects them, of the rows of the shorter column at once,
 ;; as `column-moments`:
 ;;
 ;;     (column-correlation (or-panic (doubles t "price")) (or-panic (longs t "qty")))
-(: (-> (Column %a) (Column %b) CoMoments))
-(defun (column-co-moments x y)
-  (def v (clr-column-co-moments x y))
-  (CoMoments (n (cast long (array-ref v 0))) (kx (array-ref v 1)) (ky (array-ref v 2))
-             (sx (array-ref v 3)) (sy (array-ref v 4))
-             (sxx (array-ref v 5)) (syy (array-ref v 6)) (sxy (array-ref v 7))))
+(: (-> (Column %a) (Column %b) CoMoments) (where (ColumnNumber %a) (ColumnNumber %b)))
+(defun (column-co-moments x y) (cells-co-moments (column->cells x) (column->cells y)))
 
 ;; As `covariance`; None for fewer than two pairs.
-(: (-> (Column %a) (Column %b) (Option double)))
+(: (-> (Column %a) (Column %b) (Option double)) (where (ColumnNumber %a) (ColumnNumber %b)))
 (defun (column-covariance x y) (co-moments-covariance (column-co-moments x y)))
 
 ;; As `correlation`; None for fewer than two pairs, and when one column has
 ;; the same value in each pair.
-(: (-> (Column %a) (Column %b) (Option double)))
+(: (-> (Column %a) (Column %b) (Option double)) (where (ColumnNumber %a) (ColumnNumber %b)))
 (defun (column-correlation x y) (co-moments-correlation (column-co-moments x y)))
 
 ;; ===========================================================================

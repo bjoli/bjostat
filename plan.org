@@ -1008,6 +1008,35 @@ loops before anything else, as they change the Collector trait:
    Polars's 1.09 and 3.57. tests/stats.bjo: each against the loop of its
    collector, within 1e-12, for 12 lengths around the blocks of 8, 4
    patterns of nulls, a slice inside a byte of the bitmap, longs and ints.
+
+   Moved to Bjolang the same day: the kernels are ~cells-moments~ and
+   ~cells-co-moments~ in (bjostat stats), with (std simd), and the C# that
+   is left is a load of 4 or 8 values from the cells (~Cells.Load256~,
+   ~Load128~), so that cells are a ~SimdSource~. A trait ~ColumnNumber~
+   says how a type's values become doubles: doubles and longs 4 at a time,
+   ints and floats one value at a time into the vector. The results are the
+   C# version's to the last digit, on both files, with AVX2, without it and
+   with no intrinsics. Measured, the C# version (worktree of 0981ac6) and
+   this alternated, three runs each, µs: the standard deviation 346-480 to
+   185-186 (narrow) and 402-438 to 375-379 (wide); the correlation 575-803
+   to 468-513 (narrow) and 561-585 to 909-930 (wide, nulls in both
+   columns). The C# method was compiled once without tiering (it had a
+   stackalloc) and kept its vectors on the stack; it varied most.
+   - The correlation with nulls is limited by instructions, not by the
+     registers: each block of 8 has four loads, each with a test of its
+     range and of the kind of buffer, two windows of valid bits and four
+     masks. Updating the five sums of rows 0-3 before loading rows 4-7
+     took the vectors kept on the stack from 7 to 5, and the time not;
+     masking also without nulls made the narrow file slower. Not done:
+     loads without the tests, or the bits of 56 rows at a time.
+   - Found in Bjolang: an importer specialises a published constrained
+     body in its own scope, where a trait method of a module it does not
+     import (~simd-add~, ~popcount~) is unbound, so the copy was declined
+     and every call passed a dictionary; in the loop that was an interface
+     call, which kept the sums on the stack. So the vector operations of
+     the kernels are functions of (bjostat stats) (~v4-add~ and the
+     others), which an importer names by their module. In Bjolang's
+     Todo.org.
 5. *Statistics:* a t-digest for quantiles in one pass with little memory.
 6. *Parquet*.
 7. *Nulls of dates and times.* ~skip-nulls~ and ~complete-rows~ take
