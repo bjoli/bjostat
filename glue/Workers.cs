@@ -3,148 +3,67 @@
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 using System;
-using System.Collections.Concurrent;
-using System.Runtime.ExceptionServices;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace Bjostat;
 
 /// <summary>
-/// The threads that do bjostat's work on several cores: one for each logical
-/// core by default, made once, and not threads of .NET's pool. The pumps of
-/// Bjolang's run queues run on the pool's threads, and a part that ran there
-/// could hold a thread a pump waits for; here it holds none, and the
-/// operating system shares the cores between the parts and the pumps.
-/// BJOSTAT_WORKERS sets another number: fewer threads than cores keep fibers
-/// on time while a loop runs, at less throughput (bench/latency.bjo).
+/// Where the glue's work runs on several cores: the compute threads of
+/// Bjolang's (std parallel), so that a program has one pool of threads for
+/// work that uses a core, not two.
 ///
-/// A part runs in the dynamic environment of the code that started it, as
-/// Bjolang's <c>blocking</c> runs its thunk. A part keeps its value itself;
-/// <see cref="Run"/> and <see cref="RunAll"/> give a Task of the end of the
-/// work, which Bjolang makes an event (task->event). A Task&lt;T&gt; of the
-/// glue cannot be imported #:async yet.
+/// The pool is Bjolang code, so the glue reaches it through a function that
+/// a module of bjostat installs when it is initialised: (bjostat table),
+/// (bjostat query) and (bjostat csv), the modules that call glue that runs
+/// in parts. A module is initialised before its first function runs, so the
+/// function is in place before the glue of that module is called.
+/// BJOLANG_COMPUTE_THREADS sets the number of threads.
 /// </summary>
 public static class Workers
 {
-    private static readonly BlockingCollection<Action> Queue = new();
-
-    /// <summary>The number of worker threads.</summary>
-    public static readonly int Count =
-        int.TryParse(Environment.GetEnvironmentVariable("BJOSTAT_WORKERS"), out var n) && n > 0
-            ? n
-            : Environment.ProcessorCount;
-
-    /// <summary>The number of worker threads, for Bjolang.</summary>
-    public static int CountOf() => Count;
-
-    static Workers()
-    {
-        for (int i = 0; i < Count; i++)
-        {
-            var t = new Thread(Work) { IsBackground = true, Name = "bjostat worker " + i };
-            t.Start();
-        }
-    }
-
-    private static void Work()
-    {
-        foreach (var job in Queue.GetConsumingEnumerable()) job();
-    }
+    private static Func<int, Func<int, Bjoml.Unit>, Bjoml.Unit>? _run;
+    private static int _count = Environment.ProcessorCount;
 
     /// <summary>
-    /// Runs <paramref name="work"/> on a worker; the Task ends when it does.
-    /// A part whose token was cancelled before it started does not run.
+    /// The number of compute threads, for the glue to choose a number of
+    /// parts. The logical cores until a module has installed the pool, and
+    /// then what (std parallel) has: one less than the logical cores by
+    /// default.
     /// </summary>
-    public static Task Run(Func<Bjoml.Unit> work, CancellationToken token) =>
-        RunAll(1, _ => work(), token);
+    public static int Count => _count;
 
     /// <summary>
-    /// Runs <paramref name="work"/> of 0 to count - 1 on the workers, at most
-    /// one part on each, and the parts in the order of their numbers; the
-    /// Task ends when every part has. The first exception of a part is the
-    /// Task's, and the parts not started then do not run, nor do those not
-    /// started when the token is cancelled.
+    /// Sets the function that runs the parts, (std parallel)'s
+    /// <c>computing-each</c>, and the number of compute threads.
     /// </summary>
-    public static Task RunAll(int count, Func<int, Bjoml.Unit> work, CancellationToken token)
+    public static void Install(Func<int, Func<int, Bjoml.Unit>, Bjoml.Unit> run, int count)
     {
-        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        if (count <= 0)
-        {
-            done.SetResult();
-            return done.Task;
-        }
-        var env = Bjoml.FiberContext.ForChild();
-        var parts = new Parts(count, part => work(part), token);
-        int runners = Math.Min(count, Count);
-        int left = runners;
-        for (int r = 0; r < runners; r++)
-        {
-            Queue.Add(() =>
-            {
-                using (Bjoml.FiberContext.Push(env)) parts.RunSome();
-                if (Interlocked.Decrement(ref left) == 0) parts.Finish(done);
-            });
-        }
-        return done.Task;
+        _count = Math.Max(1, count);
+        _run = run;
     }
 
     /// <summary>
-    /// Runs <paramref name="work"/> of 0 to count - 1 on the workers and on
-    /// the calling thread, and returns when every part has. For the glue's
-    /// own work, which a caller waits for as for any call: the calling
-    /// thread takes parts too, so a call from a worker cannot wait for
-    /// workers that are all busy.
+    /// Runs <paramref name="work"/> of 0 to count - 1 on the compute threads
+    /// and on the calling thread, and returns when every part has. The
+    /// calling thread takes parts too, so a call from a part cannot wait for
+    /// threads that are all busy. The first exception of a part is raised
+    /// here, and the parts not started then do not run. Before the pool is
+    /// installed, or for one part, the parts run on the calling thread, in
+    /// order.
     /// </summary>
     public static void For(int count, Action<int> work)
     {
         if (count <= 0) return;
-        var parts = new Parts(count, work, CancellationToken.None);
-        int helpers = Math.Min(count - 1, Count);
-        using var left = new CountdownEvent(helpers + 1);
-        for (int r = 0; r < helpers; r++)
+        var run = _run;
+        if (run is null || count == 1)
         {
-            Queue.Add(() =>
-            {
-                parts.RunSome();
-                left.Signal();
-            });
-        }
-        parts.RunSome();
-        left.Signal();
-        left.Wait();
-        parts.Rethrow();
-    }
-
-    /// <summary>The parts of one call, taken by number by whoever is free.</summary>
-    private sealed class Parts(int count, Action<int> work, CancellationToken token)
-    {
-        private int _next = -1;
-        private int _completed;
-        private ExceptionDispatchInfo? _failure;
-
-        public void RunSome()
-        {
-            while (_failure is null && !token.IsCancellationRequested)
-            {
-                int part = Interlocked.Increment(ref _next);
-                if (part >= count) return;
-                try
-                {
-                    work(part);
-                    Interlocked.Increment(ref _completed);
-                }
-                catch (Exception e) { Interlocked.CompareExchange(ref _failure, ExceptionDispatchInfo.Capture(e), null); }
-            }
+            for (var i = 0; i < count; i++) work(i);
+            return;
         }
 
-        public void Finish(TaskCompletionSource done)
+        run(count, k =>
         {
-            if (_failure is not null) done.TrySetException(_failure.SourceException);
-            else if (Volatile.Read(ref _completed) < count) done.TrySetCanceled(token);
-            else done.TrySetResult();
-        }
-
-        public void Rethrow() => _failure?.Throw();
+            work(k);
+            return Bjoml.Unit.Value;
+        });
     }
 }

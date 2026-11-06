@@ -15,8 +15,8 @@
 ;;   the fibers queued behind it wait.
 ;; - B, spawn/thread: a thread of its own for each part, which costs more to
 ;;   make than a part of a millisecond takes.
-;; - C, computing-each: bjostat's workers, threads made once, all the parts
-;;   one event, which the caller waits for by colour. No pump is held.
+;; - C, computing-each: (std parallel)'s compute threads, made once, which
+;;   the caller waits for by colour. No pump is held.
 ;;   bench/latency.bjo measures how it treats other fibers.
 ;; - D, (std parallel): `in-parts` over `table-rows`, parts of 65 536 rows,
 ;;   on its compute threads. And a standard deviation: `standard-deviation`
@@ -30,7 +30,7 @@
 (import (bjostat table))
 (import (bjostat query))
 (import (bjostat stats))
-(import (only (std parallel) in-parts in-parallel))
+(import (only (std parallel) in-parts in-parallel computing-each))
 
 
 (: int) (def rows 1000000)
@@ -78,10 +78,10 @@
     (def ps {vecing (bjo (sync (spawn/thread (fun () (revenue (part parts k)))))) (:for k (range 0 parts))})
     (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
 
-;; C: the parts on bjostat's workers, all of them one event.
+;; C: the parts on the compute threads, by number.
 (: (-> int double))
 (defun (on-pool parts)
-  (loop (:for x (computed (computing-each parts (fun (k) (revenue (part parts k)))))) (:acc (summing x))))
+  (loop (:for x (computing-each parts (fun (k) (revenue (part parts k))))) (:acc (summing x))))
 
 ;; D: (std parallel), parts by rows.
 (: (-> double))

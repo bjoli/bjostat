@@ -10,7 +10,7 @@
 // parses. Here each field is a span of the chunk's bytes, given to its
 // CsvColumn as it is found: a quoted field with a doubled quote is the one
 // field that is copied, into a buffer that is used again. The chunks are
-// read on bjostat's workers.
+// read on the compute threads.
 //
 // It reads what (text csv) reads, RFC 4180, or gives up: a row ends at a
 // line feed, after a carriage return or not; a quoted field may hold the

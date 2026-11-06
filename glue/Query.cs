@@ -28,7 +28,7 @@ public static class Query
     {
         CheckRows(rows.AsSpan(0, count), t.Length);
         var columns = new IArrowArray[t.ColumnCount];
-        // The columns are copied on bjostat's workers when there is enough to
+        // The columns are copied on the compute threads when there is enough to
         // copy, each in parts of rows, so that one long column of strings
         // does not take as long as all of them on one thread. Most of the
         // time of a copy is spent to get new memory: the operating system

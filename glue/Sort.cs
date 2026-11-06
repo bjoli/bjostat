@@ -379,7 +379,7 @@ public static class Sorting
     // A least significant digit first radix sort, 11 bits a pass, of the
     // keys with the rows beside them: 6 passes for 64 bits, where 8 bits a
     // pass need 8. It is stable. A digit that is the same in every key needs
-    // no pass. Many keys are sorted in parts on bjostat's workers.
+    // no pass. Many keys are sorted in parts on the compute threads.
     private const int DigitBits = 11;
     private const int Buckets = 1 << DigitBits;
     private const int Digits = (64 + DigitBits - 1) / DigitBits;

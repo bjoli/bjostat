@@ -146,7 +146,7 @@ public static class Categories
     /// rows, and the id of each row; 0 at a null. <paramref name="firsts"/>
     /// gets the first row of each id. The table is open addressing over the
     /// strings' hashes, each kept, with no call through an interface. A long
-    /// column is numbered in parts on bjostat's workers.
+    /// column is numbered in parts on the compute threads.
     /// </summary>
     internal static int[] StringIds(StringArray s, out List<int> firsts)
     {

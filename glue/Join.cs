@@ -117,7 +117,7 @@ public static class Joins
         });
         var same = lk.Select((a, k) => Equality(a, rk[k])).ToArray();
 
-        // The left rows in parts on bjostat's workers, each with lists of
+        // The left rows in parts on the compute threads, each with lists of
         // its own, put one after the other in the order of the parts. The
         // hash table is only read here, which a Dictionary allows on many
         // threads.

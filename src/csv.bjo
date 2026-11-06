@@ -28,7 +28,7 @@
 ;; are held as strings; after them each field goes into its column at once.
 ;;
 ;; A file of 4 MB or more with a header is read in chunks of whole rows on
-;; bjostat's workers, without (text csv): each field is a span of the
+;; the compute threads, without (text csv): each field is a span of the
 ;; chunk's bytes, given to its column as it is found (glue/CsvFast.cs). The
 ;; types are guessed from the first rows of the file, a guessed column of
 ;; longs that meets a decimal in any chunk becomes one of doubles in all of
@@ -44,6 +44,20 @@
 (import (text csv))
 (import (bjostat table))
 (import (bjostat query))
+(import (only (std parallel) computing-each compute-thread-count))
+
+(import/extern
+  (install-workers (: Bjostat.Workers.Install (-> (-> int (-> int Unit) Unit) int void))))
+
+;; The glue of this module (CsvFast) runs its parts on (std parallel)'s compute
+;; threads. See glue/Workers.cs.
+(: (-> int (-> int Unit) Unit))
+(defun (run-on-compute-threads n work)
+  (ignore (computing-each n work))
+  unit)
+
+(def _workers
+  (begin (install-workers run-on-compute-threads (compute-thread-count)) #t))
 
 (import/class (CsvColumn (: Bjostat.CsvColumn)))
 (import/extern (csv-chunks (: Bjostat.CsvChunks.Split (-> string int long (Array string)))))

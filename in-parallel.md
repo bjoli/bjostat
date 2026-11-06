@@ -18,14 +18,21 @@ What exists, and where it differs from the plan below:
   `values` keeps the values as an immutable array.
 - (bjostat table) and (bjostat stats) re-export `chunk-size`, `chunks`,
   `combine` and `combine-all`, which carry the traits to their importers.
+- One pool. The parts run on `(std parallel)`'s compute threads, not on
+  workers of bjostat's own, and so does bjostat's own work in parts:
+  glue/Workers.cs is given a function that runs parts on the compute
+  threads when (bjostat table), (bjostat query) or (bjostat csv) is loaded.
+  bjostat's `computing`, `computing-each` and `computed` are removed;
+  `worker-count` is `compute-thread-count`; `BJOLANG_COMPUTE_THREADS`
+  replaces `BJOSTAT_WORKERS`. A program has one pool of one thread less
+  than the logical cores, not two of as many as the cores.
 - Tests: tests/parallel.bjo. Bench: bench/parallel.bjo, of a million rows
   on 24 threads: the standard deviation 3.29 ms in one loop, 0.29 ms as
   `moments` in parts.
 
 Not yet: `Max`/`Min`, `PerGroup` and the `-by/partial` collectors, `Table`
-and the columns as `Combinable`, `linear-fit`, `group-of!` refusing other
-threads, and running on bjostat's workers rather than Bjolang's compute
-threads (there are now two pools of as many threads as cores).
+and the columns as `Combinable`, `linear-fit`, and `group-of!` refusing other
+threads.
 
 ## The plan
 
@@ -235,7 +242,7 @@ whatever the number of workers.
 6. Tests in tests/parallel.bjo: each partial collector through
    `in-parallel` against the same loop on one thread, exactly for integers,
    to 1e-12 for moments; row counts of 0, 1, rows − 1, rows, rows + 1 and
-   3 × rows + 7; `BJOSTAT_WORKERS=1`; an exception in a part; `group-of!` in
+   3 × rows + 7; `BJOLANG_COMPUTE_THREADS=1`; an exception in a part; `group-of!` in
    a part raises.
 7. bench/compare.bjo: the group by long, the group by category, the standard
    deviation and the correlation through `in-parallel`, against Polars on 24

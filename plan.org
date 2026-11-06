@@ -374,8 +374,9 @@ dplyr 1.2.1 and tidyr 1.3.2. A join is to a table of each region with a
 rate, made from the file. The first comparison, of October 29, before
 bjostat used more than one core, is in this file at commit 7027ba1.
 
-bjostat's own operations run in parts on its workers (glue/Workers.cs):
-the first column has as many workers as logical cores, 24; the second
+bjostat's own operations ran in parts on its workers (glue/Workers.cs);
+they now run on ~(std parallel)~'s compute threads, see "Done (one pool)"
+below. The first column had as many workers as logical cores, 24; the second
 ~BJOSTAT_WORKERS=1~, one worker, and the calling thread takes parts too,
 so that is one thread for a loop and at most two for the glue's work.
 The others compute on one thread: Polars with ~POLARS_MAX_THREADS=1~,
@@ -665,6 +666,38 @@ loops before anything else, as they change the Collector trait:
      above. The copy of the kept columns of a filter
      runs on .NET's ~Parallel.For~ (glue/Query.cs); it should go through
      the same parts.
+
+   Done (one pool): bjostat's work in parts runs on the compute threads of
+   Bjolang's ~(std parallel)~, as a program's loops in parts do, not on
+   workers of its own. glue/Workers.cs keeps ~Workers.For~ for the glue,
+   and is given a function that runs parts on the compute threads when
+   (bjostat table), (bjostat query) or (bjostat csv) is loaded; before
+   that, and for one part, the parts run on the calling thread.
+   ~computing~, ~computing-each~ and ~computed~ are removed (nothing used
+   them with ~choose~); ~table-summary~ uses ~(std parallel)~'s
+   ~computing-each~; ~worker-count~ is ~compute-thread-count~;
+   ~BJOLANG_COMPUTE_THREADS~ replaces ~BJOSTAT_WORKERS~. Bjolang's default
+   is one compute thread less than the logical cores, 23 here.
+   Measured, the old workers against the compute threads, 24 threads each,
+   bench/compare.bjo twice each, alternated; only rows whose ranges do not
+   overlap:
+   - Narrow file, less time: a count by a category 40 %, a distinct by a
+     string and a long 19 %, a crosstab 18 %, a count by a string and a
+     long 16 %, a distinct of rows 12 %, a categorize 10 %, a group by a
+     category 7 %.
+   - Wide file: a crosstab 5 % and a join by a category 7 % less. The
+     rows that number strings, run alone three times, more: a distinct
+     32.1-33.7 ms against 34.2-36.2, a categorize 23.3-24.5 against
+     24.8-26.6. The distinct then makes about 0.9 gen1 collections a
+     call, the old workers none; not explained.
+   - bench/parallel.bjo, one run each: ~computing-each~ of 8 parts 656 to
+     443 µs, of 12 parts 560 to 395 µs.
+   - bench/latency.bjo, the loop in parts: the old workers (24) 378-391
+     loops, a fiber's wake-up late by 190-218 µs at the median and
+     1.1-1.4 ms at most; the compute threads (23) 480-484 loops, 315-419
+     µs and 2.1-2.7 ms. With 24 compute threads the most was 7.2-8.6 ms,
+     not explained (Bjolang's Todo.org: to measure on a machine that is
+     not a VM).
 2. *Ids instead of hashes for strings and integers.* bjostat is the
    slowest of five at a group by a string (31.4 ms; 85.0 with 20 000
    regions) and at a join by a long (133 ms, 137 MB; 250 with the ids in
@@ -931,8 +964,11 @@ Still open, checked again on the vectorise branch:
   ValueTask", though it does. The example of Docs/Syntax.org,
   ~Task.Run (-> (-> %a) %a) #:async~, fails too: only the overloads of
   ~Run~ that are not generic are candidates. A method that is not generic
-  and returns a plain ~Task~ works, so glue/Workers.cs gives a ~Task~ of
-  the end of a part, and the part keeps its value itself.
+  and returns a plain ~Task~ works, so glue/Workers.cs gave a ~Task~ of
+  the end of a part, and the part kept its value itself. Checked again
+  with Bjolang 66aeac0: the example of Docs/Syntax.org compiles and runs;
+  a generic method of the glue is not tried again, since glue/Workers.cs
+  no longer returns a ~Task~ (see "Done (one pool)").
 - ~array->column~ is generic over any ~%a~, so an array of strings
   compiles and is then an exception of Arrow at run time: Bjolang's string
   is a struct, which meets ~where T : struct~, but holds a reference, which

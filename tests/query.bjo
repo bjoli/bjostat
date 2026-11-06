@@ -14,10 +14,7 @@
 (import (bjostat table))
 (import (bjostat csv))
 (import (bjostat query))
-(import/class (InvalidOperationException (: System.InvalidOperationException)))
-
-(: (Param int))
-(def test-parameter (make-parameter 0))
+(import (only (std parallel) in-parts compute-thread-count))
 
 (: (-> (Result TableError %a) %a))
 (defun (ok r)
@@ -279,44 +276,20 @@
                         (Row (Tuple double (Tuple long string)))))
           ["price" "qty" "day"])
 
-  ;; Work on several cores: computing is an event, waited for here by a
-  ;; parked thread, and its parts are Tasks of .NET's pool.
-  (expect "computing: the value"
-          (match (sync/blocking (computing (fun () (* 6 7)))) ((Ok v) v) ((Err _) -1))
-          42)
-  (expect "computing: an exception is an Err"
-          (match (sync/blocking (computing (fun () (: (raise (cast Exception (InvalidOperationException. "no"))) int)))) ((Ok _) "no Err") ((Err _) "Err"))
-          "Err")
-  (expect "computing: parts in parallel, summed in their order"
-          (with-scope
-            (def parts {vecing (bjo (sync (computing (fun () (loop (:for i (range (* k 1000) (* (+ k 1) 1000)))
-                                                                    (:acc (summing i)))))))
-                               (:for k (range 0 8))})
-            (loop (:for p parts)
-                  (:acc (summing (match (promise-join/sync p) ((Ok v) v) ((Err _) -1))))))
-          (loop (:for i (range 0 8000)) (:acc (summing i))))
-  (expect "computing-each: the values in the order of the parts"
-          (computed (computing-each 8 (fun (k) (* k k))))
-          [0 1 4 9 16 25 36 49])
-  (expect "computing-each: more parts than workers"
-          (vec-length (computed (computing-each (* 3 (worker-count)) (fun (k) k))))
-          (* 3 (worker-count)))
-  (expect "computing-each: none"
-          (vec-length (computed (computing-each 0 (fun (k) k))))
-          0)
-  (expect "computing-each: a part that raises makes it an Err"
-          (match (sync/blocking (computing-each 4 (fun (k) (if (= k 2) (: (raise (cast Exception (InvalidOperationException. "no"))) int) k))))
-            ((Ok _) "no Err") ((Err _) "Err"))
-          "Err")
-  (expect "computed: raises the Err's exception"
-          (match (try (computed (computing (fun () (: (raise (cast Exception (InvalidOperationException. "no"))) int))))
-                      #:catch (System.InvalidOperationException))
-            ((Ok _) "no exception") ((Err e) (.-Message e)))
-          "no")
-  (expect "computing: a part sees the dynamic environment of the sync"
-          (parameterize ((test-parameter 7))
-            (computed (computing (fun () (parameter-ref test-parameter)))))
-          7)
+  ;; Work on several cores: the glue's parts run on (std parallel)'s compute
+  ;; threads. A copy of more than 2 x 65 536 kept rows is in parts, so in a
+  ;; part of `in-parts` it is a call of `computing-each` inside another.
+  (expect "worker-count is the compute threads" (worker-count) (compute-thread-count))
+  (def wide (ok (make-table
+                  [(named "a" (array->column {arraying (cast double i) (:for i (range 0 300000))}))
+                   (named "b" (array->column {arraying (cast long i) (:for i (range 0 300000))}))])))
+  (: (-> int int))
+  (defun (kept-even _)
+    (table-row-count (loop (:for row (range 0 300000)) (:when (= 0 (% row 2))) (:acc (selecting wide row)))))
+  (expect "a copy in parts, from ordinary code" (kept-even 0) 150000)
+  (expect "a copy in parts, inside each part of in-parts"
+          (in-parts (range 0 8) (fun (r) (kept-even 0)) #:parts 8)
+          [150000 150000 150000 150000 150000 150000 150000 150000])
 
   ;; --- groups->table and the types a key can be ----------------------------
   ;; A key becomes a column, so it has to be a type one can hold: a Date key

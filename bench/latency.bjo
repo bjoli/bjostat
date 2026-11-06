@@ -11,8 +11,9 @@
 ;; - fibers that compute, which hold the pumps of Bjolang's run queues;
 ;; - blocking, Tasks of .NET's pool as events;
 ;; - spawn/thread, a thread of its own for each part;
-;; - computing, bjostat's workers, threads made once (glue/Workers.cs), as
-;;   many as BJOSTAT_WORKERS says, the logical cores by default.
+;; - computing, (std parallel)'s compute threads, made once, as many as
+;;   BJOLANG_COMPUTE_THREADS says, one less than the logical cores by
+;;   default.
 ;;
 ;;     bjo run bench/latency.bjo [parts] [cpu]
 ;;
@@ -26,6 +27,7 @@
 (import (bjostat table))
 (import (bjostat query))
 (import (bjostat stats))
+(import (only (std parallel) computing-each))
 
 (: int) (def rows 4000000)
 
@@ -52,7 +54,7 @@
 (: (-> int int Table))
 (defun (part parts k)
   (def size (/ (+ rows (- parts 1)) parts))
-  (table-slice t #:from (* k size) #:to (min rows (* (+ k 1) size))))
+  (or-panic (table-slice t #:from (min rows (* k size)) #:to (min rows (* (+ k 1) size)))))
 
 (: (-> (Result Exception double) double))
 (defun (ok-sum r) (match r ((Ok v) v) ((Err e) (raise e))))
@@ -82,10 +84,10 @@
     (def ps {vecing (bjo (sync (spawn/thread (fun () (work (part parts k)))))) (:for k (range 0 parts))})
     (loop (:for p ps) (:acc (summing (ok-sum (joined p)))))))
 
-;; Each part on bjostat's workers, all of them one event.
+;; Each part on the compute threads.
 (: (-> (-> Table double) int double))
 (defun (on-workers work parts)
-  (loop (:for x (computed (computing-each parts (fun (k) (work (part parts k)))))) (:acc (summing x))))
+  (loop (:for x (computing-each parts (fun (k) (work (part parts k))))) (:acc (summing x))))
 
 ;; How late each of `n` wakes after 1 ms was, in microseconds.
 (: ticker (-bjo-> int (Vec double)))

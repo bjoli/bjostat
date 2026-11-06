@@ -10,7 +10,7 @@ namespace Bjostat;
 
 /// <summary>
 /// A CSV file cut into chunks of whole rows, so that read-csv can read them
-/// on bjostat's workers. Each chunk starts with the file's header line.
+/// on the compute threads. Each chunk starts with the file's header line.
 /// </summary>
 public static class CsvChunks
 {

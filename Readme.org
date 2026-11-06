@@ -136,7 +136,7 @@ A number is in the plain form: no white space, no thousands separators, ~.~
 as the decimal point.
 
 *Speed.* A file of 4 MB or more with a header is read in chunks of whole
-rows on bjostat's workers, each field a span of its chunk's bytes; a file
+rows on the compute threads, each field a span of its chunk's bytes; a file
 that does not fit what its first rows say is read again on one thread,
 which widens the column or says what is wrong, with its line. On one
 thread the rows are read by ~(text csv)~, one at a time: a field becomes a
@@ -336,17 +336,21 @@ The columns are found first, where a misspelt name is an ~Err~:
 | ~(group-of! groups key)~ and ~summing-by~, ~counting-by~, ~min-by~, ~max-by~, ~mean-by~ | Aggregates by group, ~groups->table~ the table of them |
 | ~groups->table~ and the key it makes | A key is a value a column can hold, which is what the trait ~ColumnValue~ says: the numbers, a string, a bool, a ~Date~, a ~DateTime~ or an ~Instant~. Group by a date and the table's column of keys is a column of dates. A ~Cells~ is not one, so a column passed where the row's value was meant is refused when the program is compiled, not when it runs. |
 | ~(category-groups t name)~ | The groups of a category's levels, so that a row's code is its group, with no hash |
-| ~(string-groups t name)~ | The groups of a column of strings, in the order first seen, and the group of each row: each string numbered once, in parts on the workers, not hashed for each row as ~group-of!~ does |
+| ~(string-groups t name)~ | The groups of a column of strings, in the order first seen, and the group of each row: each string numbered once, in parts on the compute threads, not hashed for each row as ~group-of!~ does |
 | ~(grouping c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |
 | ~(table-with t name c)~ | The table with a column more, or one replaced |
-| ~(computing thunk)~, ~(computing-each n work)~ | An event of work that uses a core, run on bjostat's workers: one part, or ~(work k)~ for k from 0 to n - 1, the values in order |
-| ~(computed ev)~, ~(worker-count)~ | The value of such an event, waited for by colour; how many workers there are |
+| ~(worker-count)~ | How many compute threads there are, as ~compute-thread-count~ of ~(std parallel)~ |
 
-*Several cores.* bjostat's workers are threads made once, one for each
-logical core, or as many as the environment variable ~BJOSTAT_WORKERS~ says.
-Work on them is an event: a fiber waits for it suspended, ordinary code
-parks. Fewer workers than cores keep the other fibers of a program on time
-while the workers are busy (bench/latency.bjo).
+*Several cores.* bjostat's work in parts (reading a large CSV file,
+numbering strings, sorts, joins, copies of columns) and a program's loops in
+parts (~in-parallel~, below) run on one pool: the compute threads of
+Bjolang's ~(std parallel)~. They are made once, one less than the logical
+cores, or as many as the environment variable ~BJOLANG_COMPUTE_THREADS~
+says. bjostat's operations are ordinary functions: the thread that calls
+one waits for the parts and takes parts too. In a bjoroutine, ~in-parallel~
+and ~computing-each~ of ~(std parallel)~ suspend the fiber while the parts
+run. Fewer compute threads than cores keep the other fibers of a program on
+time while the parts run (bench/latency.bjo).
 
 The loop is the one way to make a column, a filter or a group. Bjolang is to
 make vector code of simple loops (Docs/Vectorisation-design.org in Bjolang),
