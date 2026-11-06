@@ -790,7 +790,56 @@ loops before anything else, as they change the Collector trait:
    - Still behind Polars on 24 threads, 2.91 ms: all the compute threads
      take 8.5-9.1 ms against 11.0 on one. Each part numbers most of the
      20 000 strings into a table of its own, and the merge numbers them
-     again; not examined further.
+     again.
+
+   Done, November 6: a column of many distinct strings is numbered by
+   hash (~Categories.NumberByHash~), not in parts that are then merged.
+   Measured first on columns of 1M strings (scratch/card): on all the
+   compute threads the parts were 5.7 times one thread with 4 strings,
+   1.6 with the wide file's 20 000, and slower than one thread (0.8 to
+   0.9) with 20 000 uniform, 200 000 or 1M distinct strings: each of the
+   23 parts numbered most of the strings, and the merge each part's
+   strings again. So any column of many distinct strings, as ids or
+   codes, not this benchmark's only.
+   - The rows' hashes and their count in each of 256 buckets, in parts;
+     the rows put bucket by bucket into one array, in row order; each
+     bucket numbered by one table; then each part goes through its rows
+     three times, with a place in each bucket: to count its first rows,
+     to number the strings for the column (no sort), and to give each
+     row its number.
+   - A bucket's thread writes its numbers into its own place, not at the
+     rows: the rows of a bucket are spread over the column, and threads
+     that wrote next to each other's rows shared cache lines. That took
+     the bucket step from 67 to 30 ms of thread time a call with 5 000
+     strings. What is left there is the reads of a bucket's rows' bytes,
+     one cache line each. Putting each row's key (32 bytes) in the bucket
+     instead was slower, and made gen2 collections.
+   - The parts as before for a column of few strings, where they are 5.7
+     times one thread: the first 8 192 rows are numbered on the calling
+     thread, and above 4 608 distinct strings the column goes by hash.
+     5 000 strings (4 026 in the sample) took 4.5 ms in parts and 4.9-5.1
+     by hash; the wide file's 20 000 (5 192) 10.7-11.6 and 6.8-7.2.
+   - Measured, the commit before against this, alternated, 2 to 3 runs
+     each, 23 compute threads, ms: 20 000 uniform categorize 15.2-15.5 to
+     6.91-7.11, string-groups 15.5-15.9 to 7.49; the wide file's 20 000
+     8.24-8.44 to 6.40-6.70 and 11.8-12.3 to 7.08-7.19; 200 000 51.7-52.6
+     to 36.3-37.7 and 73.4-74.0 to 61.4-62.1; 1M 167-169 to 136 and
+     308-311 to 260-262. Few strings pay for the sample: 4 strings
+     1.05-1.08 to 1.11-1.15, 5 000 4.41-4.62 to 4.63-4.77; 300 and 2 500
+     overlap. One thread does not change (no parts).
+   - bench/compare.bjo after it, two runs, against Polars on 24 threads
+     (runs of the same afternoon): the wide file's categorize 6.53-6.55
+     ms (2.91), group by a string with string-groups 12.1-12.9 (22.5),
+     count by a string and a long 16.0-17.4 (99.5-108), crosstab
+     26.5-29.1 (106-111), distinct by them 17.5-19.1 (64.1-66.9).
+   - tests/counts.bjo: 50 000 strings of a pseudo-random sequence in
+     200 000 rows, and 100 000 strings of 23 bytes, against a loop over a
+     map. The first catches a bucket's rows taken out of row order
+     (checked by breaking it); strings of a fixed period did not.
+   - Not done: a categorize of many strings sorts its levels on one
+     thread (107 of 170 ms with 1M strings), and string-groups of 1M
+     strings spends most of its 260 ms after the numbering. Neither is
+     usual for a column of categories.
 3. *CSV fields as spans.* bjostat reads the narrow file in 68.0 ms in
    chunks on the workers (186 on one thread), Polars in 71.6 on one thread
    and in 16.9 on 24; the wide one in 178, 215 and 34.8. ~(text csv)~ makes

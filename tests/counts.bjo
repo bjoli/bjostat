@@ -32,6 +32,31 @@
 (: (-> Table string))
 (defun (shown t) (table->string t #:rows 100))
 
+;; The distinct strings of the cells in the order of their first rows, and
+;; the number of each row's string, None at a null: what string-numbers
+;; returns, by one loop over a map.
+(: (-> (Cells string) (Tuple (Vec string) (Vec (Option int)))))
+(defun (first-seen cells)
+  (loop (:for w* cells)
+        (:acc st (folding (Tuple (: (map-empty) (Map string int)) (: [] (Vec string)) (: [] (Vec (Option int))))
+                   (match st
+                     ((Tuple m levels ids)
+                      (match w*
+                        (None (Tuple m levels (vec-add ids None)))
+                        ((Some w)
+                         (match (map-try-ref m w)
+                           ((Some k) (Tuple m levels (vec-add ids (Some k))))
+                           (None (Tuple (map-set m w (vec-length levels))
+                                        (vec-add levels w)
+                                        (vec-add ids (Some (vec-length levels))))))))))))
+        => (match st ((Tuple _ levels ids) (Tuple levels ids)))))
+
+;; string-numbers of the column "w", with the numbers as a vector.
+(: (-> Table (Tuple (Vec string) (Vec (Option int)))))
+(defun (numbers-of t)
+  (match (ok (string-numbers t "w"))
+    ((Tuple levels ids) (Tuple levels {vecing x (:for x ids)}))))
+
 (: (-> (Vec string) string))
 (defun (lines ls) (string-join ls "\n"))
 
@@ -126,4 +151,23 @@
           (Tuple (table-row-count (ok (table-count words ["w"])))
                  (column-sum (ok (longs (ok (table-count words ["w"])) "n"))))
           (Tuple 1001 300000L))
+
+  ;; Many distinct strings, numbered in parts: each part sees most of them.
+  ;; The numbers are those of one loop, in the order of the first rows. The
+  ;; strings come from a pseudo-random sequence, so that a string comes
+  ;; again within a part, at no fixed distance.
+  (def many (ok (make-table [(named-strings "w" (array->string-column
+                                                  {arraying (str "k" (int->string (cast int (% (% (+ (* (cast long i) 1103515245L) 12345L) 2147483648L) 50000L))))
+                                                            (:for i (range 0 200000))}
+                                                  #:valid {arraying (not (= (% i 97) 5)) (:for i (range 0 200000))}))])))
+  (expect "50 000 distinct strings in parts: numbered in the order of their first rows"
+          (numbers-of many)
+          (first-seen (: (ok (column-as many "w")) (Cells string))))
+  ;; Each string once, longer than the 16 bytes a table's entry keeps.
+  (def unique (ok (make-table [(named-strings "w" (array->string-column
+                                                    {arraying (str "customer-account-" (int->string (+ 100000 (% (* i 7919) 100000))))
+                                                              (:for i (range 0 100000))}))])))
+  (expect "100 000 strings of 23 bytes, each once: numbered in row order"
+          (numbers-of unique)
+          (first-seen (: (ok (column-as unique "w")) (Cells string))))
   0)
