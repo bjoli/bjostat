@@ -1034,8 +1034,14 @@ loops before anything else, as they change the Collector trait:
      import (~simd-add~, ~popcount~) is unbound, so the copy was declined
      and every call passed a dictionary; in the loop that was an interface
      call, which kept the sums on the stack. So the vector operations of
-     the kernels are functions of (bjostat stats) (~v4-add~ and the
-     others), which an importer names by their module. In Bjolang's
+     the kernels were functions of (bjostat stats) (~v4-add~ and the
+     others), which an importer names by their module. Fixed in Bjolang
+     the same day: an importer registers the traits of the modules it
+     only links, and the check of a copy reaches their methods. The
+     kernels call ~(std simd)~ directly now. Measured against the version
+     with the functions, alternated, 3 runs each, two rounds: all four
+     rows overlap. A body still may not write a type of a module that the
+     importer does not import (~Float64x4~ in an annotation); in Bjolang's
      Todo.org.
 5. *Statistics:* a t-digest for quantiles in one pass with little memory.
 6. *Parquet*.
