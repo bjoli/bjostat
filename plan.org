@@ -958,6 +958,32 @@ loops before anything else, as they change the Collector trait:
    starts of a slice. And the statistics without nulls are 5 times Polars's
    (a standard deviation 2.49 ms against 0.49), as their sums are not
    vector sums; that is item 6 of what the comparison taught, a decision.
+
+   Most of it was not: November 6, the same loop over an array of the
+   values took 0.62 ms, a sum as long as a standard deviation, and over
+   the cells 2.47. In .NET's machine code of the loop over cells the sum
+   was stored and read again at each row, though everything was inlined.
+   ~Cells.Ref~ still had a path that read through ~_values.Span~, a call
+   to ~MemoryManager.GetSpan~ that returns; the constructor gives every
+   buffer that holds the values an array or a pointer, so the path is
+   never taken, but a call that returns, anywhere in a loop, keeps the
+   loop's float sums in memory: on Linux .NET keeps no float register
+   across a call. Now that path throws, in a method the JIT can see does
+   not return (not ~NoInlining~: the JIT finds it out when it looks at the
+   body for inlining). bench/loops.bjo, narrow file: a sum over the cells
+   2.48 to 0.63 ms (an array 0.62); bench/compare.bjo, old and new
+   alternated, two runs each: the standard deviation 2.47 to 0.84 ms
+   (narrow) and 2.47 to 1.37 (wide), the correlation 2.83 to 1.88-2.08 and
+   4.26-4.30 to 3.03-3.22, a group by a long (wide) 7.56-7.65 to
+   6.98-7.22. The sorts were 2 to 4 % slower in each run, though they do
+   not use Cells. Polars on one thread: 0.48 ms for the standard
+   deviation. Open: the standard deviation over cells takes 0.84 ms and
+   over an array 0.62, while a sum takes the same over both.
+   - The same in Bjolang: a sum of doubles over a ~Vec~ takes 2.47 ms, as
+     its iterator calls a function at each leaf of 32 (bench/loops.bjo);
+     a sum of longs 0.68. In Bjolang's Todo.org.
+   - So the vector sums are still the decision of item 6, for the 0.84
+     against 0.48.
 5. *Statistics:* a t-digest for quantiles in one pass with little memory.
 6. *Parquet*.
 7. *Nulls of dates and times.* ~skip-nulls~ and ~complete-rows~ take

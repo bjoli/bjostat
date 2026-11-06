@@ -1,0 +1,65 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/loops.bjo — a loop over the cells of a column of doubles
+;; against the same loop over an array of the values: a sum and a standard
+;; deviation, with :when-let and with skip-nulls.
+;;
+;;     bjo bench bench/loops.bjo --all
+;;     COMPARE_CSV=scratch/compare-wide.csv bjo bench bench/loops.bjo --all
+;;
+;; On the narrow file, with no nulls, the cells should take about as long as
+;; the array. When they take about four times as long, a call that returns
+;; has come into the step of the loop over cells (Cells.Ref, CellsOps): .NET
+;; keeps no float register across a call on Linux, so the sum is stored and
+;; read again at each row. The rows over a Vec show the same in Bjolang's own
+;; iterator, which calls a function at each new leaf.
+
+(import (std prelude))
+(import (std bench))
+(import (bjostat table))
+(import (bjostat csv))
+(import (bjostat stats))
+
+(: (-> (Result TableError %a) %a))
+(defun (ok r)
+  (match r
+    ((Ok v) v)
+    ((Err e) (panic! (displayed e)))))
+
+(: string)
+(def path (match (getenv "COMPARE_CSV") ((Some p) p) (None "scratch/compare.csv")))
+
+;; In a scope of its own: a module's initialiser has none, and a file read
+;; on one thread is a port that a scope owns.
+(: Table)
+(def t (with-scope (ok (read-csv path))))
+
+(: (Cells double))
+(def price (ok (column-as t "price")))
+
+(: (Array double))
+(def price-array {arraying p (:for p (skip-nulls price))})
+
+(: (Vec double))
+(def price-vec {vecing p (:for p price-array)})
+
+(def/bench "sum, cells, :when-let"
+  (loop (:for p* price) (:when-let (Some p) p*) (:acc (summing p))))
+(def/bench "sum, cells, skip-nulls"
+  (loop (:for p (skip-nulls price)) (:acc (summing p))))
+(def/bench "sum, array"
+  (loop (:for p price-array) (:acc (summing p))))
+(def/bench "sum, Vec"
+  (loop (:for p price-vec) (:acc (summing p))))
+(def/bench "standard deviation, cells, :when-let"
+  (loop (:for p* price) (:when-let (Some p) p*) (:acc (standard-deviation p))))
+(def/bench "standard deviation, cells, skip-nulls"
+  (loop (:for p (skip-nulls price)) (:acc (standard-deviation p))))
+(def/bench "standard deviation, array"
+  (loop (:for p price-array) (:acc (standard-deviation p))))
+(def/bench "standard deviation, Vec"
+  (loop (:for p price-vec) (:acc (standard-deviation p))))
+
+(run-benches)

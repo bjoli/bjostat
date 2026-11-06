@@ -201,10 +201,24 @@ public sealed unsafe class Cells<T>
             if ((uint)i >= (uint)Length) throw new IndexOutOfRangeException();
             return Unsafe.ReadUnaligned<T>(_pointer + (nint)i * Unsafe.SizeOf<T>());
         }
-        if ((uint)i >= (uint)Length) throw new IndexOutOfRangeException();
-        return Unsafe.ReadUnaligned<T>(
-            ref Unsafe.Add(ref MemoryMarshal.GetReference(_values.Span), (_offset + i) * Unsafe.SizeOf<T>()));
+        // The constructor gives every buffer that holds the values an array
+        // or a pointer. Not a read through _values.Span here: that is a call
+        // that returns, and a loop with one, even on a path never taken, has
+        // its sums kept in memory and stored at each row, because .NET keeps
+        // no float register across a call on Linux. A sum over the million
+        // cells of a column of doubles took 2.48 ms with it and 0.63 ms
+        // without it, as over an array (0.62); the standard deviation of
+        // bench/compare.bjo 2.47 and 0.84. A throw does not return, so
+        // nothing is kept for it.
+        return ThrowNoValues();
     }
+
+    // Not NoInlining: the JIT finds that a call does not return by reading
+    // the callee's body when it considers inlining it.
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private T ThrowNoValues() =>
+        throw new InvalidOperationException(
+            $"(bjostat table): the buffer of a column of {typeof(T).Name} is shorter than its {Length} values");
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsValid(int i)
