@@ -22,6 +22,50 @@
     ((Ok v) v)
     ((Err e) (panic! (displayed e)))))
 
+;; Both None, or both Some and within 1e-12 of each other, relatively: a
+;; column function adds in another order than a loop.
+(: (-> (Option double) (Option double) bool))
+(defun (close? a b)
+  (match (Tuple a b)
+    ((Tuple (Some x) (Some y)) (<= (abs (- x y)) (* 1e-12 (max 1.0 (abs y)))))
+    ((Tuple None None) #t)
+    (_ #f)))
+
+;; A value of row i, around 1e6: the sums are of differences from the first.
+(: (-> int double))
+(defun (value-at i) (+ 1e6 (* 0.37 (cast double (% (* 7919 i) 1013)))))
+
+;; Whether row i is valid in each of the patterns of nulls.
+(: (-> int int bool))
+(defun (valid-in pattern i)
+  (match pattern
+    (0 #t)
+    (1 (not (= (% i 3) 1)))
+    (2 (>= i 10))
+    (_ (not (= (% i 8) 7)))))
+
+;; The cases, of lengths and patterns, where a column function and the loop
+;; of the same collector over the same values disagree.
+(: (-> (Vec string)))
+(defun (column-mismatches)
+  (loop (:for n [0 1 2 3 7 8 9 15 16 17 100 1001])
+        (:for pattern (range 0 4))
+        (:let values {arraying (value-at i) (:for i (range 0 n))})
+        (:let others {arraying (+ (* 2.0 (value-at i)) (cast double (% i 5))) (:for i (range 0 n))})
+        (:let valid {arraying (valid-in pattern i) (:for i (range 0 n))})
+        (:let column (array->column values #:valid valid))
+        (:let other (array->column others))
+        (:let sd (loop (:for i (range 0 n)) (:when (array-ref valid i)) (:acc (standard-deviation (array-ref values i)))))
+        (:let cor (loop (:for i (range 0 n)) (:when (array-ref valid i))
+                        (:acc (correlation (Tuple (array-ref values i) (array-ref others i))))))
+        (:let cov (loop (:for i (range 0 n)) (:when (array-ref valid i))
+                        (:acc (covariance (Tuple (array-ref values i) (array-ref others i))))))
+        (:let wrong (vec-filter (fun (case) (not (snd case)))
+                            [(Tuple "sd" (close? (column-standard-deviation column) sd))
+                             (Tuple "cor" (close? (column-correlation column other) cor))
+                             (Tuple "cov" (close? (column-covariance column other) cov))]))
+        (:acc found (folding [] (vec-merge found (vec-map (fun (case) (str (fst case) " n=" (int->string n) " pattern=" (int->string pattern))) wrong))))))
+
 ;; Close enough: within 1e-12 of the value R prints.
 (: (-> (Option double) double bool))
 (defun (near? got want)
@@ -100,4 +144,34 @@
                "price   double  2      1      1.5     2.25    3       3       3.75    4.5     2.12  \n"
                "qty     long    2      1      3       3.25    3.5     3.5     3.75    4       0.71  \n"
                "day     date    3      0      null    null    null    null    null    null    null  \n"))
+
+  ;; Whole columns
+  (expect "column functions agree with the loops: 12 lengths, 4 patterns of nulls" (column-mismatches) [])
+  (def col (array->column {arraying (value-at i) (:for i (range 0 100))}
+                          #:valid {arraying (not (= (% i 7) 2)) (:for i (range 0 100))}))
+  (def big (ok (make-table [(named "x" col)])))
+  (def sliced (ok (doubles (ok (table-slice big #:from 3 #:to 90)) "x")))
+  (expect "a slice that starts inside a byte of the valid bits"
+          (close? (column-standard-deviation sliced)
+                  (loop (:for i (range 3 90)) (:when (not (= (% i 7) 2))) (:acc (standard-deviation (value-at i)))))
+          #t)
+  (def counts (array->column {arraying (cast long (% (* 31 i) 17)) (:for i (range 0 100))}))
+  (expect "a column of longs, and a correlation of doubles with longs"
+          (Tuple (close? (column-variance counts)
+                         (loop (:for i (range 0 100)) (:acc (variance (cast double (% (* 31 i) 17))))))
+                 (close? (column-correlation col counts)
+                         (loop (:for i (range 0 100)) (:when (not (= (% i 7) 2)))
+                               (:acc (correlation (Tuple (value-at i) (cast double (% (* 31 i) 17))))))))
+          (Tuple #t #t))
+  (expect "of no value, and of one"
+          (Tuple (column-variance (array->column (: (make-array 0) (Array double))))
+                 (column-standard-deviation (array->column (vec->array [3.0]))))
+          (Tuple None None))
+  (expect "a correlation with a column that does not change"
+          (column-correlation col (array->column {arraying 1.0 (:for _ (range 0 100))}))
+          None)
+  (expect "a column of ints, added one value at a time"
+          (close? (column-standard-deviation (array->column {arraying (% i 9) (:for i (range 0 50))}))
+                  (loop (:for i (range 0 50)) (:acc (standard-deviation (cast double (% i 9))))))
+          #t)
   0)

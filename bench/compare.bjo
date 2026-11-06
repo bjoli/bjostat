@@ -147,6 +147,14 @@
 (def/bench "correlation"
   (loop (:for p* price) (:for q* qty) (:when-let (Some p) p*) (:when-let (Some q) q*)
         (:acc (correlation (Tuple p (cast double q))))))
+;; The same two as column functions of (bjostat stats), with vector
+;; instructions: Polars's std and corr are of whole columns too.
+(: (Column double))
+(def price-column (ok (doubles t "price")))
+(: (Column long))
+(def qty-column (ok (longs t "qty")))
+(def/bench "standard deviation, column function" (column-standard-deviation price-column))
+(def/bench "correlation, column function" (column-correlation price-column qty-column))
 (def/bench "summary of the table" (table-row-count (table-summary t)))
 
 (def/bench "sort by a number" (table-row-count (ok (table-sort t [(ascending "price")]))))

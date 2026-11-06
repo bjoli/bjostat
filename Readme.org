@@ -402,6 +402,30 @@ out by the loop, where R needs ~na.rm = TRUE~:
 Each is None of too few values: the mean of none, the variance of fewer than
 two. A quantile of values with a NaN is NaN.
 
+*Of a whole column.* The same statistics of all the values of a column of
+numbers, with the nulls left out, in one call:
+
+#+BEGIN_SRC scheme
+(def price (or-panic (doubles t "price")))
+(def qty (or-panic (longs t "qty")))
+(column-standard-deviation price)
+(column-correlation price qty)
+#+END_SRC
+
+| Function | What it gives |
+|----------+---------------|
+| ~(column-variance c)~, ~(column-standard-deviation c)~ | As ~variance~ and ~standard-deviation~ |
+| ~(column-covariance x y)~, ~(column-correlation x y)~ | As ~covariance~ and ~correlation~, of the rows where neither is null |
+| ~(column-moments c)~, ~(column-co-moments x y)~ | The ~Moments~ and ~CoMoments~, to finish or combine |
+
+They add with vector instructions, 8 values at a time. The order of the
+additions is fixed, so a result is the same on every machine; it differs
+from a loop's only in the last digits. A million rows: the standard
+deviation 0.34 to 0.45 ms against 0.83 for the loop, and Polars's 0.48 on
+one thread; the correlation of a column of doubles and one of longs 0.56 to
+0.80 ms against 1.87 and Polars's 1.09. A loop is still the way to a
+statistic of some rows, or of values computed from the columns.
+
 ** Loops in parts
 
 A loop runs on several cores with ~in-parallel~ of Bjolang's ~(std parallel)~:

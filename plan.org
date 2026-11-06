@@ -984,6 +984,30 @@ loops before anything else, as they change the Collector trait:
      a sum of longs 0.68. In Bjolang's Todo.org.
    - So the vector sums are still the decision of item 6, for the 0.84
      against 0.48.
+
+   Decided, November 6: the loop form stays as it is. A loop over cells
+   is about as fast as one over an array now, and more ways for the
+   compiler to make a loop would make its speed harder to see from the
+   source. The statistics that vector instructions help are column
+   functions in (bjostat stats) instead: ~column-variance~,
+   ~column-standard-deviation~, ~column-covariance~, ~column-correlation~,
+   and ~column-moments~ and ~column-co-moments~ for the sums
+   (glue/ColumnStats.cs). They make the sums of the collectors and finish
+   them with the collectors' functions, so they differ from a loop only in
+   the order of the additions. The order is fixed: the value of row r goes
+   to lane r % 8, two Vector256 with AVX2 and 8 doubles without, and the
+   lanes are added in one order; a null adds +0.0 in both. Checked: the
+   results of both files are the same to the last digit with AVX2, with
+   ~DOTNET_EnableAVX2=0~ and with ~DOTNET_EnableHWIntrinsic=0~. A column of
+   doubles or longs is loaded 4 at a time; another type of number is added
+   one value at a time, in the same order. Measured, one run each, against
+   the loop and Polars (of the same afternoon): the standard deviation
+   0.34-0.45 ms (narrow) and 0.42-0.69 (wide) against the loop's 0.83 and
+   1.36-1.46 and Polars's 0.48 and 0.83 on one thread; the correlation of
+   price and qty 0.56-0.80 and 0.53-0.54 against 1.87 and 3.06-3.20, and
+   Polars's 1.09 and 3.57. tests/stats.bjo: each against the loop of its
+   collector, within 1e-12, for 12 lengths around the blocks of 8, 4
+   patterns of nulls, a slice inside a byte of the bitmap, longs and ints.
 5. *Statistics:* a t-digest for quantiles in one pass with little memory.
 6. *Parquet*.
 7. *Nulls of dates and times.* ~skip-nulls~ and ~complete-rows~ take

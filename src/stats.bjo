@@ -35,7 +35,10 @@
   ;; Results that combine, for loops in parts (std parallel)
   MomentsOf moments-standard-deviation
   CoMomentsOf co-moments-count co-moments-covariance co-moments-correlation
-  Values ValuesOf values-count values-quantile values-quantiles values-median values-summary)
+  Values ValuesOf values-count values-quantile values-quantiles values-median values-summary
+  ;; Of a whole column at once, with vector instructions
+  column-moments column-variance column-standard-deviation
+  column-co-moments column-covariance column-correlation)
 
 (import (std prelude))
 (import (std combine))
@@ -54,7 +57,9 @@
   (clr-summarize (: Bjostat.Stats.Summarize (-> (MutableVec double) (Array double))))
   (stats-grow (: Bjostat.Stats.Grow (-> (MutableVec double) int (MutableVec double))))
   (stats-span (: Bjostat.Stats.Span (-> (MutableVec double) int int (Span double))))
-  (stats-no-none! (: Bjostat.Stats.NoNone (-> (MutableVec double) int void))))
+  (stats-no-none! (: Bjostat.Stats.NoNone (-> (MutableVec double) int void)))
+  (clr-column-moments (: Bjostat.ColumnStats.Moments (-> (Column %a) (Array double))))
+  (clr-column-co-moments (: Bjostat.ColumnStats.CoMoments (-> (Column %a) (Column %b) (Array double)))))
 
 ;; ===========================================================================
 ;; Mean and variance, in one pass
@@ -153,6 +158,29 @@
   (defun (collector-init c) no-moments)
   (defun (collector-step c m x) (moments-add m x))
   (defun (collector-finish c m) (moments-standard-deviation m)))
+
+;; The moments of the values of a column of numbers that are not null, as
+;; `moments` collects them, of the whole column at once (glue/ColumnStats.cs):
+;;
+;;     (column-standard-deviation (or-panic (doubles t "price")))
+;;
+;; The sums are added in 8 lanes with vector instructions, in an order that
+;; is the same on every machine, so a result is too. It differs from the
+;; loop's only in the order of the additions: in the last digits. For a
+;; column of doubles or longs; another type of number is added one value at a
+;; time, in the same order.
+(: (-> (Column %a) Moments))
+(defun (column-moments c)
+  (def v (clr-column-moments c))
+  (Moments (n (cast long (array-ref v 0))) (k (array-ref v 1)) (s1 (array-ref v 2)) (s2 (array-ref v 3))))
+
+;; The variance of a sample, as `variance`; None for fewer than two values.
+(: (-> (Column %a) (Option double)))
+(defun (column-variance c) (moments-variance (column-moments c)))
+
+;; As `standard-deviation`; None for fewer than two values.
+(: (-> (Column %a) (Option double)))
+(defun (column-standard-deviation c) (moments-standard-deviation (column-moments c)))
 
 ;; ===========================================================================
 ;; Covariance and correlation, in one pass
@@ -271,6 +299,27 @@
   (defun (collector-init c) no-co-moments)
   (defun (collector-step c m xy) (co-moments-add m xy))
   (defun (collector-finish c m) (co-moments-correlation m)))
+
+;; The moments of the pairs of two columns of numbers where neither is null,
+;; as `co-moments` collects them, of the rows of the shorter column at once,
+;; as `column-moments`:
+;;
+;;     (column-correlation (or-panic (doubles t "price")) (or-panic (longs t "qty")))
+(: (-> (Column %a) (Column %b) CoMoments))
+(defun (column-co-moments x y)
+  (def v (clr-column-co-moments x y))
+  (CoMoments (n (cast long (array-ref v 0))) (kx (array-ref v 1)) (ky (array-ref v 2))
+             (sx (array-ref v 3)) (sy (array-ref v 4))
+             (sxx (array-ref v 5)) (syy (array-ref v 6)) (sxy (array-ref v 7))))
+
+;; As `covariance`; None for fewer than two pairs.
+(: (-> (Column %a) (Column %b) (Option double)))
+(defun (column-covariance x y) (co-moments-covariance (column-co-moments x y)))
+
+;; As `correlation`; None for fewer than two pairs, and when one column has
+;; the same value in each pair.
+(: (-> (Column %a) (Column %b) (Option double)))
+(defun (column-correlation x y) (co-moments-correlation (column-co-moments x y)))
 
 ;; ===========================================================================
 ;; Quantiles
