@@ -13,8 +13,9 @@
 ;; the array. When they take about four times as long, a call that returns
 ;; has come into the step of the loop over cells (Cells.Ref, CellsOps): .NET
 ;; keeps no float register across a call on Linux, so the sum is stored and
-;; read again at each row. The rows over a Vec show the same in Bjolang's own
-;; iterator, which calls a function at each new leaf.
+;; read again at each row. The rows over a Vec are the same check of
+;; Bjolang's own iterator, whose step to the next leaf makes no call (Bjolang's
+;; changelog, "A walk of a Vec makes no call"): about as long as the array.
 
 (import (std prelude))
 (import (std bench))
