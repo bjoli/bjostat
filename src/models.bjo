@@ -27,6 +27,8 @@
 
 (export
   LinearModel ModelError
+  ;; The accumulators, opaque
+  Regression Glm
   LinearModelling linear-model linear-model/origin
   SimpleModelling simple-linear-model
   model->table model->string model-predict
@@ -44,38 +46,456 @@
 (import (std prelude))
 (import (bjostat table))
 (import (bjostat distributions))
-(import (only (std maths) nan? exp))
+(import (only (std maths) nan? infinite? exp loge quotient remainder))
+(import (std mutable vec))
 
-(import/class (Regression (: Bjostat.Regression)) (Glm (: Bjostat.Glm)))
+;; ===========================================================================
+;; The QR of the rows, one row at a time
+;; ===========================================================================
+;;
+;; The rows are not kept. Each row [x | y] is turned into the upper
+;; triangular R of a QR decomposition of the rows so far, and into Q'y, by
+;; Givens rotations: R is p × p, so the memory is that of p² numbers whatever
+;; the number of rows. What is left of y when the row's x is zero is the part
+;; of y that no x can give, and the sum of its squares is the residual sum of
+;; squares. This is the method of Gentleman (1974) without square roots taken
+;; out, and is as stable as a QR of all the rows at once, where the normal
+;; equations X'X b = X'y lose half the digits.
 
+;; Math.Abs and Math.Max as they are, and the invariant culture.
 (import/extern
-  (clr-make (: Bjostat.Regression.Make (-> bool Regression)))
-  (clr-add (: Bjostat.Regression.Add (-> Regression double (Vec double) Regression)))
-  (clr-add-one (: Bjostat.Regression.AddOne (-> Regression double double Regression)))
-  (clr-problem (: Bjostat.Regression.Problem (-> Regression (Array string) string)))
-  (clr-rows (: Bjostat.Regression.Rows (-> Regression long)))
-  (clr-coefficients (: Bjostat.Regression.Coefficients (-> Regression int)))
-  (clr-intercept? (: Bjostat.Regression.Intercept (-> Regression bool)))
-  (clr-estimates (: Bjostat.Regression.Estimates (-> Regression (Array double))))
-  (clr-rss (: Bjostat.Regression.ResidualSquares (-> Regression double)))
-  (clr-tss (: Bjostat.Regression.TotalSquares (-> Regression double)))
-  (clr-unscaled-errors (: Bjostat.Regression.UnscaledErrors (-> Regression (Array double))))
-  (clr-unscaled-covariance (: Bjostat.Regression.UnscaledCovariance (-> Regression (Array double))))
-  (clr-effects (: Bjostat.Regression.Effects (-> Regression (Array double))))
-  (significant (: Bjostat.Regression.Significant (-> double int string)))
-  (glm-make (: Bjostat.Glm.Make (-> int bool Glm)))
-  (glm-add (: Bjostat.Glm.Add (-> Glm double (Vec double) Glm)))
-  (glm-fit (: Bjostat.Glm.Fit (-> Glm (Array string) string)))
-  (glm-estimates (: Bjostat.Glm.Estimates (-> Glm (Array double))))
-  (glm-errors (: Bjostat.Glm.StandardErrors (-> Glm (Array double))))
-  (glm-deviance (: Bjostat.Glm.Deviance (-> Glm double)))
-  (glm-null-deviance (: Bjostat.Glm.NullDeviance (-> Glm double)))
-  (glm-log-likelihood (: Bjostat.Glm.LogLikelihood (-> Glm double)))
-  (glm-rows (: Bjostat.Glm.Rows (-> Glm long)))
-  (glm-coefficients (: Bjostat.Glm.Coefficients (-> Glm int)))
-  (glm-intercept? (: Bjostat.Glm.Intercept (-> Glm bool)))
-  (glm-iterations (: Bjostat.Glm.Iterations (-> Glm int)))
-  (glm-converged? (: Bjostat.Glm.Converged (-> Glm bool))))
+  (dabs (: System.Math.Abs (-> double double)))
+  (dmax (: System.Math.Max (-> double double double)))
+  (clr-invariant (: System.Globalization.CultureInfo.InvariantCulture #:get)))
+
+;; The accumulator of a linear model. `r` is p × p, row by row, upper
+;; triangular; `z` is Q'y; `row` is the row being rotated. `k`, `s1` and `s2`
+;; are the response's sums from its first value, for the total sum of
+;; squares. `p` is -1 before the first row.
+(type (: Regression #:opaque
+         (Record (: intercept bool)
+                 (: p int #:mutable)
+                 (: r (Array double) #:mutable)
+                 (: z (Array double) #:mutable)
+                 (: row (Array double) #:mutable)
+                 (: column-squares (Array double) #:mutable)
+                 (: rss double #:mutable)
+                 (: n long #:mutable)
+                 (: problem string #:mutable)
+                 (: k double #:mutable)
+                 (: s1 double #:mutable)
+                 (: s2 double #:mutable))))
+
+(: (-> bool Regression))
+(defun (regression-make intercept)
+  (Regression (intercept intercept) (p -1) (r #[]) (z #[]) (row #[]) (column-squares #[])
+              (rss 0.0) (n 0L) (problem "") (k 0.0) (s1 0.0) (s2 0.0)))
+
+;; The arrays of a model of `predictors` predictors.
+(: (-> Regression int void))
+(defun (regression-start! m predictors)
+  (def p (+ predictors (if (record-ref m intercept) 1 0)))
+  (record-set! m (p p) (r (make-array (* p p) #:fill 0.0)) (z (make-array p #:fill 0.0))
+                 (row (make-array p #:fill 0.0)) (column-squares (make-array p #:fill 0.0))))
+
+;; Puts v at place j of the row, and adds its square to the column's sum of
+;; squares, as the row is filled.
+(: (-> Regression int double void))
+(defun (regression-set! m j v) #:inline
+  (array-set! (record-ref m row) j v)
+  (def squares (record-ref m column-squares))
+  (array-set! squares j (+ (array-ref squares j) (* v v))))
+
+;; The row in `row` and y into R and Q'y, by one Givens rotation for each
+;; place of the row that is not 0. The row was filled by regression-set!.
+(: (-> Regression double void))
+(defun (rotate! m y0)
+  (def p (record-ref m p))
+  (def r (record-ref m r))
+  (def z (record-ref m z))
+  (def row (record-ref m row))
+  (when (= (record-ref m n) 0L) (record-set! m (k y0)))
+  (def d0 (- y0 (record-ref m k)))
+  (record-set! m (s1 (+ (record-ref m s1) d0)) (s2 (+ (record-ref m s2) (* d0 d0))) (n (+ (record-ref m n) 1L)))
+  (let go ((j 0) (y y0))
+    (if (>= j p)
+        (record-set! m (rss (+ (record-ref m rss) (* y y))))
+        (let ((w (array-ref row j))
+              (at (* j p)))
+          (if (= w 0.0)
+              (go (+ j 1) y)
+              (let ((rjj (array-ref r (+ at j))))
+                (if (= rjj 0.0)
+                    ;; An empty row of R takes the rest of this row as it is.
+                    (begin
+                      (loop (:for c (range j p)) (:do (array-set! r (+ at c) (array-ref row c))))
+                      (array-set! z j y))
+                    (let* ((h (sqrt (+ (* rjj rjj) (* w w))))
+                           (c (/ rjj h))
+                           (s (/ w h))
+                           (zj (array-ref z j)))
+                      (begin
+                        (array-set! r (+ at j) h)
+                        (loop (:for q (range (+ j 1) p))
+                              (:do (let ((rk (array-ref r (+ at q)))
+                                         (xk (array-ref row q)))
+                                     (begin
+                                       (array-set! r (+ at q) (+ (* c rk) (* s xk)))
+                                       (array-set! row q (- (* c xk) (* s rk)))))))
+                        (array-set! z j (+ (* c zj) (* s y)))
+                        (go (+ j 1) (- (* c y) (* s zj))))))))))))
+
+;; Adds a row: the response and its predictors.
+(: (-> Regression double (Vec double) Regression))
+(defun (regression-add! m y xs)
+  (def k (vec-length xs))
+  (when (< (record-ref m p) 0) (regression-start! m k))
+  (def first (if (record-ref m intercept) 1 0))
+  (if (not (= (+ k first) (record-ref m p)))
+      (begin
+        (when (= (record-ref m problem) "")
+          (record-set! m (problem (str "row " (long->string (record-ref m n)) " has " (int->string k)
+                                       " predictors, and the first row has " (int->string (- (record-ref m p) first)) "."))))
+        m)
+      (begin
+        (when (= first 1) (regression-set! m 0 1.0))
+        (loop (:for x xs) (:for at (up-from first)) (:do (regression-set! m at x)))
+        (rotate! m y)
+        m)))
+
+;; Adds a row of one predictor.
+(: (-> Regression double double Regression))
+(defun (regression-add-one! m y x)
+  (when (< (record-ref m p) 0) (regression-start! m 1))
+  (if (record-ref m intercept)
+      (begin (regression-set! m 0 1.0) (regression-set! m 1 x))
+      (regression-set! m 0 x))
+  (rotate! m y)
+  m)
+
+;; Why the model cannot be fitted, or "": rows of other numbers of
+;; predictors, no more rows than coefficients, or a predictor that is a
+;; linear combination of the others (or of the intercept), as R's lm gives NA
+;; for. A column is taken as such when its diagonal in R is below 1e-7 of its
+;; length, as R's tolerance.
+(: (-> Regression (Vec string) string))
+(defun (regression-problem m names)
+  (def p (record-ref m p))
+  (def first (if (record-ref m intercept) 1 0))
+  (cond
+    ((not (= (record-ref m problem) "")) (record-ref m problem))
+    ((< p 0) "there are no rows.")
+    ((<= (record-ref m n) (cast long p))
+     (str (long->string (record-ref m n)) " rows are too few for " (int->string p)
+          " coefficients: a model needs more rows than coefficients."))
+    (else
+     (let go ((j 0))
+       (if (>= j p)
+           ""
+           (let ((norm (sqrt (array-ref (record-ref m column-squares) j))))
+             (if (or (<= (dabs (array-ref (record-ref m r) (+ (* j p) j))) (* 1e-7 norm)) (= norm 0.0))
+                 (let ((predictor (- j first)))
+                   (if (< predictor 0)
+                       "the intercept is 0 in every row."
+                       (str "'" (if (< predictor (vec-length names)) (vec-ref names predictor) (int->string predictor))
+                            "' is a linear combination of the predictors before it"
+                            (if (= first 1) " and the intercept." "."))))
+                 (go (+ j 1)))))))))
+
+(: (-> Regression long))
+(defun (regression-rows m) (record-ref m n))
+(: (-> Regression int))
+(defun (regression-coefficients m) (record-ref m p))
+(: (-> Regression bool))
+(defun (regression-intercept? m) (record-ref m intercept))
+(: (-> Regression double))
+(defun (regression-rss m) (record-ref m rss))
+
+;; Q'y, R's effects: the square of each is the sum of squares its column adds
+;; to the columns before it, R's sequential (type I) sums of squares.
+(: (-> Regression (Array double)))
+(defun (regression-effects m) (array-resize (record-ref m z) (array-length (record-ref m z))))
+
+;; The coefficients b of R b = Q'y, by back substitution.
+(: (-> Regression (Array double)))
+(defun (regression-estimates m)
+  (def p (record-ref m p))
+  (def r (record-ref m r))
+  (def z (record-ref m z))
+  (def b (make-array p #:fill 0.0))
+  (loop (:for j (down-from (- p 1) #:to 0))
+        (:do (let ((s (loop (:for k (range (+ j 1) p))
+                            (:acc s (folding (array-ref z j) (- s (* (array-ref r (+ (* j p) k)) (array-ref b k))))))))
+               (array-set! b j (/ s (array-ref r (+ (* j p) j)))))))
+  b)
+
+;; The total sum of squares of the response: about its mean with an
+;; intercept, and about 0 without one, as R's summary.lm.
+(: (-> Regression double))
+(defun (regression-tss m)
+  (def n (cast double (record-ref m n)))
+  (def s1 (record-ref m s1))
+  (def centred (- (record-ref m s2) (/ (* s1 s1) n)))
+  (if (record-ref m intercept)
+      centred
+      (let ((mean (+ (record-ref m k) (/ s1 n))))
+        (+ centred (* (* n mean) mean)))))
+
+;; R⁻¹, upper triangular, column by column.
+(: (-> Regression (Array double)))
+(defun (regression-inverse m)
+  (def p (record-ref m p))
+  (def r (record-ref m r))
+  (def inv (make-array (* p p) #:fill 0.0))
+  (loop (:for c (range 0 p))
+        (:do (array-set! inv (+ (* c p) c) (/ 1.0 (array-ref r (+ (* c p) c))))
+             (loop (:for j (down-from (- c 1) #:to 0))
+                   (:do (let ((s (loop (:for k (range (+ j 1) (+ c 1)))
+                                       (:acc s (folding 0.0 (+ s (* (array-ref r (+ (* j p) k)) (array-ref inv (+ (* k p) c)))))))))
+                          (array-set! inv (+ (* j p) c) (/ (- s) (array-ref r (+ (* j p) j)))))))))
+  inv)
+
+;; The standard error of each coefficient over σ: the length of each row of
+;; R⁻¹, as (X'X)⁻¹ = R⁻¹ R⁻ᵀ.
+(: (-> Regression (Array double)))
+(defun (regression-unscaled-errors m)
+  (def p (record-ref m p))
+  (def inv (regression-inverse m))
+  {arraying (sqrt (loop (:for c (range j p))
+                        (:acc s (folding 0.0 (+ s (* (array-ref inv (+ (* j p) c)) (array-ref inv (+ (* j p) c))))))))
+            (:for j (range 0 p))})
+
+;; (X'X)⁻¹ = R⁻¹ R⁻ᵀ, p × p row by row: R's cov.unscaled.
+(: (-> Regression (Array double)))
+(defun (regression-unscaled-covariance m)
+  (def p (record-ref m p))
+  (def inv (regression-inverse m))
+  {arraying (let ((i (quotient at p)) (j (remainder at p)))
+              (loop (:for k (range (max i j) p))
+                    (:acc s (folding 0.0 (+ s (* (array-ref inv (+ (* i p) k)) (array-ref inv (+ (* j p) k))))))))
+            (:for at (range 0 (* p p)))})
+
+;; The number to `digits` significant digits, as R prints a summary:
+;; 0.001234, 12.35, 1.235e+06.
+(: (-> double int string))
+(defun (significant x digits)
+  (cond
+    ((nan? x) "NaN")
+    ((infinite? x) (if (> x 0.0) "Inf" "-Inf"))
+    (else (string-replace (string-replace (.ToString x (str "G" (int->string digits)) clr-invariant) "E+" "e+")
+                          "E-" "e-"))))
+
+;; ===========================================================================
+;; Generalized linear models, fitted
+;; ===========================================================================
+;;
+;; Iteratively reweighted least squares, as R's glm.fit: from a first guess
+;; of the means, each step is a least-squares fit of the working response
+;; z = η + (y - μ) / μ'(η) on the predictors, each row weighted by
+;; μ'(η)² / V(μ). A step is a Regression of the rows times the root of their
+;; weights, so it is a QR by Givens rotations. The rows are kept, as each
+;; step reads all of them. The steps end when the deviance changes by less
+;; than 1e-8 of itself, or after 25 steps, as R's glm.control.
+
+;; The accumulator and the fit of a generalized model. `family` is 0 for the
+;; binomial, 1 for the Poisson. `x` holds the rows of p columns, the
+;; intercept's 1 first when there is one. The fields after `problem` are of
+;; the fit.
+(type (: Glm #:opaque
+         (Record (: family int)
+                 (: intercept bool)
+                 (: p int #:mutable)
+                 (: x (MutableVec double))
+                 (: y (MutableVec double))
+                 (: problem string #:mutable)
+                 (: b (Array double) #:mutable)
+                 (: se (Array double) #:mutable)
+                 (: deviance double #:mutable)
+                 (: null-deviance double #:mutable)
+                 (: log-likelihood double #:mutable)
+                 (: iterations int #:mutable)
+                 (: converged bool #:mutable))))
+
+(: double)
+(def machine-epsilon 2.220446049250313e-16)
+
+(: (-> int bool Glm))
+(defun (glm-make family intercept)
+  (Glm (family family) (intercept intercept) (p -1) (x (mutablevec)) (y (mutablevec)) (problem "")
+       (b #[]) (se #[]) (deviance 0.0) (null-deviance 0.0) (log-likelihood 0.0) (iterations 0) (converged #f)))
+
+(: (-> Glm double (Vec double) Glm))
+(defun (glm-add m y xs)
+  (def first (if (record-ref m intercept) 1 0))
+  (def k (+ (vec-length xs) first))
+  (when (< (record-ref m p) 0) (record-set! m (p k)))
+  (when (= (record-ref m problem) "")
+    (def row (long->string (cast long (mutablevec-length (record-ref m y)))))
+    (cond
+      ((not (= k (record-ref m p)))
+       (record-set! m (problem (str "row " row " has " (int->string (vec-length xs))
+                                    " predictors, and the first row has " (int->string (- (record-ref m p) first)) "."))))
+      ((and (= (record-ref m family) 0) (not (and (>= y 0.0) (<= y 1.0))))
+       (record-set! m (problem (str "row " row " has the response " (double->string y)
+                                    "; a logistic model needs one from 0 to 1."))))
+      ((and (= (record-ref m family) 1) (not (>= y 0.0)))
+       (record-set! m (problem (str "row " row " has the response " (double->string y)
+                                    "; a Poisson model needs a count of at least 0."))))
+      (else
+       (def x (record-ref m x))
+       (when (= first 1) (mutablevec-add! x 1.0))
+       (loop (:for v xs) (:do (mutablevec-add! x v)))
+       (mutablevec-add! (record-ref m y) y))))
+  m)
+
+;; The mean of the linear predictor: the logistic of the binomial, exp of the
+;; Poisson.
+(: (-> Glm double double))
+(defun (glm-mean m eta) #:inline
+  (if (= (record-ref m family) 0) (/ 1.0 (+ 1.0 (exp (- eta)))) (exp eta)))
+
+;; dμ/dη: μ(1 - μ) of the logit, μ of the log. Kept from 0, as R's
+;; binomial()$mu.eta keeps it above the machine epsilon.
+(: (-> Glm double double))
+(defun (glm-slope m mu) #:inline
+  (dmax (if (= (record-ref m family) 0) (* mu (- 1.0 mu)) mu) machine-epsilon))
+
+;; a ln(a / b), and 0 for an a of 0.
+(: (-> double double double))
+(defun (y-log a b) #:inline (if (= a 0.0) 0.0 (* a (loge (/ a b)))))
+
+;; The deviance of one row, 2 (ln L(saturated) - ln L(μ)).
+(: (-> Glm double double double))
+(defun (unit-deviance m y mu) #:inline
+  (if (= (record-ref m family) 0)
+      (* 2.0 (+ (y-log y mu) (y-log (- 1.0 y) (- 1.0 mu))))
+      (* 2.0 (- (y-log y mu) (- y mu)))))
+
+(: (-> Glm double double double))
+(defun (row-log-likelihood m y mu) #:inline
+  (if (= (record-ref m family) 0)
+      (+ (if (= y 0.0) 0.0 (* y (loge mu))) (if (= y 1.0) 0.0 (* (- 1.0 y) (loge (- 1.0 mu)))))
+      (- (- (if (= y 0.0) 0.0 (* y (loge mu))) mu) (log-gamma (+ y 1.0)))))
+
+(: (-> Glm (Array double) double))
+(defun (deviance-of m mu)
+  (def ys (record-ref m y))
+  (loop (:for i (range 0 (array-length mu)))
+        (:acc d (folding 0.0 (+ d (unit-deviance m (mutablevec-ref ys i) (array-ref mu i)))))))
+
+;; The weighted least squares of a step: the rows and the working response,
+;; each times the root of its weight.
+(: (-> Glm (Array double) (Array double) Regression))
+(defun (weighted m mu eta)
+  (def p (record-ref m p))
+  (def xs (record-ref m x))
+  (def ys (record-ref m y))
+  ;; The step's rows are of all p columns, the intercept's 1 too.
+  (def step (regression-make #f))
+  (regression-start! step p)
+  (loop (:for i (range 0 (mutablevec-length ys)))
+        (:do (let* ((mui (array-ref mu i))
+                    (d (glm-slope m mui))
+                    (variance (if (= (record-ref m family) 0) (* mui (- 1.0 mui)) mui))
+                    (w (sqrt (/ (* d d) (dmax variance machine-epsilon))))
+                    (zi (+ (array-ref eta i) (/ (- (mutablevec-ref ys i) mui) d))))
+               (begin
+                 (loop (:for j (range 0 p)) (:do (regression-set! step j (* w (mutablevec-ref xs (+ (* i p) j))))))
+                 (rotate! step (* w zi))))))
+  step)
+
+;; Fits the model, and gives "" or why it cannot be fitted, as
+;; regression-problem.
+(: (-> Glm (Vec string) string))
+(defun (glm-fit m names)
+  (def p (record-ref m p))
+  (def ys (record-ref m y))
+  (def xs (record-ref m x))
+  (def n (mutablevec-length ys))
+  (def binomial? (= (record-ref m family) 0))
+  (cond
+    ((not (= (record-ref m problem) "")) (record-ref m problem))
+    ((< p 0) "there are no rows.")
+    ((<= n p)
+     (str (int->string n) " rows are too few for " (int->string p)
+          " coefficients: a model needs more rows than coefficients."))
+    (else
+     ;; The first means, as R's mustart: (y + 1/2) / 2 of the binomial,
+     ;; y + 1/10 of the Poisson.
+     ;; Arrays of the length, filled: an {arraying ...} grows a builder and
+     ;; copies it, which is twice the memory of 2 n doubles.
+     (def mu (: (make-array n) (Array double)))
+     (def eta (: (make-array n) (Array double)))
+     (loop (:for i (range 0 n))
+           (:do (let* ((y (mutablevec-ref ys i))
+                       (u (if binomial? (/ (+ y 0.5) 2.0) (+ y 0.1))))
+                  (begin
+                    (array-set! mu i u)
+                    (array-set! eta i (if binomial? (loge (/ u (- 1.0 u))) (loge u)))))))
+     ;; The names of the columns of regression-problem, which sees the
+     ;; intercept as a column of its own.
+     (def columns (if (record-ref m intercept) (vec-add-first names "(Intercept)") names))
+     (record-set! m (converged #f))
+     (def result
+       (let step ((iteration 1) (deviance (deviance-of m mu)))
+         (if (> iteration 25)
+             (begin (record-set! m (iterations 25) (deviance deviance)) "")
+             (let* ((fit (weighted m mu eta))
+                    (problem (regression-problem fit columns)))
+               (if (not (= problem ""))
+                   problem
+                   (let ((b (regression-estimates fit)))
+                     (begin
+                       (record-set! m (b b))
+                       (loop (:for i (range 0 n))
+                             (:do (let ((e (loop (:for j (range 0 p))
+                                                 (:acc e (folding 0.0 (+ e (* (mutablevec-ref xs (+ (* i p) j)) (array-ref b j))))))))
+                                    (begin (array-set! eta i e) (array-set! mu i (glm-mean m e))))))
+                       (let ((next (deviance-of m mu)))
+                         (if (< (/ (dabs (- next deviance)) (+ (dabs next) 0.1)) 1e-8)
+                             (begin (record-set! m (converged #t) (iterations iteration) (deviance next)) "")
+                             (step (+ iteration 1) next))))))))))
+     (if (not (= result ""))
+         result
+         (begin
+           ;; The errors are of the weights at the estimates, one pass more:
+           ;; the weights of the last step are those of the estimates before
+           ;; it, which differ by about 1e-4 when the deviance has stopped
+           ;; changing. R takes the last step's. The dispersion is 1 for both
+           ;; families.
+           (record-set! m (se (regression-unscaled-errors (weighted m mu eta))))
+           (record-set! m (log-likelihood
+                            (loop (:for i (range 0 n))
+                                  (:acc l (folding 0.0 (+ l (row-log-likelihood m (mutablevec-ref ys i) (array-ref mu i))))))))
+           ;; The null model: the mean of y with an intercept, or η = 0
+           ;; without.
+           (def mean (/ (loop (:for i (range 0 n)) (:acc s (folding 0.0 (+ s (mutablevec-ref ys i))))) (cast double n)))
+           (def null-mu (if (record-ref m intercept) mean (glm-mean m 0.0)))
+           (record-set! m (null-deviance
+                            (loop (:for i (range 0 n))
+                                  (:acc d (folding 0.0 (+ d (unit-deviance m (mutablevec-ref ys i) null-mu)))))))
+           "")))))
+
+(: (-> Glm (Array double)))
+(defun (glm-estimates m) (record-ref m b))
+(: (-> Glm (Array double)))
+(defun (glm-errors m) (record-ref m se))
+(: (-> Glm double))
+(defun (glm-deviance m) (record-ref m deviance))
+(: (-> Glm double))
+(defun (glm-null-deviance m) (record-ref m null-deviance))
+(: (-> Glm double))
+(defun (glm-log-likelihood m) (record-ref m log-likelihood))
+(: (-> Glm long))
+(defun (glm-rows m) (cast long (mutablevec-length (record-ref m y))))
+(: (-> Glm int))
+(defun (glm-coefficients m) (record-ref m p))
+(: (-> Glm bool))
+(defun (glm-intercept? m) (record-ref m intercept))
+(: (-> Glm int))
+(defun (glm-iterations m) (record-ref m iterations))
+(: (-> Glm bool))
+(defun (glm-converged? m) (record-ref m converged))
 
 ;; ===========================================================================
 ;; The model
@@ -114,8 +534,8 @@
 
 (: (-> Regression (Vec string) (Result ModelError LinearModel)))
 (defun (fit m names)
-  (def problem (clr-problem m (vec->array names)))
-  (def predictors (- (clr-coefficients m) (if (clr-intercept? m) 1 0)))
+  (def problem (regression-problem m names))
+  (def predictors (- (regression-coefficients m) (if (regression-intercept? m) 1 0)))
   (cond
     ((not (= problem "")) (Err (ModelError (message problem))))
     ((not (= (vec-length names) predictors))
@@ -126,16 +546,16 @@
 
 (: (-> Regression (Vec string) LinearModel))
 (defun (fitted m names)
-  (def p (clr-coefficients m))
-  (def intercept? (clr-intercept? m))
-  (def n (clr-rows m))
+  (def p (regression-coefficients m))
+  (def intercept? (regression-intercept? m))
+  (def n (regression-rows m))
   (def df (- n (cast long p)))
   (def dfd (cast double df))
-  (def b (array->vec (clr-estimates m)))
-  (def rss (clr-rss m))
-  (def tss (clr-tss m))
+  (def b (array->vec (regression-estimates m)))
+  (def rss (regression-rss m))
+  (def tss (regression-tss m))
   (def sigma (sqrt (/ rss dfd)))
-  (def se (vec-map (fun (e) (* sigma e)) (array->vec (clr-unscaled-errors m))))
+  (def se (vec-map (fun (e) (* sigma e)) (array->vec (regression-unscaled-errors m))))
   (def ts {vecing (/ (vec-ref b i) (vec-ref se i)) (:for i (range 0 p))})
   (def ps (vec-map (fun (t) (* 2.0 (t-cdf (- 0.0 (abs t)) dfd))) ts))
   (def free (if intercept? (- p 1) p))
@@ -149,8 +569,8 @@
                                               (/ (cast double (- n (if intercept? 1L 0L))) dfd))))
                (f-statistic (if (> free 0) f (/ 0.0 0.0)))
                (f-p-value (if (> free 0) (f-cdf f (cast double free) dfd #:lower? #f) (/ 0.0 0.0)))
-               (unscaled-covariance (array->vec (clr-unscaled-covariance m)))
-               (effects (array->vec (clr-effects m)))
+               (unscaled-covariance (array->vec (regression-unscaled-covariance m)))
+               (effects (array->vec (regression-effects m)))
                (intercept? intercept?)))
 
 ;; ===========================================================================
@@ -172,9 +592,9 @@
   (type %elem (Tuple double (Vec double)))
   (type %acc Regression)
   (type %out (Result ModelError LinearModel))
-  (defun (collector-init c) (clr-make (record-ref c intercept)))
+  (defun (collector-init c) (regression-make (record-ref c intercept)))
   (defun (collector-step c acc e)
-    (match e ((Tuple y xs) (clr-add acc y xs))))
+    (match e ((Tuple y xs) (regression-add! acc y xs))))
   (defun (collector-finish c acc) (fit acc (record-ref c names))))
 
 ;; A model of one predictor, with an intercept: each element is the response
@@ -188,9 +608,9 @@
   (type %elem (Tuple double double))
   (type %acc Regression)
   (type %out (Result ModelError LinearModel))
-  (defun (collector-init c) (clr-make #t))
+  (defun (collector-init c) (regression-make #t))
   (defun (collector-step c acc e)
-    (match e ((Tuple y x) (clr-add-one acc y x))))
+    (match e ((Tuple y x) (regression-add-one! acc y x))))
   (defun (collector-finish c acc) (fit acc [(record-ref c name)])))
 
 ;; ===========================================================================
@@ -332,7 +752,7 @@
 
 (: (-> Glm int (Vec string) (Result ModelError GeneralizedModel)))
 (defun (glm-of m family names)
-  (def problem (glm-fit m (vec->array names)))
+  (def problem (glm-fit m names))
   (def predictors (- (glm-coefficients m) (if (glm-intercept? m) 1 0)))
   (cond
     ((not (= problem "")) (Err (ModelError (message problem))))

@@ -47,44 +47,498 @@
   uniform-sample gamma-sample log-gamma)
 
 (import (std prelude))
-(import (only (std maths) loge exp pow floor cos pi quotient))
+(import (only (std maths) loge exp pow floor cos sin pi quotient nan? infinite?))
 (import (only (std random) RandomSource current-random random-double))
 
+;; Each distribution function is made of three functions: the logarithm of
+;; the gamma function (Lanczos), the regularized incomplete gamma function
+;; and the regularized incomplete beta function (series and continued
+;; fractions, evaluated by Lentz's method). The upper tail is computed as
+;; itself, not as one minus the lower one, so that a small p-value keeps its
+;; digits. A quantile is found by Newton's method on the distribution
+;; function, kept in a bracket and bisected where a step leaves it, in the
+;; tail whose probability is the smaller. Math.Min, Math.Max and Math.Abs are
+;; imported as they are, so that NaN and -0.0 go through them as in .NET.
 (import/extern
-  (log-gamma (: Bjostat.Distributions.LogGamma (-> double double)))
-  (clr-normal-density (: Bjostat.Distributions.NormalDensity (-> double double double double)))
-  (clr-normal-cdf (: Bjostat.Distributions.NormalCdf (-> double double double bool double)))
-  (clr-normal-quantile (: Bjostat.Distributions.NormalQuantile (-> double double double bool double)))
-  (clr-t-density (: Bjostat.Distributions.TDensity (-> double double double)))
-  (clr-t-cdf (: Bjostat.Distributions.TCdf (-> double double bool double)))
-  (clr-t-quantile (: Bjostat.Distributions.TQuantile (-> double double bool double)))
-  (clr-chi-squared-density (: Bjostat.Distributions.ChiSquaredDensity (-> double double double)))
-  (clr-chi-squared-cdf (: Bjostat.Distributions.ChiSquaredCdf (-> double double bool double)))
-  (clr-chi-squared-quantile (: Bjostat.Distributions.ChiSquaredQuantile (-> double double bool double)))
-  (clr-f-density (: Bjostat.Distributions.FDensity (-> double double double double)))
-  (clr-f-cdf (: Bjostat.Distributions.FCdf (-> double double double bool double)))
-  (clr-f-quantile (: Bjostat.Distributions.FQuantile (-> double double double bool double)))
-  (clr-binomial-probability (: Bjostat.Distributions.BinomialProbability (-> long long double double)))
-  (clr-binomial-cdf (: Bjostat.Distributions.BinomialCdf (-> long long double bool double)))
-  (clr-binomial-quantile (: Bjostat.Distributions.BinomialQuantile (-> double long double bool long)))
-  (clr-poisson-probability (: Bjostat.Distributions.PoissonProbability (-> long double double)))
-  (clr-poisson-cdf (: Bjostat.Distributions.PoissonCdf (-> long double bool double)))
-  (clr-poisson-quantile (: Bjostat.Distributions.PoissonQuantile (-> double double bool long))))
+  (log1p (: System.Double.LogP1 (-> double double)))
+  (positive-infinite? (: System.Double.IsPositiveInfinity (-> double bool)))
+  (dmin (: System.Math.Min (-> double double double)))
+  (dmax (: System.Math.Max (-> double double double)))
+  (dabs (: System.Math.Abs (-> double double)))
+  (dclamp (: System.Math.Clamp (-> double double double double))))
+
+(: double)
+(def inf (/ 1.0 0.0))
+(: double)
+(def nan (/ 0.0 0.0))
+(: double)
+(def eps 1e-16)
+(: double)
+(def tiny 1e-300)
+(: int)
+(def max-iterations 100000)
+
+;; ===========================================================================
+;; The functions the others are made of
+;; ===========================================================================
+
+;; Lanczos's approximation, g = 7 and 9 terms: about 15 digits.
+(: (Array double))
+(def lanczos
+  #[0.99999999999980993 676.5203681218851 -1259.1392167224028 771.32342877765313
+    -176.61502916214059 12.507343278686905 -0.13857109526572012 9.9843695780195716e-6
+    1.5056327351493116e-7])
+
+;; The logarithm of the absolute value of the gamma function.
+(: (-> double double))
+(defun (log-gamma x)
+  (cond
+    ((nan? x) x)
+    ((and (<= x 0.0) (= (floor x) x)) inf)
+    ;; The reflection formula.
+    ((< x 0.5) (- (loge (/ pi (dabs (sin (* pi x))))) (log-gamma (- 1.0 x))))
+    ;; ln Γ(n) of a small whole number, exactly as a sum of logarithms.
+    ((and (<= x 30.0) (= (floor x) x))
+     (loop (:for i (range 2 (cast int x))) (:acc s (folding 0.0 (+ s (loge (cast double i)))))))
+    (else
+     (def y (- x 1.0))
+     (def t (+ y 7.5))
+     (def a (loop (:for i (range 1 9))
+                  (:acc a (folding (array-ref lanczos 0) (+ a (/ (array-ref lanczos i) (+ y (cast double i))))))))
+     ;; ln a first: a sum that lives across a call is kept in memory in its
+     ;; loop. The terms are added in the same order.
+     (def log-a (loge a))
+     (+ (- (+ (* 0.5 (loge (* 2.0 pi))) (* (+ y 0.5) (loge t))) t) log-a))))
+
+;; ln Γ(x) less Stirling's approximation, (x - 1/2) ln x - x + ln √(2π),
+;; for x of at least 10: the first eight terms of Stirling's series.
+(: (-> double double))
+(defun (stirling-rest x)
+  (def r (/ 1.0 x))
+  (def r2 (* r r))
+  (* r (+ (/ 1.0 12.0)
+          (* r2 (+ (/ -1.0 360.0)
+                   (* r2 (+ (/ 1.0 1260.0)
+                            (* r2 (+ (/ -1.0 1680.0)
+                                     (* r2 (+ (/ 1.0 1188.0)
+                                              (* r2 (+ (/ -691.0 360360.0)
+                                                       (* r2 (+ (/ 1.0 156.0) (* r2 (/ -3617.0 122400.0)))))))))))))))))
+
+(: double)
+(def log-root-2-pi 0.918938533204672742)
+
+;; ln B(a, b). When a parameter is 10 or more, the parts of Stirling's
+;; approximation that would cancel are left out first, as R's lbeta does:
+;; ln Γ(a) - ln Γ(a + b) of a large a is a difference of two large numbers.
+(: (-> double double double))
+(defun (log-beta a b)
+  (def p (dmin a b))
+  (def q (dmax a b))
+  (cond
+    ((>= p 10.0)
+     (def corr (- (+ (stirling-rest p) (stirling-rest q)) (stirling-rest (+ p q))))
+     (+ (+ (+ (+ (* -0.5 (loge q)) log-root-2-pi) corr) (* (- p 0.5) (loge (/ p (+ p q)))))
+        (* q (log1p (/ (- p) (+ p q))))))
+    ((>= q 10.0)
+     (def corr (- (stirling-rest q) (stirling-rest (+ p q))))
+     (+ (- (+ (+ (log-gamma p) corr) p) (* p (loge (+ p q)))) (* (- q 0.5) (log1p (/ (- p) (+ p q))))))
+    (else (- (+ (log-gamma a) (log-gamma b)) (log-gamma (+ a b))))))
+
+;; ln(x^a e^-x / Γ(a)), the factor in front of both forms of the incomplete
+;; gamma function. For an a of 10 or more, written so that the large terms
+;; cancel before they are added: with x = a (1 + d), it is
+;; a (ln(1 + d) - d) + ln √(a / 2π) - stirling-rest(a).
+(: (-> double double double))
+(defun (log-gamma-front a x)
+  (if (< a 10.0)
+      (- (+ (- x) (* a (loge x))) (log-gamma a))
+      (let ((d (/ (- x a) a)))
+        (- (- (+ (* a (- (log1p d) d)) (* 0.5 (loge a))) log-root-2-pi) (stirling-rest a)))))
+
+;; v, or `tiny` when it is nearer to 0: Lentz's method divides by it.
+(: (-> double double))
+(defun (not-tiny v) #:inline (if (< (dabs v) tiny) tiny v))
+
+;; The series of P(a, x).
+(: (-> double double double))
+(defun (gamma-series a x)
+  (let go ((n 0) (ap a) (del (/ 1.0 a)) (sum (/ 1.0 a)))
+    (if (>= n max-iterations)
+        sum
+        (let* ((ap (+ ap 1.0))
+               (del (* del (/ x ap)))
+               (sum (+ sum del)))
+          (if (< (dabs del) (* (dabs sum) eps)) sum (go (+ n 1) ap del sum))))))
+
+;; The continued fraction of Q(a, x), less its front.
+(: (-> double double double))
+(defun (gamma-fraction a x)
+  (def b0 (- (+ x 1.0) a))
+  (let go ((i 1) (b b0) (c (/ 1.0 tiny)) (d (/ 1.0 b0)) (h (/ 1.0 b0)))
+    (if (>= i max-iterations)
+        h
+        (let* ((an (* (cast double (- i)) (- (cast double i) a)))
+               (b (+ b 2.0))
+               (d (not-tiny (+ (* an d) b)))
+               (c (not-tiny (+ b (/ an c))))
+               (d (/ 1.0 d))
+               (del (* d c))
+               (h (* h del)))
+          (if (< (dabs (- del 1.0)) eps) h (go (+ i 1) b c d h))))))
+
+;; The regularized incomplete gamma function: P(a, x), or Q(a, x) =
+;; 1 - P(a, x) when `upper?`.
+(: (-> double double bool double))
+(defun (incomplete-gamma a x upper?)
+  (cond
+    ((or (nan? a) (nan? x) (<= a 0.0)) nan)
+    ((<= x 0.0) (if upper? 1.0 0.0))
+    ((positive-infinite? x) (if upper? 0.0 1.0))
+    (else
+     (def front (exp (log-gamma-front a x)))
+     (if (< x (+ a 1.0))
+         (let ((p (* (gamma-series a x) front))) (if upper? (- 1.0 p) p))
+         (let ((q (* front (gamma-fraction a x)))) (if upper? q (- 1.0 q)))))))
+
+;; The continued fraction of I_x(a, b), less its front.
+(: (-> double double double double))
+(defun (beta-fraction x a b)
+  (def qab (+ a b))
+  (def qap (+ a 1.0))
+  (def qam (- a 1.0))
+  (def d0 (/ 1.0 (not-tiny (- 1.0 (/ (* qab x) qap)))))
+  (let go ((m 1) (c 1.0) (d d0) (h d0))
+    (if (>= m max-iterations)
+        h
+        (let* ((md (cast double m))
+               (m2 (cast double (* 2 m)))
+               (aa (/ (* (* md (- b md)) x) (* (+ qam m2) (+ a m2))))
+               (d (not-tiny (+ 1.0 (* aa d))))
+               (c (not-tiny (+ 1.0 (/ aa c))))
+               (d (/ 1.0 d))
+               (h (* h (* d c)))
+               (aa (/ (* (* (- (+ a md)) (+ qab md)) x) (* (+ a m2) (+ qap m2))))
+               (d (not-tiny (+ 1.0 (* aa d))))
+               (c (not-tiny (+ 1.0 (/ aa c))))
+               (d (/ 1.0 d))
+               (del (* d c))
+               (h (* h del)))
+          (if (< (dabs (- del 1.0)) eps) h (go (+ m 1) c d h))))))
+
+;; The regularized incomplete beta function I_x(a, b), or 1 - I_x(a, b) when
+;; `upper?`. y is 1 - x, given apart so that a caller who knows it exactly
+;; loses no digits.
+(: (-> double double double double bool double))
+(defun (incomplete-beta x y a b upper?)
+  (cond
+    ((or (nan? x) (nan? a) (nan? b) (<= a 0.0) (<= b 0.0)) nan)
+    ((<= x 0.0) (if upper? 1.0 0.0))
+    ((<= y 0.0) (if upper? 0.0 1.0))
+    (else
+     ;; ln x and ln y, through ln(1 + t) for the one near 1.
+     (def lx (if (> x 0.5) (log1p (- y)) (loge x)))
+     (def ly (if (> y 0.5) (log1p (- x)) (loge y)))
+     (def front (exp (- (+ (* a lx) (* b ly)) (log-beta a b))))
+     (if (< x (/ (+ a 1.0) (+ (+ a b) 2.0)))
+         (let ((lower (/ (* front (beta-fraction x a b)) a))) (if upper? (- 1.0 lower) lower))
+         (let ((up (/ (* front (beta-fraction y b a)) b))) (if upper? up (- 1.0 up)))))))
+
+;; ===========================================================================
+;; Quantiles of continuous distributions
+;; ===========================================================================
+
+;; The x in [lo, hi] where the distribution function is p: the lower tail's
+;; when `lower?`, the upper tail's otherwise. `cdf` takes x and whether it is
+;; of the upper tail. The tail of the smaller probability is solved, as
+;; 1 - p is exact for p of at least 0.5.
+(: (-> (-> double bool double) (-> double double) double bool double double double double))
+(defun (invert cdf density p lower? lo hi guess)
+  (cond
+    ((or (nan? p) (< p 0.0) (> p 1.0)) nan)
+    ((= p 0.0) (if lower? lo hi))
+    ((= p 1.0) (if lower? hi lo))
+    (else
+     ;; Solve in the lower tail when its probability is the smaller.
+     (def solve-lower? (if lower? (<= p 0.5) (> p 0.5)))
+     (def target (if (= lower? solve-lower?) p (- 1.0 p)))
+     ;; f(x) rises with x in the lower tail and falls in the upper.
+     (def sign (if solve-lower? 1.0 -1.0))
+     (: (-> double double))
+     (defun (f x) (* sign (- (cdf x (not solve-lower?)) target)))
+     ;; A bracket: f(a) < 0 < f(b).
+     (def a (let go ((i 0) (a (if (infinite? lo) (- (dmin guess 0.0) 1.0) lo)))
+              (if (and (< i 2000) (> (f a) 0.0)) (go (+ i 1) (if (infinite? lo) (- (* a 2.0) 1.0) lo)) a)))
+     (def b (let go ((i 0) (b (if (infinite? hi) (+ (dmax guess 0.0) 1.0) hi)))
+              (if (and (< i 2000) (< (f b) 0.0)) (go (+ i 1) (+ (* b 2.0) 1.0)) b)))
+     ;; Newton's method on the logarithm of the tail, ln P - ln target, whose
+     ;; slope is the density over P: in a far tail, where P falls as
+     ;; e^(-x²/2), a step on P itself moves x by about 1/x, and one on its
+     ;; logarithm moves it to the root in a few steps.
+     (def log-target (loge target))
+     (let newton ((i 0) (x (if (and (> guess a) (< guess b)) guess (* 0.5 (+ a b)))) (a a) (b b))
+       (if (>= i 400)
+           x
+           (let ((fx (f x)))
+             (if (= fx 0.0)
+                 x
+                 (let* ((a (if (< fx 0.0) x a))
+                        (b (if (< fx 0.0) b x))
+                        (tail (cdf x (not solve-lower?)))
+                        (next (if (and (> tail 0.0) (> (density x) 0.0))
+                                  (- x (/ (* (* sign (- (loge tail) log-target)) tail) (density x)))
+                                  nan))
+                        (next (if (and (> next a) (< next b)) next (* 0.5 (+ a b)))))
+                   (if (or (<= (dabs (- next x)) (* (* 4.0 eps) (dabs x)))
+                           (<= (- b a) (* (* 4.0 eps) (dmax (dabs a) (dabs b)))))
+                       next
+                       (newton (+ i 1) next a b))))))))))
+
+;; Acklam's approximation of the normal quantile, to about 1e-9: the first
+;; guess of Newton's method. The polynomials are written out by Horner's
+;; rule, with their coefficients in place.
+(: (-> double double))
+(defun (acklam-tail q)
+  (/ (+ (* (+ (* (+ (* (+ (* (+ (* -7.784894002430293e-03 q) -3.223964580411365e-01) q) -2.400758277161838e+00) q) -2.549732539343734e+00) q) 4.374664141464968e+00) q) 2.938163982698783e+00)
+     (+ (* (+ (* (+ (* (+ (* 7.784695709041462e-03 q) 3.224671290700398e-01) q) 2.445134137142996e+00) q) 3.754408661907416e+00) q) 1.0)))
+
+(: (-> double double))
+(defun (acklam p)
+  (cond
+    ((< p 0.02425) (acklam-tail (sqrt (* -2.0 (loge p)))))
+    ((> p (- 1.0 0.02425)) (- (acklam-tail (sqrt (* -2.0 (loge (- 1.0 p)))))))
+    (else
+     (def r (- p 0.5))
+     (def s (* r r))
+     (/ (* (+ (* (+ (* (+ (* (+ (* (+ (* -3.969683028665376e+01 s) 2.209460984245205e+02) s) -2.759285104469687e+02) s) 1.383577518672690e+02) s) -3.066479806614716e+01) s) 2.506628277459239e+00) r)
+        (+ (* (+ (* (+ (* (+ (* (+ (* -5.447609879822406e+01 s) 1.615858368580409e+02) s) -1.556989798598866e+02) s) 6.680131188771972e+01) s) -1.328068155288572e+01) s) 1.0)))))
+
+;; Acklam's approximation where p is inside (0, 1), and z otherwise.
+(: (-> double double double))
+(defun (acklam-or p z) (if (and (> p 0.0) (< p 1.0)) (acklam p) z))
+
+;; ===========================================================================
+;; The distributions, as R's d, p and q functions
+;; ===========================================================================
+
+;; √(2π), computed once: `pi` is a value of (std maths), not a constant
+;; that C# folds, and a root at each density was a fifth of a quantile's time.
+(: double)
+(def root-2-pi (sqrt (* 2.0 pi)))
+
+(: (-> double double double double))
+(defun (normal-density-of x mean sd)
+  (if (not (> sd 0.0))
+      nan
+      (let ((z (/ (- x mean) sd)))
+        (/ (exp (* (* -0.5 z) z)) (* sd root-2-pi)))))
+
+(: (-> double double double bool double))
+(defun (normal-cdf-of x mean sd lower?)
+  (if (or (not (> sd 0.0)) (nan? x))
+      nan
+      ;; Φ(z) = Q(1/2, z²/2) / 2 below 0, and its mirror above.
+      (let* ((z (/ (- x mean) sd))
+             (z (if lower? z (- z)))
+             (half (* 0.5 (incomplete-gamma 0.5 (* (* 0.5 z) z) #t))))
+        (if (<= z 0.0) half (- 1.0 half)))))
+
+(: (-> double double double bool double))
+(defun (normal-quantile-of p mean sd lower?)
+  (if (not (> sd 0.0))
+      nan
+      (let ((z (invert (fun (x up?) (normal-cdf-of x 0.0 1.0 (not up?)))
+                       (fun (x) (normal-density-of x 0.0 1.0))
+                       p lower? (- inf) inf (acklam-or (if lower? p (- 1.0 p)) 0.0))))
+        (+ mean (* sd z)))))
+
+(: (-> double double double))
+(defun (t-density-of x df)
+  (cond
+    ((not (> df 0.0)) nan)
+    ((positive-infinite? df) (normal-density-of x 0.0 1.0))
+    (else
+     (exp (- (- (- (log-gamma (/ (+ df 1.0) 2.0)) (log-gamma (/ df 2.0))) (* 0.5 (loge (* df pi))))
+             (* (/ (+ df 1.0) 2.0) (loge (+ 1.0 (/ (* x x) df)))))))))
+
+(: (-> double double bool double))
+(defun (t-cdf-of x df lower?)
+  (cond
+    ((or (not (> df 0.0)) (nan? x)) nan)
+    ((positive-infinite? df) (normal-cdf-of x 0.0 1.0 lower?))
+    ((infinite? x) (if (= (> x 0.0) lower?) 1.0 0.0))
+    ;; Of many degrees of freedom, a corrected normal, as R's pt: its error
+    ;; is of the order of 1 / df², and the continued fraction of the beta
+    ;; function converges slowly there.
+    ((> df 4e5)
+     (def val (/ 1.0 (* 4.0 df)))
+     (normal-cdf-of (/ (* x (- 1.0 val)) (sqrt (+ 1.0 (* (* (* x x) 2.0) val)))) 0.0 1.0 lower?))
+    (else
+     ;; P(T > |x|) = I_w(df/2, 1/2) / 2, with w = df / (df + x²).
+     (def x2 (* x x))
+     (def w (/ df (+ df x2)))
+     (def v (/ x2 (+ df x2)))
+     (if (= (< x 0.0) lower?)
+         (* 0.5 (incomplete-beta w v (/ df 2.0) 0.5 #f))
+         ;; 1 - tail, as 1/2 + I_v(1/2, df/2) / 2.
+         (+ 0.5 (* 0.5 (incomplete-beta w v (/ df 2.0) 0.5 #t)))))))
+
+(: (-> double double bool double))
+(defun (t-quantile-of p df lower?)
+  (cond
+    ((not (> df 0.0)) nan)
+    ((positive-infinite? df) (normal-quantile-of p 0.0 1.0 lower?))
+    (else
+     (def z (acklam-or (if lower? p (- 1.0 p)) 0.0))
+     ;; Fisher's first terms of the t from the normal quantile.
+     (def guess (+ z (/ (+ (* (* z z) z) z) (* 4.0 df))))
+     (invert (fun (x up?) (t-cdf-of x df (not up?))) (fun (x) (t-density-of x df))
+             p lower? (- inf) inf guess))))
+
+(: (-> double double double))
+(defun (chi-squared-density-of x df)
+  (cond
+    ((not (> df 0.0)) nan)
+    ((< x 0.0) 0.0)
+    ((= x 0.0) (cond ((< df 2.0) inf) ((= df 2.0) 0.5) (else 0.0)))
+    (else
+     (def k (/ df 2.0))
+     (exp (- (- (- (* (- k 1.0) (loge x)) (/ x 2.0)) (* k (loge 2.0))) (log-gamma k))))))
+
+(: (-> double double bool double))
+(defun (chi-squared-cdf-of x df lower?)
+  (if (or (not (> df 0.0)) (nan? x)) nan (incomplete-gamma (/ df 2.0) (/ x 2.0) (not lower?))))
+
+(: (-> double double bool double))
+(defun (chi-squared-quantile-of p df lower?)
+  (if (not (> df 0.0))
+      nan
+      (let* ((z (acklam-or (if lower? p (- 1.0 p)) 0.0))
+             ;; Wilson and Hilferty's cube of a normal.
+             (h (/ 2.0 (* 9.0 df)))
+             (guess (* df (pow (dmax (+ (- 1.0 h) (* z (sqrt h))) 0.01) 3.0))))
+        (invert (fun (x up?) (chi-squared-cdf-of x df (not up?))) (fun (x) (chi-squared-density-of x df))
+                p lower? 0.0 inf guess))))
+
+(: (-> double double double double))
+(defun (f-density-of x d1 d2)
+  (cond
+    ((or (not (> d1 0.0)) (not (> d2 0.0))) nan)
+    ((< x 0.0) 0.0)
+    ((= x 0.0) (cond ((< d1 2.0) inf) ((= d1 2.0) 1.0) (else 0.0)))
+    (else
+     (exp (- (- (* 0.5 (- (+ (* d1 (loge (* d1 x))) (* d2 (loge d2))) (* (+ d1 d2) (loge (+ (* d1 x) d2)))))
+                (loge x))
+             (log-beta (/ d1 2.0) (/ d2 2.0)))))))
+
+(: (-> double double double bool double))
+(defun (f-cdf-of x d1 d2 lower?)
+  (cond
+    ((or (not (> d1 0.0)) (not (> d2 0.0)) (nan? x)) nan)
+    ((<= x 0.0) (if lower? 0.0 1.0))
+    ((positive-infinite? x) (if lower? 1.0 0.0))
+    (else
+     (def s (+ (* d1 x) d2))
+     (incomplete-beta (/ (* d1 x) s) (/ d2 s) (/ d1 2.0) (/ d2 2.0) (not lower?)))))
+
+(: (-> double double double bool double))
+(defun (f-quantile-of p d1 d2 lower?)
+  (if (or (not (> d1 0.0)) (not (> d2 0.0)))
+      nan
+      (invert (fun (x up?) (f-cdf-of x d1 d2 (not up?))) (fun (x) (f-density-of x d1 d2))
+              p lower? 0.0 inf (if (> d2 2.0) (/ d2 (- d2 2.0)) 1.0))))
+
+(: (-> long long double double))
+(defun (binomial-probability-of k n p)
+  (cond
+    ((or (< n 0L) (not (and (>= p 0.0) (<= p 1.0)))) nan)
+    ((or (< k 0L) (> k n)) 0.0)
+    ((= p 0.0) (if (= k 0L) 1.0 0.0))
+    ((= p 1.0) (if (= k n) 1.0 0.0))
+    (else
+     (def choose (- (- (log-gamma (+ (cast double n) 1.0)) (log-gamma (+ (cast double k) 1.0)))
+                    (log-gamma (+ (cast double (- n k)) 1.0))))
+     (exp (+ (+ choose (* (cast double k) (loge p))) (* (cast double (- n k)) (loge (- 1.0 p))))))))
+
+(: (-> long long double bool double))
+(defun (binomial-cdf-of k n p lower?)
+  (cond
+    ((or (< n 0L) (not (and (>= p 0.0) (<= p 1.0)))) nan)
+    ((< k 0L) (if lower? 0.0 1.0))
+    ((>= k n) (if lower? 1.0 0.0))
+    ((= p 0.0) (if lower? 1.0 0.0))
+    ((= p 1.0) (if lower? 0.0 1.0))
+    ;; P(X ≤ k) = I_(1-p)(n - k, k + 1).
+    (else (incomplete-beta (- 1.0 p) p (cast double (- n k)) (cast double (+ k 1L)) (not lower?)))))
+
+;; 64 times the machine epsilon of doubles, 2^-52.
+(: double)
+(def fuzz (* 64.0 2.220446049250313e-16))
+
+;; The least k from 0 to max whose lower distribution function reaches q,
+;; or, of the upper tail, whose upper one is at most q. A step from the
+;; normal guess, then walks of one. q is moved by 64 ulps, as R does, so that
+;; the rounding of a sum does not give the next k.
+(: (-> (-> long double) (-> long double) double bool double double long long))
+(defun (discrete-quantile lower-cdf upper-cdf q lower? mean sd max)
+  (: (-> long bool))
+  (defun (reached? k)
+    (if lower? (>= (lower-cdf k) (* q (- 1.0 fuzz))) (<= (upper-cdf k) (* q (+ 1.0 fuzz)))))
+  (if (or (and lower? (= q 0.0)) (and (not lower?) (= q 1.0)))
+      0L
+      (let* ((ql (if lower? q (- 1.0 q)))
+             (z (acklam-or ql (if (>= ql 1.0) 8.5 -8.5)))
+             (k (cast long (dclamp (floor (+ (+ mean (* sd z)) 0.5)) 0.0 (cast double max)))))
+        (if (reached? k)
+            (let down ((k k)) (if (and (> k 0L) (reached? (- k 1L))) (down (- k 1L)) k))
+            (let up ((k k)) (if (and (< k max) (not (reached? k))) (up (+ k 1L)) k))))))
+
+;; The least k whose distribution function reaches q, or -1 for parameters
+;; out of range.
+(: (-> double long double bool long))
+(defun (binomial-quantile-of q n p lower?)
+  (if (or (< n 0L) (not (and (>= p 0.0) (<= p 1.0))) (not (and (>= q 0.0) (<= q 1.0))))
+      -1L
+      (discrete-quantile (fun (k) (binomial-cdf-of k n p #t)) (fun (k) (binomial-cdf-of k n p #f))
+                         q lower? (* (cast double n) p) (sqrt (* (* (cast double n) p) (- 1.0 p))) n)))
+
+(: (-> long double double))
+(defun (poisson-probability-of k lambda)
+  (cond
+    ((not (>= lambda 0.0)) nan)
+    ((< k 0L) 0.0)
+    ((= lambda 0.0) (if (= k 0L) 1.0 0.0))
+    (else (exp (- (- (* (cast double k) (loge lambda)) lambda) (log-gamma (+ (cast double k) 1.0)))))))
+
+(: (-> long double bool double))
+(defun (poisson-cdf-of k lambda lower?)
+  (cond
+    ((not (>= lambda 0.0)) nan)
+    ((< k 0L) (if lower? 0.0 1.0))
+    ((= lambda 0.0) (if lower? 1.0 0.0))
+    ;; P(X ≤ k) = Q(k + 1, λ).
+    (else (incomplete-gamma (+ (cast double k) 1.0) lambda lower?))))
+
+(: (-> double double bool long))
+(defun (poisson-quantile-of q lambda lower?)
+  (if (or (not (>= lambda 0.0)) (not (and (>= q 0.0) (<= q 1.0))))
+      -1L
+      (discrete-quantile (fun (k) (poisson-cdf-of k lambda #t)) (fun (k) (poisson-cdf-of k lambda #f))
+                         q lower? lambda (sqrt lambda) 9223372036854775807L)))
 
 ;; ===========================================================================
 ;; Normal
 ;; ===========================================================================
 
 (: (-> double (#:mean double) (#:sd double) double))
-(defun (normal-density x #:mean 0.0 #:sd 1.0) (clr-normal-density x mean sd))
+(defun (normal-density x #:mean 0.0 #:sd 1.0) (normal-density-of x mean sd))
 
 ;; P(X ≤ x), or P(X > x) with `#:lower? #f`.
 (: (-> double (#:mean double) (#:sd double) (#:lower? bool) double))
-(defun (normal-cdf x #:mean 0.0 #:sd 1.0 #:lower? #t) (clr-normal-cdf x mean sd lower?))
+(defun (normal-cdf x #:mean 0.0 #:sd 1.0 #:lower? #t) (normal-cdf-of x mean sd lower?))
 
 ;; The x where normal-cdf is p.
 (: (-> double (#:mean double) (#:sd double) (#:lower? bool) double))
-(defun (normal-quantile p #:mean 0.0 #:sd 1.0 #:lower? #t) (clr-normal-quantile p mean sd lower?))
+(defun (normal-quantile p #:mean 0.0 #:sd 1.0 #:lower? #t) (normal-quantile-of p mean sd lower?))
 
 (: (-> (#:mean double) (#:sd double) (#:rng RandomSource) double))
 (defun (normal-sample #:mean 0.0 #:sd 1.0 #:rng (parameter-ref current-random))
@@ -147,13 +601,13 @@
 ;; ===========================================================================
 
 (: (-> double double double))
-(defun (t-density x df) (clr-t-density x df))
+(defun (t-density x df) (t-density-of x df))
 
 (: (-> double double (#:lower? bool) double))
-(defun (t-cdf x df #:lower? #t) (clr-t-cdf x df lower?))
+(defun (t-cdf x df #:lower? #t) (t-cdf-of x df lower?))
 
 (: (-> double double (#:lower? bool) double))
-(defun (t-quantile p df #:lower? #t) (clr-t-quantile p df lower?))
+(defun (t-quantile p df #:lower? #t) (t-quantile-of p df lower?))
 
 ;; A normal over the root of a chi-squared divided by its degrees of freedom.
 (: (-> double (#:rng RandomSource) double))
@@ -167,13 +621,13 @@
 ;; ===========================================================================
 
 (: (-> double double double))
-(defun (chi-squared-density x df) (clr-chi-squared-density x df))
+(defun (chi-squared-density x df) (chi-squared-density-of x df))
 
 (: (-> double double (#:lower? bool) double))
-(defun (chi-squared-cdf x df #:lower? #t) (clr-chi-squared-cdf x df lower?))
+(defun (chi-squared-cdf x df #:lower? #t) (chi-squared-cdf-of x df lower?))
 
 (: (-> double double (#:lower? bool) double))
-(defun (chi-squared-quantile p df #:lower? #t) (clr-chi-squared-quantile p df lower?))
+(defun (chi-squared-quantile p df #:lower? #t) (chi-squared-quantile-of p df lower?))
 
 ;; Twice a gamma of shape df / 2.
 (: (-> double (#:rng RandomSource) double))
@@ -185,13 +639,13 @@
 ;; ===========================================================================
 
 (: (-> double double double double))
-(defun (f-density x d1 d2) (clr-f-density x d1 d2))
+(defun (f-density x d1 d2) (f-density-of x d1 d2))
 
 (: (-> double double double (#:lower? bool) double))
-(defun (f-cdf x d1 d2 #:lower? #t) (clr-f-cdf x d1 d2 lower?))
+(defun (f-cdf x d1 d2 #:lower? #t) (f-cdf-of x d1 d2 lower?))
 
 (: (-> double double double (#:lower? bool) double))
-(defun (f-quantile p d1 d2 #:lower? #t) (clr-f-quantile p d1 d2 lower?))
+(defun (f-quantile p d1 d2 #:lower? #t) (f-quantile-of p d1 d2 lower?))
 
 ;; Two chi-squareds, each over its degrees of freedom, one over the other.
 (: (-> double double (#:rng RandomSource) double))
@@ -206,10 +660,10 @@
 
 ;; P(X = k) of n trials of probability p each.
 (: (-> long long double double))
-(defun (binomial-probability k n p) (clr-binomial-probability k n p))
+(defun (binomial-probability k n p) (binomial-probability-of k n p))
 
 (: (-> long long double (#:lower? bool) double))
-(defun (binomial-cdf k n p #:lower? #t) (clr-binomial-cdf k n p lower?))
+(defun (binomial-cdf k n p #:lower? #t) (binomial-cdf-of k n p lower?))
 
 (: (-> long double string void))
 (defun (check-binomial n p name)
@@ -223,7 +677,7 @@
   (check-binomial n p "binomial-quantile")
   (unless (and (>= q 0.0) (<= q 1.0))
     (panic! (str "binomial-quantile: the probability is " (double->string q) ", not from 0 to 1.")))
-  (clr-binomial-quantile q n p lower?))
+  (binomial-quantile-of q n p lower?))
 
 (: (-> long double (#:rng RandomSource) long))
 (defun (binomial-sample n p #:rng (parameter-ref current-random))
@@ -268,10 +722,10 @@
 ;; ===========================================================================
 
 (: (-> long double double))
-(defun (poisson-probability k lambda) (clr-poisson-probability k lambda))
+(defun (poisson-probability k lambda) (poisson-probability-of k lambda))
 
 (: (-> long double (#:lower? bool) double))
-(defun (poisson-cdf k lambda #:lower? #t) (clr-poisson-cdf k lambda lower?))
+(defun (poisson-cdf k lambda #:lower? #t) (poisson-cdf-of k lambda lower?))
 
 (: (-> double string void))
 (defun (check-poisson lambda name)
@@ -283,7 +737,7 @@
   (check-poisson lambda "poisson-quantile")
   (unless (and (>= q 0.0) (<= q 1.0))
     (panic! (str "poisson-quantile: the probability is " (double->string q) ", not from 0 to 1.")))
-  (clr-poisson-quantile q lambda lower?))
+  (poisson-quantile-of q lambda lower?))
 
 (: (-> double (#:rng RandomSource) long))
 (defun (poisson-sample lambda #:rng (parameter-ref current-random))

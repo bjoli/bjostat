@@ -1070,6 +1070,63 @@ checked against the table's schema before any row was read, as Polars's
 the schema before rows are read may come back as a check of a loop's
 columns.
 
+** Done: the statistics of distributions, tests and models in Bjolang
+
+glue/Distributions.cs, Ranks.cs, Regression.cs and Glm.cs are Bjolang
+now, in (bjostat distributions), (bjostat hypothesis) and (bjostat
+models): the incomplete gamma and beta functions, the quantiles by
+Newton's method, the rank tests and Fisher's test, the QR by Givens
+rotations of a linear model, and the IRLS of a generalized one. The
+operations are in the order of the C#, so the results are the C#'s to the
+last bit: a program that prints 4630 values of the functions, the tests
+and the fits (scratch/models-bits.bjo) gave the same text before and
+after. Not the same where the C# was wrong: the products of counts of the
+rank tests, as n (n + 1) (2n + 1), are doubles, where the C# had ints that
+wrapped above about n = 1000.
+
+- Lines: 1190 of C# (849 not blank and not comments) out, 1100 of Bjolang
+  (803) in. The glue is 7328 lines of C#.
+- Measured, the C# version (worktree of 835cbfd) and this alternated,
+  three runs each, µs; most rows faster:
+
+  | row                                   | C#          | Bjolang     |
+  |---------------------------------------+-------------+-------------|
+  | log-gamma, 1000                       | 20.9-21.1   | 16.1-16.6   |
+  | t-cdf df 10, 1000                     | 199-201     | 138         |
+  | normal-cdf, 1000                      | 109         | 109         |
+  | normal-quantile, 100                  | 53.6-53.9   | 58.4-59.2   |
+  | chi-squared-quantile, 100             | 144         | 127-128     |
+  | rank-sum, 500 and 500                 | 18.3-18.6   | 13.4-13.9   |
+  | rank-sum, 40 and 40, exact            | 2010-2020   | 1640-1650   |
+  | signed-rank, 40, exact                | 15.7        | 17.6-18.1   |
+  | linear, 3 predictors, 100 000 rows    | 5080-5140   | 4590-4750   |
+  | linear, 20 predictors, 20 000 rows    | 6750-6800   | 6290-6300   |
+  | logistic, 1 predictor, 100 000 rows   | 23700-23900 | 23600-23800 |
+  | poisson, 2 predictors, 20 000 rows    | 7970-8000   | 6160-6180   |
+  | fisher, 301 values                    | 142-143     | 127-135     |
+
+- What the first version lost, and what fixed it (each found in perf or in
+  the machine code): the rank tests sorted with vec-sort-by, a merge sort
+  of a Vec (2x slower), now System.Array.Sort of a copy of the values with
+  the indices; the GLM copied each weighted row with Array.Copy, now the
+  row is written in place, and the sums of squares of the columns are
+  added as a row is filled, not in a pass of their own; the means and the
+  linear predictors were {arraying ...}, which grows a builder and copies
+  it (twice the memory), now arrays of their length; ln a of log-gamma was
+  taken after ln t, so the sum a lived across a call and was kept in
+  memory in its loop (log-gamma 20.9 to 16.1).
+- Still slower: the exact signed-rank. Its counting loop,
+  counts[s] += counts[s - e] down from the end, has two checks of the
+  index and a test at the top in Bjolang's while loop, where the C# for
+  loop had one check, a test at the bottom and a copy without the check.
+  Starting the walk at (array-length counts) - 1 took it from 21.9 to 17.6.
+  And normal-quantile by 9 %, not found: the same 788 calls of the
+  distribution function for 100 quantiles as the C#, and normal-cdf alone
+  the same.
+- The Bjolang = of doubles is Equals, so NaN = NaN, where C#'s == says
+  no. The tie of two ranks is a <= and >= (same?), as C#'s ==; comparisons
+  with a constant are the same either way.
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema

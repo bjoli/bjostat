@@ -34,14 +34,21 @@
 (import (bjostat stats))
 (import (only (bjostat query) table-with ColumnBuilding))
 (import (bjostat distributions))
-(import (only (std maths) nan? atanh tanh))
+(import (only (std maths) nan? infinite? atanh tanh pow quotient loge exp))
 (import (std mutable vec))
 
 (import/extern
-  (significant (: Bjostat.Regression.Significant (-> double int string)))
-  (clr-rank-sum (: Bjostat.Ranks.RankSum (-> (Array double) (Array double) bool (Array double))))
-  (clr-signed-rank (: Bjostat.Ranks.SignedRank (-> (Array double) bool (Array double))))
-  (clr-fisher (: Bjostat.Ranks.Fisher (-> long long long long (Array double)))))
+  (clr-invariant (: System.Globalization.CultureInfo.InvariantCulture #:get)))
+
+;; The number to `digits` significant digits, as R prints a test:
+;; 0.001234, 12.35, 1.235e+06.
+(: (-> double int string))
+(defun (significant x digits)
+  (cond
+    ((nan? x) "NaN")
+    ((infinite? x) (if (> x 0.0) "Inf" "-Inf"))
+    (else (string-replace (string-replace (.ToString x (str "G" (int->string digits)) clr-invariant) "E+" "e+")
+                          "E-" "e-"))))
 
 ;; Why a test cannot be made.
 (type (: TestError (Record (: message string))))
@@ -388,7 +395,7 @@
        (if (or (= (mutablevec-length a) 0) (= (mutablevec-length b) 0))
            (refuse "a rank-sum test needs a value in each sample.")
            (Ok (rank-test-of "Wilcoxon rank sum test"
-                             (clr-rank-sum (mutablevec->array a) (mutablevec->array b) #t))))))))
+                             (rank-sum-p-values (mutablevec->array a) (mutablevec->array b) #t))))))))
 
 ;; R's wilcox.test(x, mu = null): are the values symmetric about `null`?
 (type (: SignedRankTest #:opaque (Struct (: null double) (: paired bool))))
@@ -420,7 +427,7 @@
   (def values (mutablevec->array d))
   (if (= 0 (loop (:for i (range 0 (array-length values))) (:when (not (= (array-ref values i) 0.0))) (:acc (counting i))))
       (refuse "a signed-rank test needs a value that is not its null.")
-      (Ok (rank-test-of method (clr-signed-rank values #t)))))
+      (Ok (rank-test-of method (signed-rank-p-values values #t)))))
 
 ;; ===========================================================================
 ;; Fisher's exact test
@@ -452,6 +459,225 @@
      (def a (count 0 0)) (def b (count 1 0)) (def c (count 0 1)) (def d (count 1 1))
      (if (or (< a 0L) (< b 0L) (< c 0L) (< d 0L))
          (refuse "a count is null or below 0.")
-         (let ((r (clr-fisher a b c d)))
+         (let ((r (fisher-p-values a b c d)))
            (Ok (FisherTest (p-value (array-ref r 0)) (p-less (array-ref r 1)) (p-greater (array-ref r 2))
                            (odds-ratio (array-ref r 3)))))))))
+
+;; ===========================================================================
+;; Ranks and Fisher's exact test, computed
+;; ===========================================================================
+;;
+;; A rank test gives an array: the statistic, the p-values of the two-sided,
+;; "less" and "greater" alternatives, and 1 when the p-values are exact, 0
+;; when they are of the normal approximation. As R, the exact distribution is
+;; used when each sample has fewer than 50 values and no value is tied (or, of
+;; the signed-rank test, 0); it is counted by dynamic programming over the
+;; sums of subsets of the ranks. The products of counts, as n (n + 1), are
+;; taken in doubles, so that a large sample does not overflow an int.
+
+;; Math.Min, Math.Max and Math.Sign as they are, for NaN as in .NET.
+(import/extern
+  (dmin (: System.Math.Min (-> double double double)))
+  (dmax (: System.Math.Max (-> double double double)))
+  (dabs (: System.Math.Abs (-> double double)))
+  (dsign (: System.Math.Sign (-> double int)))
+  ;; The items in the order of the keys, as CompareTo orders them, NaN
+  ;; first. Not stable, which the ranks do not need: tied values get the mean
+  ;; of their ranks whatever their order.
+  (sort-by-keys! (: System.Array.Sort (-> (Array double) (Array int) void))))
+
+;; Whether two doubles are equal as C#'s == says: NaN is equal to nothing.
+;; Bjolang's = of doubles is Equals, where NaN is equal to NaN.
+(: (-> double double bool))
+(defun (same? a b) #:inline (and (<= a b) (>= a b)))
+
+;; The ranks of the values, ties given the mean of their ranks, and the sum
+;; of t³ - t over the groups of t tied values.
+(: (-> (Array double) (Tuple (Array double) double)))
+(defun (ranks-of v)
+  (def n (array-length v))
+  (def keys (array-resize v n))
+  (def order {arraying i (:for i (range 0 n))})
+  (sort-by-keys! keys order)
+  (def ranks (make-array n #:fill 0.0))
+  (def ties
+    (let group ((i 0) (ties 0.0))
+      (if (>= i n)
+          ties
+          (let* ((first (array-ref v (array-ref order i)))
+                 (j (let last ((j i))
+                      (if (and (< (+ j 1) n) (same? (array-ref v (array-ref order (+ j 1))) first)) (last (+ j 1)) j)))
+                 (rank (+ (/ (cast double (+ i j)) 2.0) 1.0))
+                 (t (cast double (+ (- j i) 1))))
+            (begin
+              (loop (:for k (range i (+ j 1))) (:do (array-set! ranks (array-ref order k) rank)))
+              (group (+ j 1) (+ ties (- (* (* t t) t) t))))))))
+  (Tuple ranks ties))
+
+;; The numbers of the subsets of size k of {0, ..., n - 1} by the sum of their
+;; elements, for W of the rank-sum test: W of x is that sum less nothing, as
+;; the ranks less 1 are 0 to n - 1 and W is the sum of x's ranks less
+;; k (k + 1) / 2.
+(: (-> int int (Array double)))
+(defun (subset-sums n k)
+  (def top (* k (- n k)))
+  ;; ways j s: the subsets of size j of the elements so far whose sum, less
+  ;; 0 + 1 + ... + (j - 1), is s.
+  (def ways {arraying (make-array (+ top 1) #:fill 0.0) (:for _j (range 0 (+ k 1)))})
+  (array-set! (array-ref ways 0) 0 1.0)
+  (loop (:for e (range 0 n))
+        (:do (loop (:for j (down-from (min k (+ e 1)) #:to 1))
+                   (:do (let ((shift (- e (- j 1)))
+                              (wj (array-ref ways j))
+                              (wp (array-ref ways (- j 1))))
+                          (when (>= shift 0)
+                            (loop (:for s (down-from top #:to shift))
+                                  (:do (array-set! wj s (+ (array-ref wj s) (array-ref wp (- s shift))))))))))))
+  (array-ref ways k))
+
+;; The counts added in order.
+(: (-> (Array double) double))
+(defun (total-of counts)
+  (loop (:for c counts) (:acc s (folding 0.0 (+ s c)))))
+
+;; P(statistic ≤ q), of the counts of each sum and their total.
+(: (-> (Array double) double double double))
+(defun (count-below counts total q)
+  (def limit (dmin q (cast double (- (array-length counts) 1))))
+  (def s (let go ((i 0) (s 0.0))
+           (if (<= (cast double i) limit) (go (+ i 1) (+ s (array-ref counts i))) s)))
+  (if (< q 0.0) 0.0 (/ s total)))
+
+;; The p-values of an exact distribution: the counts of each sum, their
+;; total, the statistic and its mean.
+(: (-> (Array double) double double double (Array double)))
+(defun (exact-p-values counts total statistic mean)
+  (def less (count-below counts total statistic))
+  (def greater (- 1.0 (count-below counts total (- statistic 1.0))))
+  (def two (if (> statistic mean) (* 2.0 greater) (* 2.0 less)))
+  #[statistic (dmin 1.0 two) less greater 1.0])
+
+;; The p-values of the normal approximation, with R's correction of 1/2
+;; towards the mean when `correct?`.
+(: (-> double double double bool (Array double)))
+(defun (normal-p-values statistic z sigma correct?)
+  (def c (if correct? 0.5 0.0))
+  (def zc (/ (- z (* (cast double (dsign z)) c)) sigma))
+  (def two (* 2.0 (dmin (normal-cdf zc) (normal-cdf zc #:lower? #f))))
+  (def less (normal-cdf (/ (+ z c) sigma)))
+  (def greater (normal-cdf (/ (- z c) sigma) #:lower? #f))
+  #[statistic (dmin 1.0 two) less greater 0.0])
+
+;; Wilcoxon's rank-sum test of x against y, W the sum of x's ranks less
+;; n (n + 1) / 2.
+(: (-> (Array double) (Array double) bool (Array double)))
+(defun (rank-sum-p-values x y correct?)
+  (def nx (array-length x))
+  (def ny (array-length y))
+  (def all {arraying (if (< i nx) (array-ref x i) (array-ref y (- i nx))) (:for i (range 0 (+ nx ny)))})
+  (match (ranks-of all)
+    ((Tuple ranks ties)
+     (def fx (cast double nx))
+     (def fy (cast double ny))
+     (def w (- (loop (:for i (range 0 nx)) (:acc s (folding 0.0 (+ s (array-ref ranks i)))))
+               (/ (* fx (+ fx 1.0)) 2.0)))
+     (if (and (< nx 50) (< ny 50) (= ties 0.0))
+         (let ((counts (subset-sums (+ nx ny) nx)))
+           (exact-p-values counts (total-of counts) w (/ (* fx fy) 2.0)))
+         (let ((n (cast double (+ nx ny))))
+           (normal-p-values w (- w (/ (* fx fy) 2.0))
+                            (sqrt (* (/ (* fx fy) 12.0) (- (+ n 1.0) (/ ties (* n (- n 1.0))))))
+                            correct?))))))
+
+;; Wilcoxon's signed-rank test of the differences, V the sum of the ranks of
+;; those above 0.
+(: (-> (Array double) bool (Array double)))
+(defun (signed-rank-p-values d correct?)
+  (def zeros? (any? (fun (x) (= x 0.0)) d))
+  (def nonzero {arraying x (:for x d) (:when (not (= x 0.0)))})
+  (def n (array-length nonzero))
+  (match (ranks-of {arraying (dabs x) (:for x nonzero)})
+    ((Tuple ranks ties)
+     (def v (loop (:for i (range 0 n))
+                  (:acc s (folding 0.0 (if (> (array-ref nonzero i) 0.0) (+ s (array-ref ranks i)) s)))))
+     (def fn (cast double n))
+     (if (and (< n 50) (= ties 0.0) (not zeros?))
+         ;; The subsets of {1, ..., n} by their sum.
+         (let* ((top (quotient (* n (+ n 1)) 2))
+                (counts (: (make-array (+ top 1)) (Array double))))
+           (begin
+             (array-set! counts 0 1.0)
+             (loop (:for e (range 1 (+ n 1)))
+                   ;; From the array's last index, which tells .NET that every
+                   ;; index of the walk is in it.
+                   (:do (loop (:for s (down-from (- (array-length counts) 1) #:to e))
+                              (:do (array-set! counts s (+ (array-ref counts s) (array-ref counts (- s e))))))))
+             (exact-p-values counts (pow 2.0 fn) v (/ (* fn (+ fn 1.0)) 4.0))))
+         (normal-p-values v (- v (/ (* fn (+ fn 1.0)) 4.0))
+                          (sqrt (- (/ (* (* fn (+ fn 1.0)) (+ (* 2.0 fn) 1.0)) 24.0) (/ ties 48.0)))
+                          correct?)))))
+
+;; ln (n choose k).
+(: (-> long long double))
+(defun (log-choose n k)
+  (- (- (log-gamma (+ (cast double n) 1.0)) (log-gamma (+ (cast double k) 1.0)))
+     (log-gamma (+ (cast double (- n k)) 1.0))))
+
+;; The ψ whose noncentral hypergeometric mean is a: 0 when a is the least x,
+;; infinite when it is the most, else found by bisection on ln ψ, as the mean
+;; rises with ψ. The answer is exp of the midpoint, so a bracket of w wide is
+;; w relative on the ratio: 1e-13 is about as fine as the bisection can hold,
+;; since a double's own spacing near ±100 is 1.4e-14.
+(: (-> (Array double) long long double))
+(defun (odds-ratio-of logp lo a)
+  (def size (array-length logp))
+  (: (-> double double))
+  (defun (mean-at log-psi)
+    (def top (loop (:for i (range 0 size))
+                   (:acc t (folding (- (/ 1.0 0.0))
+                                    (dmax t (+ (array-ref logp i) (* (cast double (+ lo (cast long i))) log-psi)))))))
+    (let go ((i 0) (s 0.0) (sx 0.0))
+      (if (>= i size)
+          (/ sx s)
+          (let* ((x (cast double (+ lo (cast long i))))
+                 (w (exp (- (+ (array-ref logp i) (* x log-psi)) top))))
+            (go (+ i 1) (+ s w) (+ sx (* w x)))))))
+  (cond
+    ((= a lo) 0.0)
+    ((= a (+ lo (cast long (- size 1)))) (/ 1.0 0.0))
+    (else
+     (let go ((i 0) (left -100.0) (right 100.0))
+       (if (and (< i 200) (> (- right left) 1e-13))
+           (let ((mid (* 0.5 (+ left right))))
+             (if (< (mean-at mid) (cast double a)) (go (+ i 1) mid right) (go (+ i 1) left mid)))
+           (exp (* 0.5 (+ left right))))))))
+
+;; Fisher's exact test of the table [[a, b], [c, d]]: the p-values of the
+;; two-sided, "less" and "greater" alternatives, then the conditional maximum
+;; likelihood estimate of the odds ratio, as R's fisher.test.
+(: (-> long long long long (Array double)))
+(defun (fisher-p-values a b c d)
+  (def m (+ a b))
+  (def n (+ c d))
+  (def k (+ a c))
+  (def lo (if (> (- k n) 0L) (- k n) 0L))
+  (def hi (if (< k m) k m))
+  (def size (cast int (+ (- hi lo) 1L)))
+  ;; ln of the hypergeometric probability of each x from lo to hi. The
+  ;; normalising term is the same for every x, so it is taken once.
+  (def norm (log-choose (+ m n) k))
+  (def logp {arraying (let ((x (+ lo (cast long i)))) (- (+ (log-choose m x) (log-choose n (- k x))) norm))
+                      (:for i (range 0 size))})
+  (def at (cast int (- a lo)))
+  (def observed (array-ref logp at))
+  ;; R's relative tolerance of 1e-7, so that a probability that is the
+  ;; observed one but for rounding counts.
+  (def bound (+ observed (loge (+ 1.0 1e-7))))
+  (let go ((i 0) (less 0.0) (greater 0.0) (two 0.0))
+    (if (>= i size)
+        #[(dmin 1.0 two) (dmin 1.0 less) (dmin 1.0 greater) (odds-ratio-of logp lo a)]
+        (let ((p (exp (array-ref logp i))))
+          (go (+ i 1)
+              (if (<= i at) (+ less p) less)
+              (if (>= i at) (+ greater p) greater)
+              (if (<= (array-ref logp i) bound) (+ two p) two))))))
