@@ -1115,14 +1115,33 @@ wrapped above about n = 1000.
   it (twice the memory), now arrays of their length; ln a of log-gamma was
   taken after ln t, so the sum a lived across a call and was kept in
   memory in its loop (log-gamma 20.9 to 16.1).
-- Still slower: the exact signed-rank. Its counting loop,
-  counts[s] += counts[s - e] down from the end, has two checks of the
-  index and a test at the top in Bjolang's while loop, where the C# for
-  loop had one check, a test at the bottom and a copy without the check.
-  Starting the walk at (array-length counts) - 1 took it from 21.9 to 17.6.
-  And normal-quantile by 9 %, not found: the same 788 calls of the
-  distribution function for 100 quantiles as the C#, and normal-cdf alone
-  the same.
+- The exact signed-rank was slower (17.6-18.1 above) for a reason other
+  than its loop. The counting loop, counts[s] += counts[s - e], took 13.5
+  µs for n = 40 in a function of its own, the same as a C# for loop. Inside
+  signed-rank-p-values the time of the test changed from run to run,
+  measured with all rows and alternated:
+  - C#: 15.6-15.7 by default, 26.2-26.6 with DOTNET_TieredPGO=0;
+  - Bjolang: 17.5-21.9 by default, 15.4-15.8 with DOTNET_TieredPGO=0.
+  In the slow Bjolang runs the JIT left the loop's test at the top and did
+  not align the loop. In the slow C# runs it kept the array on the stack and
+  read it three times an iteration. So the larger method, not the shape of
+  Bjolang's loop, was the cause; a C# while (cond) in place of
+  while (true) did not change it (16.8-21.7). The loop is now
+  signed-rank-counts, a function of its own: 15.4-15.5 against the C#'s
+  15.5-15.6, three runs each with all rows, and 15.1-15.7 in 12 of 12 runs
+  by default, with no PGO and with a call-counting delay of 100 ms. The
+  same 4630 values.
+- Still slower: normal-quantile, 58.1-59.6 against 53.5-53.8. The cause is
+  inlining. In the C#, the JIT inlined LogGamma (295 bytes of IL) and Gamma
+  (464, with its continued fraction) into NormalQuantile. In Bjolang,
+  log-gamma is 420 bytes and the JIT says "unprofitable inline" for 3 of
+  its 4 calls, and also for gamma-fraction (289). Measured with a
+  log-gamma edited by hand in the emitted C#: with no Range struct, no
+  loopexit local function and `&&` in place of a hoisted bool, it is 329
+  bytes and is inlined, and the row is 54.1. None of the three alone
+  was enough (57.4-58.8). Written with named lets in place of loop, it is
+  353 bytes and is not inlined (57.7). This is a matter for the compiler
+  (Bjolang Todo.org).
 - The Bjolang = of doubles is Equals, so NaN = NaN, where C#'s == says
   no. The tie of two ranks is a <= and >= (same?), as C#'s ==; comparisons
   with a constant are the same either way.
