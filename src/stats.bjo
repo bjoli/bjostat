@@ -48,18 +48,30 @@
 (re-export combine combine-all)
 
 (import (std mutable vec))
+(import (only (std array) array-fill!))
 (import (bjostat table))
 (import (bjostat query))
 (import (only (std parallel) computing-each))
 (import (std simd))
 (import (std maths))
 
+;; .NET's Math as it is, for the results of the C# this was, to the last bit.
 (import/extern
-  (clr-quantiles (: Bjostat.Stats.Quantiles (-> (MutableVec double) (Array double) (Array double))))
-  (clr-summarize (: Bjostat.Stats.Summarize (-> (MutableVec double) (Array double))))
-  (stats-grow (: Bjostat.Stats.Grow (-> (MutableVec double) int (MutableVec double))))
-  (stats-span (: Bjostat.Stats.Span (-> (MutableVec double) int int (Span double))))
-  (stats-no-none! (: Bjostat.Stats.NoNone (-> (MutableVec double) int void))))
+  (clr-max (: System.Math.Max (-> double double double)))
+  (clr-floor (: System.Math.Floor (-> double double)))
+  (clr-log (: System.Math.Log (-> double double)))
+  (clr-exp (: System.Math.Exp (-> double double)))
+  (clr-sqrt (: System.Math.Sqrt (-> double double)))
+  (clr-clamp (: System.Math.Clamp (-> int int int int)))
+  (clr-nan (: System.Double.NaN #:get))
+  ;; An introsort, in place. Not stable; the order of equal doubles does not
+  ;; change a quantile.
+  (span-sort! (: System.MemoryExtensions.Sort (-> (Span %a) void))))
+
+(import/class
+  (ArgumentOutOfRangeException (: System.ArgumentOutOfRangeException
+                                  (-> string string ArgumentOutOfRangeException)))
+  (InvalidOperationException (: System.InvalidOperationException (-> string InvalidOperationException))))
 
 ;; ===========================================================================
 ;; Mean and variance, in one pass
@@ -513,6 +525,236 @@
 ;; Quantiles
 ;; ===========================================================================
 
+;; The values of a quantile collector are kept in a MutableVec, which a
+;; vector loop fills a block at a time.
+(: (-> (MutableVec double) int (MutableVec double)))
+(defun (stats-grow xs n)
+  (mutablevec-grow! xs n)
+  xs)
+
+;; A value is never None in a vector loop over values that are not null.
+(: (-> (MutableVec double) int void))
+(defun (stats-no-none! _xs _i)
+  (raise (cast Exception (InvalidOperationException. "(bjostat stats): a quantile value cannot be None"))))
+
+;; The quantiles at `ps` of the values, as R's `quantile` gives them by
+;; default (its type 7): the value at (n - 1) p in the sorted values, and
+;; between two values a straight line between them.
+;; - The values are reordered in place. They are not sorted: a selection puts
+;;   each value that is necessary at its place in the sorted order.
+;; - NaN at each p when a value is NaN or there are no values.
+;; - Raises ArgumentOutOfRangeException when a p is not between 0 and 1.
+(: (-> (MutableVec double) (Array double) (Array double)))
+(defun (quantiles-in-place! values ps)
+  (loop (:for p ps)
+        (:do (unless (and (>= p 0.0) (<= p 1.0))
+               (raise (cast Exception
+                            (ArgumentOutOfRangeException.
+                             "ps" (str "(bjostat stats): a quantile at " (.ToString p)
+                                       ", which is not between 0 and 1")))))))
+  (def n (mutablevec-length values))
+  (def result (: (make-array (array-length ps)) (Array double)))
+  (if (or (= n 0) (any-nan? (mutablevec-span values 0 n)))
+      (array-fill! result clr-nan)
+      (select-quantiles! (mutablevec-span values 0 n) ps result))
+  result)
+
+;; The seven numbers of a summary of the values, which are not empty: min,
+;; q1, median, mean, q3, max and sd. The values are reordered in place. Seven
+;; NaNs when a value is NaN, or a sum is not a number.
+(: (-> (MutableVec double) (Array double)))
+(defun (summary-in-place! values)
+  (summarize! (mutablevec-span values 0 (mutablevec-length values))))
+
+(: (Array double))
+(def summary-ps #[0.0 0.25 0.5 0.75 1.0])
+
+(: (-> (Span double) (Array double)))
+(defun (summarize! xs)
+  (def len (span-length xs))
+  (def k (span-ref xs 0))
+  (def (Tuple s1 s2)
+    (let go ((i 0) (s1 0.0) (s2 0.0))
+      (if (< i len)
+          (let ((d (- (span-ref xs i) k)))
+            (go (+ i 1) (+ s1 d) (+ s2 (* d d))))
+          (Tuple s1 s2))))
+  (if (nan? s2)
+      (make-array 7 #:fill clr-nan)
+      (let* ((n (cast double len))
+             (mean (+ k (/ s1 n)))
+             (sd (if (< len 2) clr-nan (clr-sqrt (clr-max 0.0 (/ (- s2 (/ (* s1 s1) n)) (- n 1.0))))))
+             (qs (: (make-array 5) (Array double))))
+        (select-quantiles! xs summary-ps qs)
+        #[(array-ref qs 0) (array-ref qs 1) (array-ref qs 2) mean (array-ref qs 3) (array-ref qs 4) sd])))
+
+(: (-> (Span double) bool))
+(defun (any-nan? xs)
+  (let go ((i 0))
+    (cond
+      ((= i (span-length xs)) #f)
+      ((nan? (span-ref xs i)) #t)
+      (else (go (+ i 1))))))
+
+;; The quantiles at `ps` into `result`, of values with no NaN.
+;; The places in the sorted order that the quantiles use are found from the
+;; least up, so that each selection looks only at the values after the last
+;; place.
+(: (-> (Span double) (Array double) (Array double) void))
+(defun (select-quantiles! xs ps result)
+  (def n (span-length xs))
+  ;; The places: the index below (n - 1) p, and the one above it when p is
+  ;; between two.
+  (def places (: (make-array (* 2 (array-length ps))) (Array int)))
+  (def count
+    (let go ((i 0) (count 0))
+      (if (= i (array-length ps))
+          count
+          (let* ((h (* (cast double (- n 1)) (array-ref ps i)))
+                 (lo (cast int (clr-floor h))))
+            (array-set! places count lo)
+            (if (> h (cast double lo))
+                (begin
+                  (array-set! places (+ count 1) (+ lo 1))
+                  (go (+ i 1) (+ count 2)))
+                (go (+ i 1) (+ count 1)))))))
+  (span-sort! (array->span places #:to count))
+  (def unique
+    (let go ((i 0) (u 0))
+      (cond
+        ((= i count) u)
+        ((or (= u 0) (not (= (array-ref places i) (array-ref places (- u 1)))))
+         (array-set! places u (array-ref places i))
+         (go (+ i 1) (+ u 1)))
+        (else (go (+ i 1) u)))))
+  (select-all! xs 0 (- n 1) places 0 unique)
+  (let go ((i 0))
+    (when (< i (array-length ps))
+      (let* ((h (* (cast double (- n 1)) (array-ref ps i)))
+             (lo (cast int (clr-floor h))))
+        (array-set! result i
+                    (if (> h (cast double lo))
+                        (+ (span-ref xs lo) (* (- h (cast double lo)) (- (span-ref xs (+ lo 1)) (span-ref xs lo))))
+                        (span-ref xs lo)))
+        (go (+ i 1))))))
+
+;; Each place of `places`, from `from` to `to`, sorted, gets its value in the
+;; sorted order of the values from `lo` to `hi`. The middle place first: it
+;; splits the values and the other places in two.
+(: (-> (Span double) int int (Array int) int int void))
+(defun (select-all! xs lo hi places from to)
+  (unless (or (= from to) (> lo hi))
+    (let* ((mid (+ from (quotient (- to from) 2)))
+           (k (array-ref places mid)))
+      (select! xs lo hi k)
+      (select-all! xs lo (- k 1) places from mid)
+      (select-all! xs (+ k 1) hi places (+ mid 1) to))))
+
+;; Puts the value that belongs at `k` in the sorted order of the values from
+;; `left` to `right` there, the smaller values before it and the greater
+;; after it.
+;; - `k` at an end: one scan for the least or the greatest.
+;; - 33 values or fewer: a sort.
+;; - More than 600: Floyd-Rivest selection. It first selects in a small slice
+;;   around `k`, so that the pivot is near the value at `k`, and one pass
+;;   makes the range a few thousand values.
+;; - Else the median of three is the pivot.
+(: (-> (Span double) int int int void))
+(defun (select! xs left right k)
+  (let go ((left left) (right right))
+    (when (> right left)
+      (cond
+        ((= k left) (swap! xs left (least-at xs left right)))
+        ((= k right) (swap! xs right (greatest-at xs left right)))
+        ((<= (- right left) 32) (span-sort! (span-slice xs #:from left #:to (+ right 1))))
+        (else
+         (if (> (- right left) 600)
+             (floyd-rivest! xs left right k)
+             (median-of-three! xs left right k))
+         (def j (partition! xs left right k))
+         (go (if (<= j k) (+ j 1) left) (if (<= k j) (- j 1) right)))))))
+
+;; The index of the first least value from `left` to `right`.
+(: (-> (Span double) int int int))
+(defun (least-at xs left right)
+  (let go ((i (+ left 1)) (at left) (least (span-ref xs left)))
+    (cond
+      ((> i right) at)
+      ((< (span-ref xs i) least) (go (+ i 1) i (span-ref xs i)))
+      (else (go (+ i 1) at least)))))
+
+;; The index of the greatest value from `left` to `right`: `right`, or the
+;; first from `left` that is greater.
+(: (-> (Span double) int int int))
+(defun (greatest-at xs left right)
+  (let go ((i left) (at right) (greatest (span-ref xs right)))
+    (cond
+      ((>= i right) at)
+      ((> (span-ref xs i) greatest) (go (+ i 1) i (span-ref xs i)))
+      (else (go (+ i 1) at greatest)))))
+
+(: (-> (Span double) int int void))
+(defun (swap! xs a b)
+  #:inline
+  (let ((t (span-ref xs a)))
+    (span-set! xs a (span-ref xs b))
+    (span-set! xs b t)))
+
+;; Selects `k` in a slice around it whose size grows as n^(2/3), so that the
+;; value at `k` is a good pivot for the whole range.
+(: (-> (Span double) int int int void))
+(defun (floyd-rivest! xs left right k)
+  (def* (n (cast double (+ (- right left) 1)))
+        (m (cast double (+ (- k left) 1)))
+        (z (clr-log n))
+        (s (* 0.5 (clr-exp (/ (* 2.0 z) 3.0))))
+        (sd (* (* 0.5 (clr-sqrt (/ (* (* z s) (- n s)) n))) (if (< (- m (/ n 2.0)) 0.0) -1.0 1.0)))
+        (new-left (clr-clamp (cast int (+ (- (cast double k) (/ (* m s) n)) sd)) left k))
+        (new-right (clr-clamp (cast int (+ (+ (cast double k) (/ (* (- n m) s) n)) sd)) k right)))
+  (select! xs new-left new-right k))
+
+;; The median of the values at `left`, the middle and `right`, moved to `k`.
+(: (-> (Span double) int int int void))
+(defun (median-of-three! xs left right k)
+  (def mid (+ left (quotient (- right left) 2)))
+  (when (< (span-ref xs mid) (span-ref xs left)) (swap! xs mid left))
+  (when (< (span-ref xs right) (span-ref xs left)) (swap! xs right left))
+  (when (< (span-ref xs right) (span-ref xs mid)) (swap! xs right mid))
+  (swap! xs mid k))
+
+;; Partitions the values from `left` to `right` around the value at `k`,
+;; and returns the index where that value is after it.
+(: (-> (Span double) int int int int))
+(defun (partition! xs left right k)
+  (def t (span-ref xs k))
+  (swap! xs left k)
+  (when (> (span-ref xs right) t) (swap! xs right left))
+  (def j
+    (let go ((i left) (j right))
+      (if (< i j)
+          (begin
+            (swap! xs i j)
+            (go (first-not-below xs (+ i 1) t) (last-not-above xs (- j 1) t)))
+          j)))
+  ;; == of C#: = of Bjolang is Equals, which is true of two NaNs.
+  (if (and (<= (span-ref xs left) t) (>= (span-ref xs left) t))
+      (begin
+        (swap! xs left j)
+        j)
+      (begin
+        (swap! xs (+ j 1) right)
+        (+ j 1))))
+
+(: (-> (Span double) int double int))
+(defun (first-not-below xs i t)
+  (let go ((i i))
+    (if (< (span-ref xs i) t) (go (+ i 1)) i)))
+
+(: (-> (Span double) int double int))
+(defun (last-not-above xs j t)
+  (let go ((j j))
+    (if (> (span-ref xs j) t) (go (- j 1)) j)))
+
 ;; The quantile at p, 0 to 1, as R's `quantile` gives it by default: the
 ;; value at (n - 1) p in the sorted values, and between two values a straight
 ;; line between them. NaN when a value is NaN; None when there are none.
@@ -525,7 +767,7 @@
 (defun (quantiles-of values ps)
   (if (= (mutablevec-length values) 0)
       None
-      (Some (clr-quantiles values ps))))
+      (Some (quantiles-in-place! values ps))))
 
 (impl (Collector Quantile)
   (type %elem double)
@@ -543,7 +785,7 @@
   (type %acc (MutableVec double))
   (defun (block-count c acc) (mutablevec-length acc))
   (defun (block-grow c acc n) (stats-grow acc n))
-  (defun (block-span c acc start n) (stats-span acc start n))
+  (defun (block-span c acc start n) (mutablevec-span acc start n))
   (defun (block-none! c acc i) (stats-no-none! acc i)))
 
 ;; The quantiles at several p, from one sort.
@@ -568,7 +810,7 @@
   (type %acc (MutableVec double))
   (defun (block-count c acc) (mutablevec-length acc))
   (defun (block-grow c acc n) (stats-grow acc n))
-  (defun (block-span c acc start n) (stats-span acc start n))
+  (defun (block-span c acc start n) (mutablevec-span acc start n))
   (defun (block-none! c acc i) (stats-no-none! acc i)))
 
 ;; The median: the quantile at 0.5.
@@ -590,7 +832,7 @@
   (type %acc (MutableVec double))
   (defun (block-count c acc) (mutablevec-length acc))
   (defun (block-grow c acc n) (stats-grow acc n))
-  (defun (block-span c acc start n) (stats-span acc start n))
+  (defun (block-span c acc start n) (mutablevec-span acc start n))
   (defun (block-none! c acc i) (stats-no-none! acc i)))
 
 ;; ===========================================================================
@@ -625,7 +867,7 @@
   (def n (mutablevec-length vs))
   (if (= n 0)
       None
-      (let ((q (clr-summarize vs)))
+      (let ((q (summary-in-place! vs)))
         (Some (Summary (count (cast long n))
                        (min (array-ref q 0)) (q1 (array-ref q 1)) (median (array-ref q 2))
                        (mean (array-ref q 3)) (q3 (array-ref q 4)) (max (array-ref q 5))
@@ -636,7 +878,7 @@
   (type %acc SummaryAcc)
   (defun (block-count c acc) (mutablevec-length (record-ref acc values)))
   (defun (block-grow c acc n) (SummaryAcc (values (stats-grow (record-ref acc values) n))))
-  (defun (block-span c acc start n) (stats-span (record-ref acc values) start n))
+  (defun (block-span c acc start n) (mutablevec-span (record-ref acc values) start n))
   (defun (block-none! c acc i) (stats-no-none! (record-ref acc values) i)))
 
 ;; ===========================================================================
@@ -668,7 +910,7 @@
   (type %acc (MutableVec double))
   (defun (block-count c acc) (mutablevec-length acc))
   (defun (block-grow c acc n) (stats-grow acc n))
-  (defun (block-span c acc start n) (stats-span acc start n))
+  (defun (block-span c acc start n) (mutablevec-span acc start n))
   (defun (block-none! c acc i) (stats-no-none! acc i)))
 
 (: (-> Values long))

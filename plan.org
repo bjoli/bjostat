@@ -1179,6 +1179,38 @@ which stays. The glue is 6715 lines of C#.
   as the row is read, not when the column is made (the message is the
   same, of the first such value in the order of the columns).
 
+** Done: the quantiles in Bjolang
+
+glue/Stats.cs (203 lines) is Bjolang now, in (bjostat stats): the
+quantiles of R's type 7, the summary, and the Floyd-Rivest selection that
+finds only the places the quantiles use. The operations are in the order
+of the C#. The block-grow and block-span of the collectors of a MutableVec
+are mutablevec-grow! and mutablevec-span of (std mutable vec), new in
+Bjolang 3a9570e. The glue is 6512 lines of C#.
+
+- The same results: scratch/stats-q/dump.bjo prints the quantiles, the
+  median and the summary, by the bits of each double, of 74 inputs (0 to
+  40 values, 10^6 values, ties, all equal, sorted, -0, NaN, infinities,
+  more than 8 places), through the collectors over an array, over cells,
+  and through values; and the messages of a p outside 0 to 1. The same 735
+  lines before and after. All 15 test files pass with all threads and with
+  one.
+- Measured, the C# version (worktree of 3425c96) and this alternated,
+  three rounds, µs:
+
+  | row                          | C#          | Bjolang     |
+  |------------------------------+-------------+-------------|
+  | median, 10^6                 | 7679-7698   | 7391-7454   |
+  | quartiles and deciles, 10^6  | 14230-14317 | 13531-13629 |
+  | summary, 10^6                | 12820-12863 | 12150-12250 |
+  | summary, 10^6 of 5 values    | 11928-11995 | 11628-11745 |
+  | summary, 1000                | 6.07-6.52   | 6.46-6.52   |
+  | median collector, 10^6       | 6903-6914   | 6651-6748   |
+
+  Each row but the collector's includes the copy of the values. The small
+  summary is slower in two of three rounds; the C# kept the places and
+  the five quantiles in stackalloc, and Bjolang makes two small arrays.
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema
