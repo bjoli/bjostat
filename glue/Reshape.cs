@@ -895,4 +895,33 @@ public static class ReshapeOps
         firsts = f.ToArray();
         return ids;
     }
+
+    /// <summary>
+    /// The group of each row, the first row of each group, and the groups in
+    /// the order that table-sort gives their keys, ascending, a null last.
+    /// </summary>
+    public static int[] GroupsInOrder(IArrowArray[] keys, int n, out int[] firsts, out int[] order)
+    {
+        var groups = Reshape.Groups(keys, n, out var f, out var stringIds);
+        order = Sorting.OrderRows(keys, new bool[keys.Length], CollectionsMarshal.AsSpan(f), stringIds, f.Count);
+        firsts = f.ToArray();
+        return groups;
+    }
+
+    /// <summary>
+    /// An id for each row's value in the column, from 0 in the order of
+    /// table-sort, a null last, and the number of ids; None when the values
+    /// are not dense or are floats. A new array, which the caller may change.
+    /// </summary>
+    public static BjolangRuntime.Option<(int[], int)> SortedIds(IArrowArray a)
+    {
+        var ids = Reshape.TrySortedIds(a, out int card);
+        return ids == null ? BjolangRuntime.None<(int[], int)>() : BjolangRuntime.Some((ids, card));
+    }
+
+    /// <summary>The most ids put together that index an array.</summary>
+    public static long DenseLimit => Reshape.DenseLimit;
+
+    /// <summary>The number of levels of a category, without their strings.</summary>
+    public static int LevelCount(IArrowArray category) => ((DictionaryArray)category).Dictionary.Length;
 }

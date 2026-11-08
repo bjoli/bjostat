@@ -1523,6 +1523,66 @@ table; now they are the Err of a small file, "two columns are named 'a'."
   217 on one. The bench's MB are of the calling thread only, so they do
   not compare between these two versions.
 
+** Done: table-count and table-crosstab in Bjolang
+
+glue/Counts.cs is gone (524 lines): table-count and table-crosstab are
+Bjolang in src/table.bjo ("Counts"), with the paths of the C#: one
+category key counted by its codes; keys whose values can be numbered in
+the order of table-sort, with at most DenseLimit slots, counted by slot,
+which needs no groups and no sort; otherwise the groups of the keys and
+their order. The rows are counted in parts on the compute threads from
+32 768 rows: an array of counts for each part up to 16 384 values, and
+above that one array the parts add to with Bjolang's new
+atomic-array-increment! ((std atomic)). The C# left is kernels, public in
+ReshapeOps: GroupsInOrder (Reshape.Groups and Sorting.OrderRows),
+SortedIds, LevelCount, and Columns.FromArrayAt (a column of values at
+indices, in one pass). The glue is 5630 lines of C# (478 out).
+
+- Changed from the C#: a crosstab with a null in a key counts all rows in
+  parts, as one without, and then sets the counts of the keys' null groups
+  to 0, which leaves the counts of the rows with both keys. The C# counted
+  such a crosstab on one thread. The same counts.
+- Found on the way: Columns.FromArray, under every array->column, copied
+  through ArrowBuffer.Builder's AppendRange, which takes the values one at
+  a time: 2.6-4.4 ms of 600 000 longs. Now it is one block copy: 0.7 ms.
+- bench/compare.bjo printed its results in a definition of the module, so
+  in its initialiser. Now that the counts wait for the compute threads in
+  Bjolang, the compiler sees that, and refuses it. The printing is in
+  main, which calls run-registered-benches.
+- The same results: scratch/counts/dump.bjo prints 199 counts and
+  crosstabs (each key type, nulls, 0 to 3 keys, 1 000 to 400 003 rows, the
+  atomic path, every message): the same before and after with all
+  threads, with one and with three. All 15 test files pass with all
+  threads and with one.
+- Measured, 37887c1 (worktree) and this alternated, two rounds, the
+  median of 20 runs of bench/compare.bjo:
+
+  | row, file, threads         | 37887c1     | now         |
+  |----------------------------+-------------+-------------|
+  | category, narrow, 24       | 143-149 µs  | 135-138 µs  |
+  | category, narrow, 1        | 727-730 µs  | 580-586 µs  |
+  | category, wide, 24         | 1.05 ms     | 0.73-0.76   |
+  | category, wide, 1          | 1.06        | 0.76        |
+  | string and long, narrow, 24 | 1.71-1.73  | 1.61-1.99   |
+  | string and long, narrow, 1 | 6.85-6.93   | 6.35-6.37   |
+  | string and long, wide, 24  | 17.8-18.1   | 16.6-19.6   |
+  | string and long, wide, 1   | 55.0-55.2   | 47.7-47.8   |
+  | crosstab, narrow, 24       | 2.35-2.39   | 2.35-2.54   |
+  | crosstab, narrow, 1        | 10.7        | 11.4        |
+  | crosstab, wide, 24         | 38.4-41.2   | 20.1-30.4   |
+  | crosstab, wide, 1          | 42.0-48.4   | 43.5-45.0   |
+
+  The crosstab of the narrow file on one thread is slower in the bench.
+  scratch/counts/loop.bjo, 300 calls in a process, says the other: a
+  median of 10.8-11.0 ms against 11.6-12.1, and perf gives the counting
+  7% of the samples against 9.9% in the C#. Not found what the bench sees.
+- The first port was slower on the wide file (about 20 000 regions), and
+  each cause was found by allocation and perf: the category's levels made
+  as 20 000 strings to count them (now LevelCount); a serial count that
+  made a part's arrays and merged them; a crosstab with nulls that turned
+  each group's counts into a Vec to search them; and each count column
+  copied twice (now FromArrayAt).
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema

@@ -70,6 +70,9 @@
               instant->utc-datetime))
 (import (std parallel))
 (import (only (std simd) Simd128 Simd256))
+(import (only (std maths) quotient))
+(import (only (std atomic) atomic-array-increment!))
+(import (only (std array) array-fill!))
 
 ;; SimdSource, for the cells of a column of numbers: the re-exported methods
 ;; carry the trait to importers, as `chunk-size` carries Chunkable.
@@ -216,8 +219,15 @@
   (data-type (: Apache.Arrow.ArrayData.DataType (-> ArrayData ArrowType) #:get))
 
   ;; A TableProblem is a table the arguments cannot make.
-  (clr-count (: Bjostat.Counts.Count (-> Table (Array string) string Table) #:exceptions (Bjostat.TableProblem)))
-  (clr-crosstab (: Bjostat.Counts.Crosstab (-> Table string string Table) #:exceptions (Bjostat.TableProblem)))
+  ;; For the counts: the groups of the keys with their order, and the ids of
+  ;; a column's values in the order of table-sort.
+  (clr-groups-in-order (: Bjostat.ReshapeOps.GroupsInOrder
+                          (-> (Array AnyColumn) int (out (Array int)) (out (Array int))
+                              (Tuple (Array int) (Array int) (Array int)))))
+  (clr-sorted-ids (: Bjostat.ReshapeOps.SortedIds (-> AnyColumn (Option (Tuple (Array int) int)))))
+  (clr-dense-limit (: Bjostat.ReshapeOps.DenseLimit long #:get))
+  (clr-level-count (: Bjostat.ReshapeOps.LevelCount (-> AnyColumn int)))
+  (clr-longs-at (: Bjostat.Columns.FromArrayAt (-> (Array long) (Array int) (Column long))))
   (clr-categorize (: Bjostat.Categories.Categorize (-> Table string (Array string) Table)
                      #:exceptions (Bjostat.TableProblem)))
   (clr-levels (: Bjostat.Categories.Levels (-> AnyColumn (Array string))))
@@ -1500,6 +1510,57 @@
 ;; Counts
 ;; ===========================================================================
 
+;; The rows are counted in parts on the compute threads once there are two
+;; parts of count-part-rows or more. Each part keeps an array of counts when
+;; there are at most count-parts-limit values, and the arrays are summed
+;; after; with more, the parts add to one array, with atomic-array-increment!.
+;;
+;; When each key's values can be numbered in the order of table-sort and the
+;; numbers of all keys together are at most DenseLimit (Reshape.cs), the
+;; numbers of a row are its slot, and the slots that have a count are the
+;; result in its order: no groups to find and no sort. A category's codes
+;; are such numbers already. Otherwise the groups of the keys are found and
+;; put in order (ReshapeOps.GroupsInOrder).
+
+(import/extern
+  (uninitialized-ints (: System.GC.AllocateUninitializedArray (-> int bool (Array int)))))
+
+(: int) (def count-part-rows 16384)
+(: int) (def count-parts-limit 16384)
+
+;; The number of parts of n rows, and the rows of each but the last.
+(: (-> int (Tuple int int)))
+(defun (count-parts n)
+  (def parts (max 1 (min (quotient n count-part-rows) (compute-thread-count))))
+  (Tuple parts (quotient (+ n (- parts 1)) parts)))
+
+;; The first and the end row of part p.
+(: (-> int int int (Tuple int int)))
+(defun (part-rows p size n) (Tuple (* p size) (min n (* (+ p 1) size))))
+
+(: (-> (Array long) AnyColumn))
+(defun (long-column a) (column->any (array->column a)))
+
+;; The elements of `a` at the indices, in their order.
+(: (-> (Array %a) (Array int) (Array %a)))
+(defun (gathered a indices)
+  (def out (: (make-array (array-length indices)) (Array %a)))
+  (let go ((i 0))
+    (when (< i (array-length indices))
+      (array-set! out i (array-ref a (array-ref indices i)))
+      (go (+ i 1))))
+  out)
+
+;; The table of the keys' columns, with their fields, and the counts after.
+(: (-> Table string AnyColumn int Table))
+(defun (with-count keys name counts rows)
+  (def k (table-column-count keys))
+  (clr-from-fields
+   {arraying (if (< i k) (field-at keys i) (clr-new-field name (data-type (clr-data counts))))
+             (:for i (range 0 (+ k 1)))}
+   {arraying (if (< i k) (clr-column keys i) counts) (:for i (range 0 (+ k 1)))}
+   rows))
+
 ;; How many rows have each value of the columns `keys`, as dplyr's count: a
 ;; row for each distinct value, with the count in the column `#:name`, in the
 ;; order of the keys as table-sort gives it. A null is a value. With no keys,
@@ -1508,7 +1569,307 @@
 ;;     (table-count sales ["region" "product"])
 (: (-> Table (Vec string) (#:name string) (Result TableError Table)))
 (defun (table-count t keys #:name "n")
-  (problem-or (clr-count t (vec->array keys) name)))
+  (def n (table-row-count t))
+  (cond
+    ((some? (find (fun (k) (= k name)) keys))
+     (refuse (str "the count and a key are both named '" name "'.")))
+    (:def (Ok cols) (key-columns t keys) :propagate)
+    (:def (Ok idx) (column-indices t keys) :propagate)
+    ((= (array-length cols) 0)
+     (def all (long-column (: (make-array 1 #:fill (cast long n)) (Array long))))
+     (Ok (clr-from-fields #[(clr-new-field name (data-type (clr-data all)))] #[all] 1)))
+    ((and (= (array-length cols) 1) (= (clr-type-name (array-ref cols 0)) "Category"))
+     (Ok (count-category t (array-ref idx 0) (array-ref cols 0) name n)))
+    (else
+     (Ok (match (if (>= n (* 2 count-part-rows)) (count-sorted t idx cols name n) None)
+           ((Some counted) counted)
+           (None (count-groups t idx cols name n)))))))
+
+;; The counts of the groups of the keys, in the order of the groups' keys.
+(: (-> Table (Array int) (Array AnyColumn) string int Table))
+(defun (count-groups t idx cols name n)
+  (def (Tuple group-of firsts order) (clr-groups-in-order cols n))
+  (def counts (group-counts group-of (array-length firsts) n))
+  (def rows (array-length order))
+  (with-count (clr-take (clr-select t idx) (gathered firsts order) rows) name
+              (column->any (clr-longs-at counts order)) rows))
+
+;; The number of rows in each of the groups.
+(: (-> (Array int) int int (Array long)))
+(defun (group-counts group-of groups n)
+  (def counts (: (make-array groups) (Array long)))
+  (if (and (>= n (* 2 count-part-rows)) (<= groups count-parts-limit))
+      (let ()
+        (def (Tuple parts size) (count-parts n))
+        (def each (computing-each parts (fun (p)
+                                          (def (Tuple from to) (part-rows p size n))
+                                          (counted group-of groups from to))))
+        (loop (:for pc each) (:do (add-counts! counts pc)))
+        counts)
+      (let go ((r 0))
+        (if (= r n)
+            counts
+            (let ()
+              (def g (array-ref group-of r))
+              (array-set! counts g (+ (array-ref counts g) 1L))
+              (go (+ r 1)))))))
+
+;; How often each of the ids from 0 to `slots` comes in `ids`, from `from`
+;; to `to`.
+(: (-> (Array int) int int int (Array int)))
+(defun (counted ids slots from to)
+  (def pc (: (make-array slots) (Array int)))
+  (let go ((r from))
+    (when (< r to)
+      (def s (array-ref ids r))
+      (array-set! pc s (+ (array-ref pc s) 1))
+      (go (+ r 1))))
+  pc)
+
+(: (-> (Array long) (Array int) Unit))
+(defun (add-counts! counts pc)
+  (let go ((g 0))
+    (when (< g (array-length counts))
+      (array-set! counts g (+ (array-ref counts g) (cast long (array-ref pc g))))
+      (go (+ g 1)))))
+
+;; The counts by slot, when each key's values can be numbered in the order
+;; of table-sort and the slots are at most DenseLimit; or None.
+(: (-> Table (Array int) (Array AnyColumn) string int (Option Table)))
+(defun (count-sorted t idx cols name n)
+  (def k (array-length cols))
+  (def col-ids (: (make-array k) (Array (Array int))))
+  (def cards (: (make-array k) (Array int)))
+  (def slots
+    (let go ((c 0) (total 1L))
+      (if (= c k)
+          (Some total)
+          (match (clr-sorted-ids (array-ref cols c))
+            (None None)
+            ((Some (Tuple ids card))
+             (def ck (if (= card 0) 1 card))
+             (def more (* total (cast long ck)))
+             (array-set! col-ids c ids)
+             (array-set! cards c ck)
+             (if (> more clr-dense-limit) None (go (+ c 1) more)))))))
+  (match slots
+    (None None)
+    ((Some s) (Some (count-slots t idx col-ids cards (cast int s) name n)))))
+
+;; The slot of each row is its first key's id, times the next key's number
+;; of ids, plus its id, and so on. With two keys it is made as each row is
+;; counted; with more, first, into the ids of the first key.
+(: (-> Table (Array int) (Array (Array int)) (Array int) int string int Table))
+(defun (count-slots t idx col-ids cards slots name n)
+  (def k (array-length col-ids))
+  (def (Tuple parts size) (count-parts n))
+  (def ids (array-ref col-ids 0))
+  (when (> k 2)
+    (ignore (computing-each parts (fun (p)
+                                    (def (Tuple from to) (part-rows p size n))
+                                    (combine-slots! ids col-ids cards from to)
+                                    unit))))
+  (def two? (= k 2))
+  (def second (if two? (array-ref col-ids 1) ids))
+  (def c1 (if two? (array-ref cards 1) 1))
+  (def (Tuple slot-counts slot-firsts)
+    (if (<= slots count-parts-limit)
+        (slot-counts-in-parts ids second c1 two? slots parts size n)
+        (slot-counts-atomic ids second c1 two? slots parts size n)))
+  (def (Tuple firsts counts)
+    (if (>= slots count-part-rows)
+        (compacted-in-parts slot-counts slot-firsts parts)
+        (compacted slot-counts slot-firsts)))
+  (def rows (array-length firsts))
+  (with-count (clr-take (clr-select t idx) firsts rows) name (long-column counts) rows))
+
+(: (-> (Array int) (Array (Array int)) (Array int) int int Unit))
+(defun (combine-slots! ids col-ids cards from to)
+  (def k (array-length col-ids))
+  (let go ((r from))
+    (when (< r to)
+      (def s (let add ((c 1) (s (array-ref ids r)))
+               (if (= c k) s (add (+ c 1) (+ (* s (array-ref cards c)) (array-ref (array-ref col-ids c) r))))))
+      (array-set! ids r s)
+      (go (+ r 1)))))
+
+;; The counts and the first rows of the slots, from one array of each for
+;; each part.
+(: (-> (Array int) (Array int) int bool int int int int (Tuple (Array int) (Array int))))
+(defun (slot-counts-in-parts ids second c1 two? slots parts size n)
+  (def each (computing-each parts (fun (p)
+                                    (def (Tuple from to) (part-rows p size n))
+                                    (slot-part ids second c1 two? slots from to))))
+  (def counts (: (make-array slots) (Array int)))
+  (def firsts (: (make-array slots #:fill int-max) (Array int)))
+  (loop (:for (Tuple pc pf) each) (:do (merge-part! counts firsts pc pf)))
+  (Tuple counts firsts))
+
+(: (-> (Array int) (Array int) int bool int int int (Tuple (Array int) (Array int))))
+(defun (slot-part ids second c1 two? slots from to)
+  (def pc (: (make-array slots) (Array int)))
+  (def pf (: (make-array slots #:fill int-max) (Array int)))
+  (if two?
+      (let go ((r from))
+        (when (< r to)
+          (def s (+ (* (array-ref ids r) c1) (array-ref second r)))
+          (def c (array-ref pc s))
+          (when (= c 0) (array-set! pf s r))
+          (array-set! pc s (+ c 1))
+          (go (+ r 1))))
+      (let go ((r from))
+        (when (< r to)
+          (def s (array-ref ids r))
+          (def c (array-ref pc s))
+          (when (= c 0) (array-set! pf s r))
+          (array-set! pc s (+ c 1))
+          (go (+ r 1)))))
+  (Tuple pc pf))
+
+(: (-> (Array int) (Array int) (Array int) (Array int) Unit))
+(defun (merge-part! counts firsts pc pf)
+  (let go ((s 0))
+    (when (< s (array-length counts))
+      (array-set! counts s (+ (array-ref counts s) (array-ref pc s)))
+      (when (< (array-ref pf s) (array-ref firsts s)) (array-set! firsts s (array-ref pf s)))
+      (go (+ s 1)))))
+
+;; The counts and a first row of the slots, from one array of counts that
+;; the parts add to. A slot's first row is the row of the step that made its
+;; count 1; any row of a slot has its keys.
+(: (-> (Array int) (Array int) int bool int int int int (Tuple (Array int) (Array int))))
+(defun (slot-counts-atomic ids second c1 two? slots parts size n)
+  (def counts (: (make-array slots) (Array int)))
+  (def firsts (uninitialized-ints slots #f))
+  (ignore (computing-each parts (fun (p)
+                                  (def (Tuple from to) (part-rows p size n))
+                                  (slot-part-atomic! counts firsts ids second c1 two? from to)
+                                  unit)))
+  (Tuple counts firsts))
+
+(: (-> (Array int) (Array int) (Array int) (Array int) int bool int int Unit))
+(defun (slot-part-atomic! counts firsts ids second c1 two? from to)
+  (if two?
+      (let go ((r from))
+        (when (< r to)
+          (def s (+ (* (array-ref ids r) c1) (array-ref second r)))
+          (when (= (atomic-array-increment! counts s) 1) (array-set! firsts s r))
+          (go (+ r 1))))
+      (let go ((r from))
+        (when (< r to)
+          (def s (array-ref ids r))
+          (when (= (atomic-array-increment! counts s) 1) (array-set! firsts s r))
+          (go (+ r 1))))))
+
+;; The first row and the count of each slot that has a count, in the order
+;; of the slots.
+(: (-> (Array int) (Array int) (Tuple (Array int) (Array long))))
+(defun (compacted counts firsts)
+  (def rows (loop (:for c counts) (:acc k (summing (if (> c 0) 1 0)))))
+  (def out-firsts (uninitialized-ints rows #f))
+  (def out-counts (: (make-array rows) (Array long)))
+  (let go ((s 0) (i 0))
+    (when (< s (array-length counts))
+      (def c (array-ref counts s))
+      (if (> c 0)
+          (begin
+            (array-set! out-firsts i (array-ref firsts s))
+            (array-set! out-counts i (cast long c))
+            (go (+ s 1) (+ i 1)))
+          (go (+ s 1) i))))
+  (Tuple out-firsts out-counts))
+
+;; The same, the slots in parts on the compute threads: the slots with a
+;; count in each part, then where each part's go, then the copies.
+(: (-> (Array int) (Array int) int (Tuple (Array int) (Array long))))
+(defun (compacted-in-parts counts firsts parts)
+  (def slots (array-length counts))
+  (def size (quotient (+ slots (- parts 1)) parts))
+  (def in-part (computing-each parts (fun (p)
+                                       (def (Tuple from to) (part-rows p size slots))
+                                       (loop (:for s (range from to))
+                                             (:acc k (summing (if (> (array-ref counts s) 0) 1 0)))))))
+  (def starts (: (make-array parts) (Array int)))
+  (def rows
+    (let go ((p 0) (at 0))
+      (if (= p parts)
+          at
+          (begin (array-set! starts p at) (go (+ p 1) (+ at (vec-ref in-part p)))))))
+  (def out-firsts (uninitialized-ints rows #f))
+  (def out-counts (: (make-array rows) (Array long)))
+  (ignore (computing-each parts (fun (p)
+                                  (def (Tuple from to) (part-rows p size slots))
+                                  (let go ((s from) (i (array-ref starts p)))
+                                    (when (< s to)
+                                      (def c (array-ref counts s))
+                                      (if (> c 0)
+                                          (begin
+                                            (array-set! out-firsts i (array-ref firsts s))
+                                            (array-set! out-counts i (cast long c))
+                                            (go (+ s 1) (+ i 1)))
+                                          (go (+ s 1) i))))
+                                  unit)))
+  (Tuple out-firsts out-counts))
+
+;; The counts of a category's codes, which are in the order of its levels,
+;; and a null after them: no groups to find and no sort.
+(: (-> Table int AnyColumn string int Table))
+(defun (count-category t col cat name n)
+  (def levels (clr-level-count cat))
+  (def slots (if (= (any-null-count cat) 0) levels (+ levels 1)))
+  (def cells (clr-cells-of-column (as-ints (clr-codes cat))))
+  (def counts (: (make-array slots) (Array int)))
+  (def firsts (: (make-array slots #:fill int-max) (Array int)))
+  (if (and (>= n (* 2 count-part-rows)) (<= slots count-parts-limit))
+      (let ()
+        (def (Tuple parts size) (count-parts n))
+        (def each (computing-each parts (fun (p)
+                                          (def (Tuple from to) (part-rows p size n))
+                                          (code-part cells levels slots from to))))
+        (loop (:for (Tuple pc pf) each) (:do (merge-part! counts firsts pc pf))))
+      ;; On this thread, into the counts themselves.
+      (count-codes-into! cells levels counts firsts 0 n))
+  (def (Tuple out-firsts out-counts) (compacted counts firsts))
+  (def rows (array-length out-firsts))
+  (with-count (clr-take (clr-select t #[col]) out-firsts rows) name (long-column out-counts) rows))
+
+;; The counts and the first rows of the codes from `from` to `to`, a null
+;; counted as the code `levels`.
+(: (-> (ClrCells int) int int int int (Tuple (Array int) (Array int))))
+(defun (code-part cells levels slots from to)
+  (def pc (: (make-array slots) (Array int)))
+  (def pf (: (make-array slots #:fill int-max) (Array int)))
+  (count-codes-into! cells levels pc pf from to)
+  (Tuple pc pf))
+
+;; Adds the codes from `from` to `to` to the counts, and their first rows
+;; to the first rows that are int-max.
+(: (-> (ClrCells int) int (Array int) (Array int) int int Unit))
+(defun (count-codes-into! cells levels pc pf from to)
+  (if (= (clr-cells-null-count cells) 0)
+      (count-codes! (clr-cells-values cells) pc pf from to)
+      (count-codes-or-nulls! (clr-cells-values cells) (clr-cells-valid cells) levels pc pf from to)))
+
+(: (-> (RoSpan int) (Array int) (Array int) int int Unit))
+(defun (count-codes! codes pc pf from to)
+  (let go ((r from))
+    (when (< r to)
+      (def s (ro-span-ref codes r))
+      (def c (array-ref pc s))
+      (when (= c 0) (array-set! pf s r))
+      (array-set! pc s (+ c 1))
+      (go (+ r 1)))))
+
+(: (-> (RoSpan int) (RoSpan byte) int (Array int) (Array int) int int Unit))
+(defun (count-codes-or-nulls! codes valid levels pc pf from to)
+  (let go ((r from))
+    (when (< r to)
+      (def bit (bitwise-and (cast int (ro-span-ref valid (shift-right r 3))) (shift-left 1 (bitwise-and r 7))))
+      (def s (if (= bit 0) levels (ro-span-ref codes r)))
+      (def c (array-ref pc s))
+      (when (= c 0) (array-set! pf s r))
+      (array-set! pc s (+ c 1))
+      (go (+ r 1)))))
 
 ;; How many rows have each pair of values of two columns, as R's table(x, y):
 ;; a row for each value of `row-key`, and a column for each value of
@@ -1520,7 +1881,157 @@
 ;;     (table-crosstab survey "smoker" "sex")
 (: (-> Table string string (Result TableError Table)))
 (defun (table-crosstab t row-key col-key)
-  (problem-or (clr-crosstab t row-key col-key)))
+  (cond
+    ((= row-key col-key) (refuse (str "the rows and the columns are both of '" row-key "'.")))
+    (:def (Ok cols) (key-columns t [row-key col-key]) :propagate)
+    (:def (Ok idx) (column-indices t [row-key col-key]) :propagate)
+    (else (crosstab-of t (array-ref idx 0) (array-ref cols 0) (array-ref cols 1) row-key col-key))))
+
+;; The counts are kept by the column's group, then the row's: counts[c][r].
+;; Without a null they are counted in parts, from one array of each pair for
+;; each part or, with more pairs, from one that the parts add to. With a
+;; null, on this thread, leaving out each row of a key's null group, and
+;; then each group that kept no count.
+(: (-> Table int AnyColumn AnyColumn string string (Result TableError Table)))
+(defun (crosstab-of t row-idx row-col col-col row-key col-key)
+  (def n (table-row-count t))
+  (def (Tuple row-of row-firsts row-order) (clr-groups-in-order #[row-col] n))
+  (def (Tuple col-of col-firsts col-order) (clr-groups-in-order #[col-col] n))
+  (def r-count (array-length row-firsts))
+  (def c-count (array-length col-firsts))
+  (def nulls? (or (> (any-null-count row-col) 0) (> (any-null-count col-col) 0)))
+  (def counts (pair-counts row-of col-of r-count c-count n))
+  ;; A row with a null in a key is in that key's null group: its counts are
+  ;; made 0, which leaves the counts of the rows with both keys.
+  (when nulls?
+    (match (null-group row-col row-firsts)
+      ((Some rg) (loop (:for cc counts) (:do (array-set! cc rg 0L))))
+      (None unit))
+    (match (null-group col-col col-firsts)
+      ((Some cg) (array-fill! (array-ref counts cg) 0L))
+      (None unit)))
+  (def active (if nulls? (Some (active-groups counts r-count)) None))
+  (def rows (match active ((Some (Tuple ra _)) (kept row-order (fun (rg) (array-ref ra rg)))) (None row-order)))
+  (def columns (match active ((Some (Tuple _ ca)) (kept col-order (fun (cg) (array-ref ca cg)))) (None col-order)))
+  (def m (array-length rows))
+  (def row-table (clr-take (clr-select t #[row-idx]) (gathered row-firsts rows) m))
+  (def names {vecing (any->string col-col (array-ref col-firsts cg) -1) (:for cg columns)})
+  (match (repeated-name [row-key] names)
+    ((Some name)
+     (refuse (str "'" col-key "' has the value '" name "', and the table has a column of that name already.")))
+    (None
+     (def count-columns {arraying (column->any (clr-longs-at (array-ref counts cg) rows)) (:for cg columns)})
+     (def k (array-length count-columns))
+     (Ok (clr-from-fields
+          {arraying (if (= i 0)
+                        (field-at row-table 0)
+                        (clr-new-field (vec-ref names (- i 1))
+                                       (data-type (clr-data (array-ref count-columns (- i 1))))))
+                    (:for i (range 0 (+ k 1)))}
+          {arraying (if (= i 0) (clr-column row-table 0) (array-ref count-columns (- i 1)))
+                    (:for i (range 0 (+ k 1)))}
+          m)))))
+
+;; The first of the names that is the row key's or one before it.
+(: (-> (Vec string) (Vec string) (Option string)))
+(defun (repeated-name taken names)
+  (let go ((i 0) (seen (fold (fun (s m) (map-set m s #t)) (: (map-empty) (Map string bool)) taken)))
+    (cond
+      ((= i (vec-length names)) None)
+      ((map-has-key? seen (vec-ref names i)) (Some (vec-ref names i)))
+      (else (go (+ i 1) (map-set seen (vec-ref names i) #t))))))
+
+;; The elements of `order` that `keep` keeps, in their order.
+(: (-> (Array int) (-> int bool) (Array int)))
+(defun (kept order keep)
+  {arraying g (:for g order) (:when (keep g))})
+
+;; Which row groups and which column groups kept a count, in one pass.
+(: (-> (Array (Array long)) int (Tuple (Array bool) (Array bool))))
+(defun (active-groups counts r-count)
+  (def ra (: (make-array r-count) (Array bool)))
+  (def ca (: (make-array (array-length counts)) (Array bool)))
+  (let go ((c 0))
+    (when (< c (array-length counts))
+      (def cc (array-ref counts c))
+      (let each ((rg 0))
+        (when (< rg r-count)
+          (when (not (= (array-ref cc rg) 0L))
+            (array-set! ra rg #t)
+            (array-set! ca c #t))
+          (each (+ rg 1))))
+      (go (+ c 1))))
+  (Tuple ra ca))
+
+(: (-> int int (Array (Array long))))
+(defun (zero-counts r-count c-count)
+  {arraying (: (make-array r-count) (Array long)) (:for _c (range 0 c-count))})
+
+(: (-> (Array int) (Array int) int int int (Array (Array long))))
+(defun (pair-counts row-of col-of r-count c-count n)
+  (def counts (zero-counts r-count c-count))
+  (def pairs (* (cast long c-count) (cast long r-count)))
+  (cond
+    ((and (>= n (* 2 count-part-rows)) (<= pairs (cast long count-parts-limit)))
+     (def (Tuple parts size) (count-parts n))
+     (def each (computing-each parts (fun (p)
+                                       (def (Tuple from to) (part-rows p size n))
+                                       (pair-part row-of col-of r-count (* c-count r-count) from to))))
+     (loop (:for pc each) (:do (add-pairs! counts pc r-count)))
+     counts)
+    ((and (>= n (* 2 count-part-rows)) (<= pairs clr-dense-limit))
+     (def (Tuple parts size) (count-parts n))
+     (def flat (: (make-array (* c-count r-count)) (Array int)))
+     (ignore (computing-each parts (fun (p)
+                                     (def (Tuple from to) (part-rows p size n))
+                                     (pair-part-atomic! flat row-of col-of r-count from to)
+                                     unit)))
+     (add-pairs! counts flat r-count)
+     counts)
+    (else
+     (let go ((r 0))
+       (when (< r n)
+         (def cc (array-ref counts (array-ref col-of r)))
+         (def rg (array-ref row-of r))
+         (array-set! cc rg (+ (array-ref cc rg) 1L))
+         (go (+ r 1))))
+     counts)))
+
+;; The count of each pair from `from` to `to`, at column times rows plus row.
+(: (-> (Array int) (Array int) int int int int (Array int)))
+(defun (pair-part row-of col-of r-count pairs from to)
+  (def pc (: (make-array pairs) (Array int)))
+  (let go ((r from))
+    (when (< r to)
+      (def s (+ (* (array-ref col-of r) r-count) (array-ref row-of r)))
+      (array-set! pc s (+ (array-ref pc s) 1))
+      (go (+ r 1))))
+  pc)
+
+(: (-> (Array int) (Array int) (Array int) int int int Unit))
+(defun (pair-part-atomic! flat row-of col-of r-count from to)
+  (let go ((r from))
+    (when (< r to)
+      (ignore (atomic-array-increment! flat (+ (* (array-ref col-of r) r-count) (array-ref row-of r))))
+      (go (+ r 1)))))
+
+(: (-> (Array (Array long)) (Array int) int Unit))
+(defun (add-pairs! counts flat r-count)
+  (let go ((c 0))
+    (when (< c (array-length counts))
+      (def cc (array-ref counts c))
+      (def base (* c r-count))
+      (let add ((rg 0))
+        (when (< rg r-count)
+          (array-set! cc rg (+ (array-ref cc rg) (cast long (array-ref flat (+ base rg)))))
+          (add (+ rg 1))))
+      (go (+ c 1)))))
+
+;; The group of a key's nulls, the one whose first row is a null; None when
+;; the key has none.
+(: (-> AnyColumn (Array int) (Option int)))
+(defun (null-group col firsts)
+  (find (fun (g) (not (clr-any-valid? col (array-ref firsts g)))) (range 0 (array-length firsts))))
 
 ;; ===========================================================================
 ;; Categories

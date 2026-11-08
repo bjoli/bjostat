@@ -245,7 +245,10 @@
   (println (str "crosstab rows: " (int->string (table-row-count (ok (table-crosstab t "region" "qty"))))))
   0)
 
-(: int)
-(def _printed (print-results))
-
-(run-benches)
+;; The results first, then the benchmarks: in main, not in a definition of
+;; the module, whose initialiser may not wait for the compute threads while
+;; they run this module's code.
+(: (-> (Vec string) int))
+(defun (main args)
+  (ignore (print-results))
+  (run-registered-benches (current-module) args))

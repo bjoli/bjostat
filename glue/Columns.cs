@@ -12,6 +12,7 @@
 // the aggregates skip them by the validity bitmap, here, in one loop.
 
 using System.Globalization;
+using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
@@ -101,7 +102,10 @@ public static partial class Columns
     public static PrimitiveArray<T> FromArray<T>(T[] values, bool[] valid) where T : struct, IEquatable<T>
     {
         CheckValid(values.Length, valid);
-        var data = new ArrowBuffer.Builder<T>(values.Length).AppendRange(values).Build();
+        // One copy of the values' bytes. ArrowBuffer.Builder's AppendRange
+        // enumerates them one at a time, which was 2.6-4.4 ms of 600 000
+        // longs where this is a block copy.
+        var data = new ArrowBuffer(MemoryMarshal.AsBytes(values.AsSpan()).ToArray());
         var bitmap = ArrowBuffer.Empty;
         int nulls = 0;
 
@@ -117,6 +121,19 @@ public static partial class Columns
         }
 
         var arrayData = new ArrayData(ArrowTypeOf<T>(), values.Length, nulls, 0, new[] { bitmap, data });
+        return (PrimitiveArray<T>)ArrowArrayFactory.BuildArray(arrayData);
+    }
+
+    /// <summary>
+    /// A column of values[at[i]] for each i, with no nulls: one pass, into
+    /// the column's buffer.
+    /// </summary>
+    public static PrimitiveArray<T> FromArrayAt<T>(T[] values, int[] at) where T : struct, IEquatable<T>
+    {
+        var bytes = GC.AllocateUninitializedArray<byte>(at.Length * System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
+        var span = MemoryMarshal.Cast<byte, T>(bytes.AsSpan());
+        for (int i = 0; i < at.Length; i++) span[i] = values[at[i]];
+        var arrayData = new ArrayData(ArrowTypeOf<T>(), at.Length, 0, 0, new[] { ArrowBuffer.Empty, new ArrowBuffer(bytes) });
         return (PrimitiveArray<T>)ArrowArrayFactory.BuildArray(arrayData);
     }
 
