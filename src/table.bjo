@@ -97,7 +97,11 @@
   (AnyColumn (: Apache.Arrow.IArrowArray))
   ((Column %a) (: Apache.Arrow.PrimitiveArray))
   (StringColumn (: Apache.Arrow.StringArray))
-  ((ClrCells %a) (: Bjostat.Cells)))
+  ((ClrCells %a) (: Bjostat.Cells))
+  (ArrowType (: Apache.Arrow.Types.IArrowType))
+  (Schema (: Apache.Arrow.Schema))
+  (Field (: Apache.Arrow.Field))
+  (ArrayData (: Apache.Arrow.ArrayData)))
 
 (import/extern
   ;; Any column
@@ -185,12 +189,33 @@
   (clr-join (: Bjostat.Joins.Join (-> Table Table (Array string) int Table)))
   (clr-key-problem (: Bjostat.Joins.KeyProblem (-> Table Table (Array string) string)))
 
-  ;; Reshaping. A TableProblem is a table the arguments cannot make.
-  (clr-distinct (: Bjostat.Reshape.Distinct (-> Table (Array string) Table) #:exceptions (Bjostat.TableProblem)))
-  (clr-append (: Bjostat.Reshape.Append (-> (Array Table) Table) #:exceptions (Bjostat.TableProblem)))
-  (clr-pivot-longer (: Bjostat.Reshape.PivotLonger (-> Table (Array string) string string Table)
-                       #:exceptions (Bjostat.TableProblem)))
-  (clr-pivot-wider (: Bjostat.Reshape.PivotWider (-> Table string string Table) #:exceptions (Bjostat.TableProblem)))
+  ;; Reshaping: the kernels of glue/Reshape.cs and glue/Join.cs.
+  (clr-firsts (: Bjostat.ReshapeOps.Firsts (-> (Array AnyColumn) int (Array int))))
+  (clr-groups (: Bjostat.ReshapeOps.Groups (-> (Array AnyColumn) int (out (Array int)) (Tuple (Array int) (Array int)))))
+  (clr-string-ids (: Bjostat.ReshapeOps.StringIds (-> StringColumn (out (Array int)) (Tuple (Array int) (Array int)))))
+  (clr-concat (: Bjostat.ReshapeOps.Concat (-> (Array AnyColumn) ArrowType AnyColumn)))
+  (clr-interleavable? (: Bjostat.Reshape.Interleavable (-> ArrowType bool)))
+  (clr-interleaved (: Bjostat.Reshape.Interleaved (-> (Array AnyColumn) int AnyColumn)))
+  (clr-repeated (: Bjostat.Reshape.Repeated (-> (Array string) int AnyColumn)))
+  (clr-select (: Bjostat.Reshape.Select (-> Table (Array int) Table)))
+  (clr-take (: Bjostat.Query.Take (-> Table (Array int) int Table)))
+  (clr-take-or-null (: Bjostat.Joins.TakeOrNull (-> Table (Array int) (Array AnyColumn))))
+  (clr-nulls (: Bjostat.Joins.Nulls (-> ArrowType int AnyColumn)))
+  (clr-key-type? (: Bjostat.Joins.KeyType (-> ArrowType bool)))
+  (clr-same-type? (: Bjostat.Joins.SameType (-> ArrowType ArrowType bool)))
+  (clr-arrow-name (: Bjostat.ColumnTypes.ArrowName (-> ArrowType string)))
+  (clr-from-fields (: Bjostat.Tables.FromFields (-> (Array Field) (Array AnyColumn) int Table)))
+  (clr-new-field (: Bjostat.Tables.NewField (-> string ArrowType Field)))
+  (clr-any-valid? (: Bjostat.Columns.IsValid (-> AnyColumn int bool)))
+  (clr-schema (: Apache.Arrow.RecordBatch.Schema (-> Table Schema) #:get))
+  (schema-field (: Apache.Arrow.Schema.GetFieldByIndex (-> Schema int Field)))
+  (field-name (: Apache.Arrow.Field.Name (-> Field string) #:get))
+  (field-type (: Apache.Arrow.Field.DataType (-> Field ArrowType) #:get))
+  (clr-string-type (: Apache.Arrow.Types.StringType.Default #:get))
+  (clr-data (: Apache.Arrow.IArrowArray.Data (-> AnyColumn ArrayData) #:get))
+  (data-type (: Apache.Arrow.ArrayData.DataType (-> ArrayData ArrowType) #:get))
+
+  ;; A TableProblem is a table the arguments cannot make.
   (clr-count (: Bjostat.Counts.Count (-> Table (Array string) string Table) #:exceptions (Bjostat.TableProblem)))
   (clr-crosstab (: Bjostat.Counts.Crosstab (-> Table string string Table) #:exceptions (Bjostat.TableProblem)))
   (clr-categorize (: Bjostat.Categories.Categorize (-> Table string (Array string) Table)
@@ -1122,6 +1147,78 @@
     ((Ok t) (Ok t))
     ((Err e) (refuse (.-Message e)))))
 
+;; ---------------------------------------------------------------------------
+;; What the reshaping shares
+;; ---------------------------------------------------------------------------
+;;
+;; The reshaping is Bjolang over the kernels of glue/Reshape.cs and
+;; glue/Join.cs: the groups of equal keys, the copies of columns and the
+;; takes of rows.
+
+(: (-> Table int Field))
+(defun (field-at t i) (schema-field (clr-schema t) i))
+
+(: (-> Table int ArrowType))
+(defun (type-at t i) (field-type (field-at t i)))
+
+(: (-> AnyColumn ArrowType))
+(defun (any-type c) (data-type (clr-data c)))
+
+;; The index of the column `name`, or an Err that names the columns.
+(: (-> Table string (Result TableError int)))
+(defun (column-index t name)
+  (def i (clr-index-of t name))
+  (if (< i 0)
+      (refuse (str "the table has no column '" name "'. Its columns are: "
+                   (string-join (table-names t) ", ") "."))
+      (Ok i)))
+
+;; Whether a name comes twice.
+(: (-> (Vec string) bool))
+(defun (repeats? names)
+  (let go ((i 0) (seen (: (map-empty) (Map string bool))))
+    (cond
+      ((= i (vec-length names)) #f)
+      ((map-has-key? seen (vec-ref names i)) #t)
+      (else (go (+ i 1) (map-set seen (vec-ref names i) #t))))))
+
+;; The index of each column, in order, or an Err for the first that is not
+;; there.
+(: (-> Table (Vec string) (Result TableError (Array int))))
+(defun (column-indices t names)
+  (def out (: (make-array (vec-length names)) (Array int)))
+  (let go ((i 0))
+    (if (= i (vec-length names))
+        (Ok out)
+        (match (column-index t (vec-ref names i))
+          ((Err e) (Err e))
+          ((Ok c)
+           (array-set! out i c)
+           (go (+ i 1)))))))
+
+;; The columns of the names, or an Err for a name given twice, a name the
+;; table does not have, or a column that cannot be a key.
+(: (-> Table (Vec string) (Result TableError (Array AnyColumn))))
+(defun (key-columns t names)
+  (def out (: (make-array (vec-length names)) (Array AnyColumn)))
+  (if (repeats? names)
+      (refuse "a key is named twice.")
+      (let go ((i 0))
+        (cond
+          ((= i (vec-length names)) (Ok out))
+          (:def name (vec-ref names i))
+          (:def (Ok c) (column-index t name) :propagate)
+          (:def type (type-at t c))
+          ((not (clr-key-type? type))
+           (refuse (str "'" name "' is a column of " (clr-arrow-name type) ", which cannot be a key.")))
+          (else
+           (array-set! out i (clr-column t c))
+           (go (+ i 1)))))))
+
+;; ---------------------------------------------------------------------------
+;; Distinct and append
+;; ---------------------------------------------------------------------------
+
 ;; The first row of each distinct value of the columns `#:by`, in the order
 ;; of the rows, with all the columns, as dplyr's distinct with .keep_all.
 ;; With no `#:by`, all the columns are the key, and the result has no row
@@ -1130,15 +1227,64 @@
 ;;     (table-distinct sales #:by ["customer"])
 (: (-> Table (#:by (Vec string)) (Result TableError Table)))
 (defun (table-distinct t #:by [])
-  (problem-or (clr-distinct t (vec->array by))))
+  (def (Ok keys) (key-columns t (if (vec-empty? by) (table-names t) by)) :propagate)
+  (def firsts (clr-firsts keys (table-row-count t)))
+  (Ok (if (= (array-length firsts) (table-row-count t))
+          t
+          (clr-take t firsts (array-length firsts)))))
 
 ;; The rows of the tables, one table after the other, as dplyr's bind_rows.
 ;; Columns are matched by name: the columns are those of the first table, then
 ;; those that each next table adds, and a table without a column has nulls in
-;; it. An Err for a name with columns of two types.
+;; it. An Err for a name with columns of two types. Each column is made as a
+;; part on (std parallel)'s compute threads.
 (: (-> (Vec Table) (Result TableError Table)))
 (defun (table-append tables)
-  (problem-or (clr-append (vec->array tables))))
+  (def (Ok fields) (appended-fields tables) :propagate)
+  (def rows (loop (:for t tables) (:acc n (folding 0 (+ n (table-row-count t))))))
+  (def filled (vec-filter (fun (t) (> (table-row-count t) 0)) tables))
+  (def columns (computing-each (vec-length fields) (fun (c) (appended-column filled (vec-ref fields c)))))
+  (Ok (clr-from-fields (vec->array fields) (vec->array columns) rows)))
+
+;; A field of each name, of the type of its first column, in the order the
+;; names first come.
+(: (-> (Vec Table) (Result TableError (Vec Field))))
+(defun (appended-fields tables)
+  (let go ((k 0) (i 0) (fields (: [] (Vec Field))) (index (: (map-empty) (Map string int))))
+    (cond
+      ((= k (vec-length tables)) (Ok fields))
+      (:def t (vec-ref tables k))
+      ((= i (table-column-count t)) (go (+ k 1) 0 fields index))
+      (:def f (field-at t i))
+      (:def name (field-name f))
+      (else
+       (match (map-try-ref index name)
+         (None
+          (go k (+ i 1) (vec-add fields (clr-new-field name (field-type f))) (map-set index name (vec-length fields))))
+         ((Some j)
+          (def first (field-type (vec-ref fields j)))
+          (if (clr-same-type? first (field-type f))
+              (go k (+ i 1) fields index)
+              (refuse (str "'" name "' is a column of " (clr-arrow-name first) " in one table and of "
+                           (clr-arrow-name (field-type f)) " in another.")))))))))
+
+;; The column of the field: the column of its name of each table, or nulls
+;; for a table without one.
+(: (-> (Vec Table) Field AnyColumn))
+(defun (appended-column tables f)
+  (def type (field-type f))
+  (def pieces
+    {arraying (let ((i (clr-index-of t (field-name f))))
+                (if (< i 0) (clr-nulls type (table-row-count t)) (clr-column t i)))
+              (:for t tables)})
+  (match (array-length pieces)
+    (0 (clr-nulls type 0))
+    (1 (array-ref pieces 0))
+    (_ (clr-concat pieces type))))
+
+;; ---------------------------------------------------------------------------
+;; Pivots
+;; ---------------------------------------------------------------------------
 
 ;; Columns to rows, as tidyr's pivot_longer: each row becomes one row for each
 ;; of the columns `cols`, with the column's name in `#:names-to` and its value
@@ -1149,7 +1295,90 @@
 ;;     (pivot-longer t ["2024" "2025"] #:names-to "year" #:values-to "sales")
 (: (-> Table (Vec string) (#:names-to string) (#:values-to string) (Result TableError Table)))
 (defun (pivot-longer t cols #:names-to "name" #:values-to "value")
-  (problem-or (clr-pivot-longer t (vec->array cols) names-to values-to)))
+  (cond
+    ((vec-empty? cols) (refuse "pivot-longer needs at least one column."))
+    ((repeats? cols) (refuse "a column is named twice."))
+    (:def (Ok idx) (column-indices t cols) :propagate)
+    (:def type (type-at t (array-ref idx 0)))
+    (else
+     (match (find (fun (c) (not (clr-same-type? type (type-at t c)))) idx)
+       ((Some c)
+        (refuse (str "'" (vec-ref cols 0) "' is a column of " (clr-arrow-name type) " and '"
+                     (field-name (field-at t c)) "' of " (clr-arrow-name (type-at t c))
+                     ": the values of one column have to be of one type.")))
+       (None (longer-checked t cols idx type names-to values-to))))))
+
+(: (-> Table (Vec string) (Array int) ArrowType string string (Result TableError Table)))
+(defun (longer-checked t cols idx type names-to values-to)
+  (def kept {arraying i (:for i (range 0 (table-column-count t))) (:when (not (any? (fun (c) (= c i)) idx)))})
+  (def kept-names {vecing (field-name (field-at t i)) (:for i kept)})
+  (def n (table-row-count t))
+  (def k (array-length idx))
+  (cond
+    ((= names-to values-to) (refuse (str "the names and the values are both to go in '" names-to "'.")))
+    ((any? (fun (s) (= s names-to)) kept-names) (refuse (str "the table has a column '" names-to "' already.")))
+    ((any? (fun (s) (= s values-to)) kept-names) (refuse (str "the table has a column '" values-to "' already.")))
+    ((> (* (cast long n) (cast long k)) 2147483647L)
+     (refuse (str (int->string n) " rows of " (int->string k) " columns are too many rows.")))
+    (else (Ok (longer t cols idx kept type names-to values-to n k)))))
+
+;; The rows a pivot to longer takes, at i k + j for row i of `n` and column j
+;; of `k`: i, for a kept column.
+(: (-> int int (Array int)))
+(defun (kept-row-numbers n k)
+  (def rows (: (make-array (* n k)) (Array int)))
+  (loop (:for i (range 0 n))
+        (:do (loop (:for j (range 0 k))
+                   (:do (array-set! rows (+ (* i k) j) i)))))
+  rows)
+
+;; j n + i, for the values of the columns one after the other.
+(: (-> int int (Array int)))
+(defun (value-row-numbers n k)
+  (def rows (: (make-array (* n k)) (Array int)))
+  (loop (:for i (range 0 n))
+        (:do (loop (:for j (range 0 k))
+                   (:do (array-set! rows (+ (* i k) j) (+ (* j n) i))))))
+  rows)
+
+;; Row i, column j of the result is at i k + j. A column of numbers, dates or
+;; timestamps is interleaved directly; another is taken through the rows,
+;; which are made only when a column needs them.
+(: (-> Table (Vec string) (Array int) (Array int) ArrowType string string int int Table))
+(defun (longer t cols idx kept type names-to values-to n k)
+  (def m (* n k))
+  (def nk (array-length kept))
+  (def kept-rows
+    (if (any? (fun (c) (not (clr-interleavable? (any-type (clr-column t c))))) kept)
+        (kept-row-numbers n k)
+        (: (make-array 0) (Array int))))
+  (def kept-columns
+    {arraying (let ((a (clr-column t c)))
+                (if (clr-interleavable? (any-type a))
+                    (clr-interleaved (make-array k #:fill a) n)
+                    (clr-column (clr-take (clr-select t #[c]) kept-rows m) 0)))
+              (:for c kept)})
+  (def values
+    (if (clr-interleavable? type)
+        (clr-interleaved {arraying (clr-column t c) (:for c idx)} n)
+        (let* ((rows (value-row-numbers n k))
+               (whole (if (= k 1)
+                          (clr-column t (array-ref idx 0))
+                          (clr-concat {arraying (clr-column t c) (:for c idx)} type)))
+               (one (clr-from-fields #[(clr-new-field values-to type)] #[whole] (any-length whole))))
+          (clr-column (clr-take one rows m) 0))))
+  (clr-from-fields
+   {arraying (cond
+               ((< i nk) (field-at t (array-ref kept i)))
+               ((= i nk) (clr-new-field names-to clr-string-type))
+               (else (clr-new-field values-to type)))
+             (:for i (range 0 (+ nk 2)))}
+   {arraying (cond
+               ((< i nk) (array-ref kept-columns i))
+               ((= i nk) (clr-repeated (vec->array cols) n))
+               (else values))
+             (:for i (range 0 (+ nk 2)))}
+   m))
 
 ;; Rows to columns, as tidyr's pivot_wider: a column for each distinct string
 ;; of `#:names-from`, in the order they first come, with the values of
@@ -1162,7 +1391,104 @@
 ;;     (pivot-wider t #:names-from "year" #:values-from "sales")
 (: (-> Table (#:names-from string) (#:values-from string) (Result TableError Table)))
 (defun (pivot-wider t #:names-from "name" #:values-from "value")
-  (problem-or (clr-pivot-wider t names-from values-from)))
+  (cond
+    ((= names-from values-from) (refuse (str "the names and the values are both from '" names-from "'.")))
+    (:def (Ok nc) (column-index t names-from) :propagate)
+    (:def (Ok vc) (column-index t values-from) :propagate)
+    (:def name-col (clr-column t nc))
+    (:def strings? (= (clr-type-name name-col) "String"))
+    ((not (or strings? (= (clr-type-name name-col) "Category")))
+     (refuse (str "'" names-from "' is a column of " (clr-arrow-name (type-at t nc))
+                  "; the names of columns have to be strings.")))
+    (:def ids {arraying i (:for i (range 0 (table-column-count t))) (:when (not (or (= i nc) (= i vc))))})
+    (else
+     (match (find (fun (i) (not (clr-key-type? (type-at t i)))) ids)
+       ((Some i)
+        (refuse (str "'" (field-name (field-at t i)) "' is a column of " (clr-arrow-name (type-at t i))
+                     ", which cannot be a key.")))
+       (None (wider t names-from vc name-col strings? ids))))))
+
+(: (-> Table string int AnyColumn bool (Array int) (Result TableError Table)))
+(defun (wider t names-from vc name-col strings? ids)
+  (def n (table-row-count t))
+  (def (Tuple group-of firsts) (clr-groups {arraying (clr-column t i) (:for i ids)} n))
+  (def rows (array-length firsts))
+  (def (Ok (Tuple col-of new-names)) (name-columns names-from name-col strings? n) :propagate)
+  (def (Ok cells) (cell-rows names-from group-of col-of new-names rows n) :propagate)
+  (def id-names {vecing (field-name (field-at t i)) (:for i ids)})
+  (match (find (fun (s) (any? (fun (x) (= x s)) id-names)) new-names)
+    ((Some name) (refuse (str "the table has a column '" name "' already.")))
+    (None
+     (def id-table (clr-take (clr-select t ids) firsts rows))
+     (def value-table (clr-select t #[vc]))
+     (def type (type-at t vc))
+     (def nids (array-length ids))
+     (def count (+ nids (array-length new-names)))
+     (Ok (clr-from-fields
+          {arraying (if (< i nids)
+                        (field-at id-table i)
+                        (clr-new-field (array-ref new-names (- i nids)) type))
+                    (:for i (range 0 count))}
+          {arraying (if (< i nids)
+                        (clr-column id-table i)
+                        (array-ref (clr-take-or-null value-table (array-ref cells (- i nids))) 0))
+                    (:for i (range 0 count))}
+          rows)))))
+
+;; The new column of each row, and the name of each new column, in the order
+;; the names first come. An Err for a null, since a column needs a name.
+(: (-> string AnyColumn bool int (Result TableError (Tuple (Array int) (Array string)))))
+(defun (name-columns names-from name-col strings? n)
+  (cond
+    ((> (any-null-count name-col) 0)
+     (def r (let go ((r 0)) (if (clr-any-valid? name-col r) (go (+ r 1)) r)))
+     (refuse (str "'" names-from "' has a null in row " (int->string r) ", and a column needs a name.")))
+    (strings?
+     (def s (as-strings name-col))
+     (def (Tuple col-of firsts) (clr-string-ids s))
+     (Ok (Tuple col-of {arraying (match (string-column-ref s r) ((Some x) x) (None ""))
+                                 (:for r firsts)})))
+    (else (Ok (category-columns (column-values (as-ints (clr-codes name-col))) (clr-levels name-col) n)))))
+
+;; Of a category: a new column for each code, in the order the codes first
+;; come.
+(: (-> (RoSpan int) (Array string) int (Tuple (Array int) (Array string))))
+(defun (category-columns codes levels n)
+  (def code-to-col (make-array (array-length levels) #:fill -1))
+  (def col-of (: (make-array n) (Array int)))
+  (let go ((r 0) (names (: [] (Vec string))))
+    (if (= r n)
+        (Tuple col-of (vec->array names))
+        (let* ((code (ro-span-ref codes r))
+               (c (array-ref code-to-col code)))
+          (if (< c 0)
+              (begin
+                (array-set! code-to-col code (vec-length names))
+                (array-set! col-of r (vec-length names))
+                (go (+ r 1) (vec-add names (array-ref levels code))))
+              (begin
+                (array-set! col-of r c)
+                (go (+ r 1) names)))))))
+
+;; The row of each cell of each new column, -1 where no row gives one. An Err
+;; for two rows of one cell.
+(: (-> string (Array int) (Array int) (Array string) int int (Result TableError (Array (Array int)))))
+(defun (cell-rows names-from group-of col-of new-names rows n)
+  (def cells {arraying (make-array rows #:fill -1) (:for _c (range 0 (array-length new-names)))})
+  (let go ((r 0))
+    (if (= r n)
+        (Ok cells)
+        (let* ((c (array-ref col-of r))
+               (column (array-ref cells c))
+               (g (array-ref group-of r))
+               (cell (array-ref column g)))
+          (if (>= cell 0)
+              (refuse (str "rows " (int->string cell) " and " (int->string r)
+                           " have the same values in the other columns, and both '"
+                           (array-ref new-names c) "' in '" names-from "': a cell holds one value."))
+              (begin
+                (array-set! column g r)
+                (go (+ r 1))))))))
 
 ;; ===========================================================================
 ;; Counts

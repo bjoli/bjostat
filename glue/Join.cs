@@ -437,13 +437,13 @@ public static class Joins
         return "";
     }
 
-    internal static bool KeyType(IArrowType t) =>
+    public static bool KeyType(IArrowType t) =>
         t is DoubleType or FloatType or Int64Type or Int32Type or Int16Type or UInt8Type
             or UInt16Type or UInt32Type or UInt64Type
             or StringType or BooleanType or Date32Type or TimestampType
         || Categories.IsType(t);
 
-    internal static bool SameType(IArrowType a, IArrowType b) =>
+    public static bool SameType(IArrowType a, IArrowType b) =>
         a.TypeId == b.TypeId
         && (a is not TimestampType ta || b is TimestampType tb && ta.Unit == tb.Unit && ta.Timezone == tb.Timezone)
         && (a is not DictionaryType || Categories.IsType(a) && Categories.IsType(b));
@@ -565,7 +565,7 @@ public static class Joins
         (i, j) => x.Values[i] == y.Values[j];
 
     // The columns of `t` at the rows; a row of -1 is a null in each column.
-    internal static IArrowArray[] TakeOrNull(RecordBatch t, int[] rows)
+    public static IArrowArray[] TakeOrNull(RecordBatch t, int[] rows)
     {
         int n = rows.Length;
         bool missing = false;
@@ -618,7 +618,7 @@ public static class Joins
     }
 
     // A column of n nulls of the type.
-    internal static IArrowArray Nulls(IArrowType type, int n)
+    public static IArrowArray Nulls(IArrowType type, int n)
     {
         if (Categories.IsType(type)) return Categories.Nulls(n);
         var bits = new ArrowBuffer(new byte[(n + 7) / 8]);

@@ -218,6 +218,17 @@ public static class Tables
         return new RecordBatch(schema.Build(), columns, length);
     }
 
+    /// <summary>A table of the columns under the fields, which keep their nullability and metadata.</summary>
+    public static RecordBatch FromFields(Field[] fields, IArrowArray[] columns, int length)
+    {
+        var schema = new Schema.Builder();
+        foreach (var f in fields) schema.Field(f);
+        return new RecordBatch(schema.Build(), columns, length);
+    }
+
+    /// <summary>A field of the name and type that can hold nulls.</summary>
+    public static Field NewField(string name, IArrowType type) => new(name, type, true);
+
     public static string[] Names(RecordBatch t) => t.Schema.FieldsList.Select(f => f.Name).ToArray();
 
     public static int ColumnCount(RecordBatch t) => t.ColumnCount;

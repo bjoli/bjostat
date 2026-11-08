@@ -622,270 +622,6 @@ public static class Reshape
     internal static string TypeText(IArrowType t) => ColumnTypes.ArrowName(t);
 
     // ---------------------------------------------------------------------
-    // Distinct
-
-    /// <summary>
-    /// The first row of each distinct value of the key columns, in the order
-    /// of the rows, with all columns. With no key names, all columns are the
-    /// key.
-    /// </summary>
-    public static RecordBatch Distinct(RecordBatch t, string[] keys)
-    {
-        var names = keys.Length == 0 ? t.Schema.FieldsList.Select(f => f.Name).ToArray() : keys;
-        var columns = KeyColumns(t, names).Select(t.Column).ToArray();
-        Groups(columns, t.Length, out var firsts, out _, false, needGroupIds: false);
-        if (firsts.Count == t.Length) return t;
-        return Query.Take(t, firsts.ToArray(), firsts.Count);
-    }
-
-    // ---------------------------------------------------------------------
-    // Append
-
-    /// <summary>
-    /// The rows of the tables, one table after the other, as dplyr's
-    /// bind_rows. A column is matched by its name: the columns are those of
-    /// the first table, then the new ones of each next table, and a table
-    /// without a column has nulls in it. A column of one name has to have one
-    /// type in all the tables.
-    /// </summary>
-    public static RecordBatch Append(RecordBatch[] tables)
-    {
-        var fields = new List<Field>();
-        var index = new Dictionary<string, int>();
-        foreach (var t in tables)
-            foreach (var f in t.Schema.FieldsList)
-            {
-                if (!index.TryGetValue(f.Name, out int i))
-                {
-                    index[f.Name] = fields.Count;
-                    fields.Add(new Field(f.Name, f.DataType, true));
-                }
-                else if (!Joins.SameType(fields[i].DataType, f.DataType))
-                    throw new TableProblem($"'{f.Name}' is a column of {TypeText(fields[i].DataType)} in one table "
-                                           + $"and of {TypeText(f.DataType)} in another.");
-            }
-
-        int n = tables.Sum(t => t.Length);
-        // A column on each worker.
-        var columns = new IArrowArray[fields.Count];
-        Workers.For(fields.Count, c =>
-        {
-            var f = fields[c];
-            var pieces = tables
-                .Where(t => t.Length > 0)
-                .Select(t =>
-                {
-                    int i = t.Schema.GetFieldIndex(f.Name);
-                    return i < 0 ? Joins.Nulls(f.DataType, t.Length) : t.Column(i);
-                })
-                .ToList();
-            columns[c] = pieces.Count switch
-            {
-                0 => Joins.Nulls(f.DataType, 0),
-                1 => pieces[0],
-                _ => Concat(pieces, f.DataType),
-            };
-        });
-        var schema = new Schema.Builder();
-        foreach (var f in fields) schema.Field(f);
-        return new RecordBatch(schema.Build(), columns, n);
-    }
-
-    // ---------------------------------------------------------------------
-    // Pivots
-
-    /// <summary>
-    /// Columns to rows, as tidyr's pivot_longer: each row becomes one row for
-    /// each of the columns <paramref name="names"/>, with the column's name
-    /// under <paramref name="namesTo"/> and its value under
-    /// <paramref name="valuesTo"/>. The other columns are repeated. The
-    /// columns have to be of one type; a null stays a null.
-    /// </summary>
-    public static RecordBatch PivotLonger(RecordBatch t, string[] names, string namesTo, string valuesTo)
-    {
-        if (names.Length == 0) throw new TableProblem("pivot-longer needs at least one column.");
-        if (names.Distinct().Count() != names.Length) throw new TableProblem("a column is named twice.");
-        var cols = names.Select(name => Column(t, name)).ToArray();
-        var type = t.Schema.GetFieldByIndex(cols[0]).DataType;
-        foreach (int c in cols)
-        {
-            var other = t.Schema.GetFieldByIndex(c).DataType;
-            if (!Joins.SameType(type, other))
-                throw new TableProblem($"'{names[0]}' is a column of {TypeText(type)} and "
-                                       + $"'{t.Schema.GetFieldByIndex(c).Name}' of {TypeText(other)}: "
-                                       + "the values of one column have to be of one type.");
-        }
-        var moved = new HashSet<int>(cols);
-        var kept = Enumerable.Range(0, t.ColumnCount).Where(i => !moved.Contains(i)).ToArray();
-        var keptNames = kept.Select(i => t.Schema.GetFieldByIndex(i).Name).ToHashSet();
-        if (namesTo == valuesTo) throw new TableProblem($"the names and the values are both to go in '{namesTo}'.");
-        foreach (var name in new[] { namesTo, valuesTo })
-            if (keptNames.Contains(name)) throw new TableProblem($"the table has a column '{name}' already.");
-
-        int n = t.Length, k = cols.Length;
-        long total = (long)n * k;
-        if (total > int.MaxValue) throw new TableProblem($"{n} rows of {k} columns are too many rows.");
-        int m = (int)total;
-        // Row i, column j of the result is at i * k + j: the kept cells of
-        // row i, and the cell of column j. A column of numbers is copied to
-        // those rows directly (Interleaved); another is taken through the
-        // rows, which are made only then.
-        int[]? keptRowsMade = null;
-        int[] KeptRows()
-        {
-            if (keptRowsMade != null) return keptRowsMade;
-            var rows = new int[m];
-            for (int i = 0, at = 0; i < n; i++)
-                for (int j = 0; j < k; j++) rows[at++] = i;
-            return keptRowsMade = rows;
-        }
-
-        var fields = new List<Field>();
-        var columns = new List<IArrowArray>();
-        foreach (int c in kept)
-        {
-            var a = t.Column(c);
-            fields.Add(t.Schema.GetFieldByIndex(c));
-            columns.Add(Interleavable(a.Data.DataType)
-                ? Interleaved(Enumerable.Repeat(a, k).ToArray(), n)
-                : Query.Take(Select(t, new[] { c }), KeptRows(), m).Column(0));
-        }
-
-        fields.Add(new Field(namesTo, StringType.Default, true));
-        columns.Add(Repeated(names, n));
-
-        fields.Add(new Field(valuesTo, type, true));
-        if (Interleavable(type))
-            columns.Add(Interleaved(cols.Select(t.Column).ToArray(), n));
-        else
-        {
-            var valueRows = new int[m];
-            for (int i = 0, at = 0; i < n; i++)
-                for (int j = 0; j < k; j++) valueRows[at++] = j * n + i;
-            var values = k == 1 ? t.Column(cols[0]) : Concat(cols.Select(t.Column).ToList(), type);
-            var valueTable = new RecordBatch(new Schema.Builder().Field(new Field(valuesTo, type, true)).Build(),
-                                             new[] { values }, values.Length);
-            columns.Add(Query.Take(valueTable, valueRows, m).Column(0));
-        }
-
-        var schema = new Schema.Builder();
-        foreach (var f in fields) schema.Field(f);
-        return new RecordBatch(schema.Build(), columns, m);
-    }
-
-    /// <summary>
-    /// Rows to columns, as tidyr's pivot_wider: one row for each distinct
-    /// value of the other columns, in the order of their first rows, and one
-    /// column for each distinct string of <paramref name="namesFrom"/>, in
-    /// the order they first come, with the values of
-    /// <paramref name="valuesFrom"/>. A cell that no row gives is a null. Two
-    /// rows of the same id and name are a TableProblem, since a cell holds one
-    /// value.
-    /// </summary>
-    public static RecordBatch PivotWider(RecordBatch t, string namesFrom, string valuesFrom)
-    {
-        if (namesFrom == valuesFrom) throw new TableProblem($"the names and the values are both from '{namesFrom}'.");
-        int nc = Column(t, namesFrom), vc = Column(t, valuesFrom);
-        var nameCol = t.Column(nc);
-        if (nameCol is not StringArray && !Categories.Is(nameCol))
-            throw new TableProblem($"'{namesFrom}' is a column of {TypeText(t.Schema.GetFieldByIndex(nc).DataType)}; "
-                                   + "the names of columns have to be strings.");
-        var ids = Enumerable.Range(0, t.ColumnCount).Where(i => i != nc && i != vc).ToArray();
-        foreach (int i in ids)
-        {
-            var f = t.Schema.GetFieldByIndex(i);
-            if (!Joins.KeyType(f.DataType))
-                throw new TableProblem($"'{f.Name}' is a column of {TypeText(f.DataType)}, which cannot be a key.");
-        }
-
-        int n = t.Length;
-        var groupOf = Groups(ids.Select(t.Column).ToArray(), n, out var firsts);
-        int rows = firsts.Count;
-
-        // Each distinct name becomes a new column, in the order it first comes.
-        int[] colOf;
-        List<string> newNames;
-        if (nameCol is StringArray s)
-        {
-            if (s.NullCount != 0)
-            {
-                for (int r = 0; r < n; r++)
-                    if (s.IsNull(r))
-                        throw new TableProblem($"'{namesFrom}' has a null in row {r}, and a column needs a name.");
-            }
-            colOf = Categories.StringIds(s, out var nameFirsts);
-            newNames = new List<string>(nameFirsts.Count);
-            foreach (int r in nameFirsts) newNames.Add(s.GetString(r));
-        }
-        else
-        {
-            var d = (DictionaryArray)nameCol;
-            if (d.NullCount != 0)
-            {
-                for (int r = 0; r < n; r++)
-                    if (d.IsNull(r))
-                        throw new TableProblem($"'{namesFrom}' has a null in row {r}, and a column needs a name.");
-            }
-            var levels = (StringArray)d.Dictionary;
-            var codes = ((Int32Array)d.Indices).Values;
-            var codeToCol = new int[levels.Length];
-            System.Array.Fill(codeToCol, -1);
-            colOf = new int[n];
-            newNames = new List<string>();
-            for (int r = 0; r < n; r++)
-            {
-                ref int c = ref codeToCol[codes[r]];
-                if (c < 0)
-                {
-                    c = newNames.Count;
-                    newNames.Add(levels.GetString(codes[r]));
-                }
-                colOf[r] = c;
-            }
-        }
-
-        // The row of each cell of each new column, -1 where no row gives one.
-        var cellRows = new int[newNames.Count][];
-        for (int c = 0; c < cellRows.Length; c++)
-        {
-            cellRows[c] = new int[rows];
-            System.Array.Fill(cellRows[c], -1);
-        }
-        for (int r = 0; r < n; r++)
-        {
-            int c = colOf[r];
-            ref int cell = ref cellRows[c][groupOf[r]];
-            if (cell >= 0)
-                throw new TableProblem($"rows {cell} and {r} have the same values in the other columns, "
-                                       + $"and both '{newNames[c]}' in '{namesFrom}': a cell holds one value.");
-            cell = r;
-        }
-
-        var idNames = ids.Select(i => t.Schema.GetFieldByIndex(i).Name).ToHashSet();
-        foreach (var name in newNames)
-            if (idNames.Contains(name)) throw new TableProblem($"the table has a column '{name}' already.");
-
-        var fields = new List<Field>();
-        var columns = new List<IArrowArray>();
-        var idTable = Query.Take(Select(t, ids), firsts.ToArray(), rows);
-        for (int i = 0; i < ids.Length; i++)
-        {
-            fields.Add(idTable.Schema.GetFieldByIndex(i));
-            columns.Add(idTable.Column(i));
-        }
-        var valueTable = Select(t, new[] { vc });
-        var type = t.Schema.GetFieldByIndex(vc).DataType;
-        for (int c = 0; c < newNames.Count; c++)
-        {
-            fields.Add(new Field(newNames[c], type, true));
-            columns.Add(Joins.TakeOrNull(valueTable, cellRows[c])[0]);
-        }
-        var schema = new Schema.Builder();
-        foreach (var f in fields) schema.Field(f);
-        return new RecordBatch(schema.Build(), columns, rows);
-    }
-
-    // ---------------------------------------------------------------------
     // Columns put one after the other
 
     // The cells of the columns, one column after the other. A copy of each
@@ -1003,7 +739,7 @@ public static class Reshape
     // The bytes are the names once, copied in blocks that double; the offset
     // of name j of time i is i times the bytes of all the names and the
     // offset of name j in them, made in parts on the workers.
-    private static IArrowArray Repeated(string[] names, int times)
+    public static IArrowArray Repeated(string[] names, int times)
     {
         var encoded = names.Select(System.Text.Encoding.UTF8.GetBytes).ToArray();
         int period = encoded.Sum(e => e.Length), k = names.Length;
@@ -1046,7 +782,7 @@ public static class Reshape
 
     // Whether a column of the type is copied by Interleaved: numbers, dates
     // and timestamps, a value in a fixed number of whole bytes.
-    private static bool Interleavable(IArrowType t) =>
+    public static bool Interleavable(IArrowType t) =>
         t is FixedWidthType fw && t is not BooleanType && t is not DictionaryType && fw.BitWidth % 8 == 0
         && fw.BitWidth is 8 or 16 or 32 or 64;
 
@@ -1056,7 +792,7 @@ public static class Reshape
     /// workers. The columns are of one type that <see cref="Interleavable"/>
     /// takes.
     /// </summary>
-    private static IArrowArray Interleaved(IArrowArray[] cols, int n)
+    public static IArrowArray Interleaved(IArrowArray[] cols, int n)
     {
         var type = cols[0].Data.DataType;
         int k = cols.Length, m = n * k;
@@ -1116,10 +852,43 @@ public static class Reshape
     }
 
     // The table of the columns at the indices, without a copy.
-    internal static RecordBatch Select(RecordBatch t, int[] indices)
+    public static RecordBatch Select(RecordBatch t, int[] indices)
     {
         var schema = new Schema.Builder();
         foreach (int i in indices) schema.Field(t.Schema.GetFieldByIndex(i));
         return new RecordBatch(schema.Build(), indices.Select(t.Column).ToList(), t.Length);
+    }
+}
+
+/// <summary>
+/// The parts of the reshaping of (bjostat table) that Bjolang calls, where a
+/// method of <see cref="Reshape"/> takes or returns a List.
+/// </summary>
+public static class ReshapeOps
+{
+    /// <summary>The first row of each group of equal keys, in the order of the rows.</summary>
+    public static int[] Firsts(IArrowArray[] keys, int n)
+    {
+        Reshape.Groups(keys, n, out var firsts, out _, false, needGroupIds: false);
+        return firsts.ToArray();
+    }
+
+    /// <summary>The group of each row, and the first row of each group.</summary>
+    public static int[] Groups(IArrowArray[] keys, int n, out int[] firsts)
+    {
+        var groups = Reshape.Groups(keys, n, out var f);
+        firsts = f.ToArray();
+        return groups;
+    }
+
+    /// <summary>The cells of the columns, one column after the other.</summary>
+    public static IArrowArray Concat(IArrowArray[] pieces, IArrowType type) => Reshape.Concat(pieces.ToList(), type);
+
+    /// <summary>The number of each distinct string, in the order they first come, and the first row of each.</summary>
+    public static int[] StringIds(StringArray s, out int[] firsts)
+    {
+        var ids = Categories.StringIds(s, out var f);
+        firsts = f.ToArray();
+        return ids;
     }
 }

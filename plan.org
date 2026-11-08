@@ -1251,6 +1251,49 @@ gone from the glue. The glue is 6463 lines of C#.
   found first and no Option in the loop, 20 % slower (4.4 ms). skip-nulls,
   which reads the validity bitmap a window at a time, is faster than both.
 
+** Done: distinct, append and the pivots in Bjolang
+
+table-distinct, table-append, pivot-longer and pivot-wider are Bjolang
+functions of (bjostat table): the checks and their messages, the fields
+of the result, the new columns of pivot-wider and its cells. The kernels
+stay in C#, public for Bjolang: the groups of equal keys
+(ReshapeOps.Groups and Firsts, over Reshape.Groups), the strings of a
+column numbered (ReshapeOps.StringIds), Concat, Interleaved, Repeated,
+Select, Query.Take and Joins.TakeOrNull, Nulls, SameType and KeyType. A
+result keeps the fields of its columns, with Tables.FromFields, as the C#
+kept them. The glue is 6241 lines of C# (222 out).
+
+- The same results: scratch/reshape/dump.bjo prints every row of 38
+  tables the four make (every kind of column, nulls, NaN, -0, categories,
+  slices, no rows, 200 003 and 600 009 rows) and 22 messages: 6483 lines,
+  the same before and after. All 15 test files pass with all threads and
+  with one.
+- table-append makes its columns with computing-each, as table-summary
+  does, so a bjoroutine waits for them suspended. The C#'s Workers.For
+  parked the thread.
+- Measured, the C# version (worktree of 7db9972) and this alternated,
+  three rounds (append: five), µs:
+
+  | row                      | C#          | Bjolang     |
+  |--------------------------+-------------+-------------|
+  | distinct k label, 10^6   | 2875-3436   | 3097-4680   |
+  | distinct, 100 rows       | 3.0-3.5     | 2.4-3.4     |
+  | append 3 x 10^6          | 12927-14632 | 12974-14937 |
+  | append, 2 x 100 rows     | 23.2-25.6   | 25.5-29.5   |
+  | longer 3 of 10^6         | 14452-18182 | 15531-17842 |
+  | longer, 100 rows         | 8.5-10.6    | 8.1-9.3     |
+  | wider 3 x 10^6           | 92080-95773 | 93217-109986 |
+
+  The rows of 10^6 run on several threads and vary from run to run in
+  both. The append of small tables is slower by about 2.5 µs: the fields
+  are found with a persistent map and a Vec.
+- What the first version lost: the rows that pivot-longer takes, 3 x 10^6
+  ints, were made with {arraying ...}, which grows a builder and copies
+  it, and then by a function given as an argument, which was a Func call
+  for each (#:inline did not inline the function value): 29-34 ms against
+  15-18. Two functions that fill an array of the size are as fast as the
+  C#'s loops.
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema
