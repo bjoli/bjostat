@@ -1311,11 +1311,16 @@ kept them. The glue is 6241 lines of C# (222 out).
   against 169 of a table of one column, 68 against 210 of the 20th of 20
   columns, 30 against 131 of a name that is not there (column-type).
 - What the first version lost: the rows that pivot-longer takes, 3 x 10^6
-  ints, were made with {arraying ...}, which grows a builder and copies
-  it, and then by a function given as an argument, which was a Func call
-  for each (#:inline did not inline the function value): 29-34 ms against
-  15-18. Two functions that fill an array of the size are as fast as the
-  C#'s loops.
+  ints, were made with {arraying (quotient r k) ...}, which grows a
+  builder and copies it: 29-34 ms against 15-18. Loops that fill an array
+  of the size are as fast as the C#'s. Written as one #:inline function
+  given a lambda for the value of each row, they are inlined, lambda and
+  all, at both calls in longer: the C# has the loops in longer, and no
+  Func is called. (It was said here before that they were not. That was
+  read off the C# of the function's own definition, which is emitted
+  whether or not a call is left, and a slow run that was noise.) The two
+  functions with no lambda, kept-row-numbers and value-row-numbers, are
+  calls, once each; the same loops.
 
 ** Later
 
