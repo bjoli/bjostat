@@ -32,8 +32,8 @@ public static class Joins
     /// <summary>What a join keeps: 0 inner, 1 left, 2 semi, 3 anti.</summary>
     public static RecordBatch Join(RecordBatch left, RecordBatch right, string[] keys, int kind)
     {
-        var lk = keys.Select(k => left.Column(left.Schema.GetFieldIndex(k))).ToArray();
-        var rk = keys.Select(k => right.Column(right.Schema.GetFieldIndex(k))).ToArray();
+        var lk = keys.Select(k => left.Column(Tables.IndexOf(left, k))).ToArray();
+        var rk = keys.Select(k => right.Column(Tables.IndexOf(right, k))).ToArray();
 
         int ln = left.Length;
         var leftRows = new List<int>(ln);
@@ -57,7 +57,7 @@ public static class Joins
         var takenLeft = InOrder(lrows, ln) ? left : Query.Take(left, lrows, n);
         foreach (var k in keys)
         {
-            int i = left.Schema.GetFieldIndex(k);
+            int i = Tables.IndexOf(left, k);
             fields.Add(left.Schema.GetFieldByIndex(i));
             columns.Add(takenLeft.Column(i));
         }
@@ -425,7 +425,7 @@ public static class Joins
         if (keys.Distinct().Count() != keys.Length) return "a key is named twice.";
         foreach (var k in keys)
         {
-            int li = left.Schema.GetFieldIndex(k), ri = right.Schema.GetFieldIndex(k);
+            int li = Tables.IndexOf(left, k), ri = Tables.IndexOf(right, k);
             if (li < 0) return $"the left table has no column '{k}'.";
             if (ri < 0) return $"the right table has no column '{k}'.";
             var lt = left.Schema.GetFieldByIndex(li).DataType;

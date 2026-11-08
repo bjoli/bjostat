@@ -1304,7 +1304,12 @@ kept them. The glue is 6241 lines of C# (222 out).
   Schema.GetFieldIndex, which compares the names in the current culture,
   through ICU. It is slow (a sort key for each name), and it is wrong: "pri"
   + U+00AD + "ce" and "price" + U+200B find the column "price"
-  (scratch/reshape/culture.bjo). Not fixed yet.
+  (scratch/reshape/culture.bjo). Fixed: Tables.IndexOf compares the names
+  ordinally, and the six other calls of GetFieldIndex in the glue (joins,
+  categories, the keys of Reshape, WithColumn) call it. Those two names
+  are other names now (tests/table.bjo), and a lookup is faster: 40 ns
+  against 169 of a table of one column, 68 against 210 of the 20th of 20
+  columns, 30 against 131 of a name that is not there (column-type).
 - What the first version lost: the rows that pivot-longer takes, 3 x 10^6
   ints, were made with {arraying ...}, which grows a builder and copies
   it, and then by a function given as an argument, which was a Func call

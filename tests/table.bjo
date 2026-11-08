@@ -247,6 +247,22 @@
   (expect "the columns" (table-column-count t) 4)
   (expect "a column's type" (column-type t "qty") (Some Long))
   (expect "no such column" (column-type t "pricee") None)
+  ;; Names are compared character for character. In the current culture a
+  ;; soft hyphen (U+00AD) and a zero-width space (U+200B) count for nothing,
+  ;; and these found "price".
+  (def soft-hyphen (str "pri" (char->string (int->char 173)) "ce"))
+  (def zero-width (str "price" (char->string (int->char 8203))))
+  (expect "a name with a soft hyphen is another name" (column-type t soft-hyphen) None)
+  (expect "a name with a zero-width space is another name" (column-type t zero-width) None)
+  (expect "and is not a key"
+          (error-of (table-distinct t #:by [soft-hyphen]))
+          (str "the table has no column '" soft-hyphen "'. Its columns are: region, price, qty, rating."))
+  (expect "nor a key of a join"
+          (string-starts-with? (error-of (inner-join t t [zero-width])) "the left table has no column")
+          #t)
+  (expect "nor the column of a category"
+          (string-starts-with? (error-of (table-categorize t soft-hyphen)) "the table has no column")
+          #t)
   (expect "the schema"
           (vec-map (fun (p) (str (fst p) ":" (displayed (snd p)))) (table-schema t))
           ["region:string" "price:double" "qty:long" "rating:int"])

@@ -238,7 +238,19 @@ public static class Tables
     public static IArrowArray Column(RecordBatch t, int i) => t.Column(i);
 
     /// <summary>The index of the column, or -1.</summary>
-    public static int IndexOf(RecordBatch t, string name) => t.Schema.GetFieldIndex(name);
+    /// <summary>
+    /// The index of the first column of the name, or -1. Names are compared
+    /// ordinally, character for character. Arrow's Schema.GetFieldIndex
+    /// compares them in the current culture, which ignores characters such
+    /// as a soft hyphen, so that "pri\u00ADce" found the column "price".
+    /// </summary>
+    public static int IndexOf(RecordBatch t, string name)
+    {
+        var fields = t.Schema.FieldsList;
+        for (int i = 0; i < fields.Count; i++)
+            if (string.Equals(fields[i].Name, name, StringComparison.Ordinal)) return i;
+        return -1;
+    }
 
     /// <summary>The rows from <paramref name="from"/> up to <paramref name="to"/>, without a copy.</summary>
     public static RecordBatch Slice(RecordBatch t, int from, int to) => t.Slice(from, to - from);

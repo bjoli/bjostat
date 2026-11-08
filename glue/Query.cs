@@ -434,7 +434,7 @@ public static class Query
         var fields = t.Schema.FieldsList.ToList();
         var columns = Enumerable.Range(0, t.ColumnCount).Select(t.Column).ToList();
         var field = new Field(name, column.Data.DataType, true);
-        int at = t.Schema.GetFieldIndex(name);
+        int at = Tables.IndexOf(t, name);
         if (at < 0)
         {
             fields.Add(field);

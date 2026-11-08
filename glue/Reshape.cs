@@ -611,7 +611,7 @@ public static class Reshape
 
     internal static int Column(RecordBatch t, string name)
     {
-        int i = t.Schema.GetFieldIndex(name);
+        int i = Tables.IndexOf(t, name);
         if (i < 0)
             throw new TableProblem($"the table has no column '{name}'. Its columns are: "
                                    + string.Join(", ", t.Schema.FieldsList.Select(f => f.Name)) + ".");
