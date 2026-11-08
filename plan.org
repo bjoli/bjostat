@@ -1279,14 +1279,32 @@ kept them. The glue is 6241 lines of C# (222 out).
   | distinct k label, 10^6   | 2875-3436   | 3097-4680   |
   | distinct, 100 rows       | 3.0-3.5     | 2.4-3.4     |
   | append 3 x 10^6          | 12927-14632 | 12974-14937 |
-  | append, 2 x 100 rows     | 23.2-25.6   | 25.5-29.5   |
+  | append, 2 x 100 rows     | 24.9-26.9   | 9.9-10.6    |
   | longer 3 of 10^6         | 14452-18182 | 15531-17842 |
   | longer, 100 rows         | 8.5-10.6    | 8.1-9.3     |
   | wider 3 x 10^6           | 92080-95773 | 93217-109986 |
 
   The rows of 10^6 run on several threads and vary from run to run in
-  both. The append of small tables is slower by about 2.5 µs: the fields
-  are found with a persistent map and a Vec.
+  both.
+- The append of small tables was 3 µs slower at first (25.5-29.5), and
+  allocated 3 KB more, whatever the number of rows. Measured by parts
+  (scratch/reshape/parts.bjo) and with perf (DOTNET_PerfMapEnabled=1, and
+  DOTNET_EnableWriteXorExecute=0 so that perf finds the JIT's code): a
+  quarter of it was the names of the columns, made UTF-8 strings by
+  field-name and .NET strings again by clr-index-of, which the C# never
+  converted; the rest small allocations of Vecs and closures. The
+  persistent map cost nothing that could be measured. Both versions spent
+  half the call, 13 µs, starting computing-each for 7 columns of 100 rows,
+  whose copies take 4.6 µs on one thread. Now, as Query.Take does, an
+  append of fewer than 65 536 cells makes its columns on the calling
+  thread: 6.8-7.0 µs against the C#'s 21-22 for two tables of 100 rows
+  (scratch/reshape/append-only.bjo), 6.0 against 19.1-20.0 for two of one
+  row. The append of 3 x 10^6 rows still runs in parts.
+- Found with perf, in both versions: Tables.IndexOf is Arrow's
+  Schema.GetFieldIndex, which compares the names in the current culture,
+  through ICU. It is slow (a sort key for each name), and it is wrong: "pri"
+  + U+00AD + "ce" and "price" + U+200B find the column "price"
+  (scratch/reshape/culture.bjo). Not fixed yet.
 - What the first version lost: the rows that pivot-longer takes, 3 x 10^6
   ints, were made with {arraying ...}, which grows a builder and copies
   it, and then by a function given as an argument, which was a Func call

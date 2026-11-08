@@ -1237,13 +1237,18 @@
 ;; Columns are matched by name: the columns are those of the first table, then
 ;; those that each next table adds, and a table without a column has nulls in
 ;; it. An Err for a name with columns of two types. Each column is made as a
-;; part on (std parallel)'s compute threads.
+;; part on (std parallel)'s compute threads, when the result has 65 536 cells
+;; or more. Below that, the columns are made on this thread: the start of the
+;; parts takes longer than the copies, as for Query.Take.
 (: (-> (Vec Table) (Result TableError Table)))
 (defun (table-append tables)
   (def (Ok fields) (appended-fields tables) :propagate)
   (def rows (loop (:for t tables) (:acc n (folding 0 (+ n (table-row-count t))))))
   (def filled (vec-filter (fun (t) (> (table-row-count t) 0)) tables))
-  (def columns (computing-each (vec-length fields) (fun (c) (appended-column filled (vec-ref fields c)))))
+  (def columns
+    (if (< (* (cast long rows) (cast long (vec-length fields))) 65536L)
+        {vecing (appended-column filled f) (:for f fields)}
+        (computing-each (vec-length fields) (fun (c) (appended-column filled (vec-ref fields c))))))
   (Ok (clr-from-fields (vec->array fields) (vec->array columns) rows)))
 
 ;; A field of each name, of the type of its first column, in the order the
