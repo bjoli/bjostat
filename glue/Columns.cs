@@ -12,8 +12,6 @@
 // the aggregates skip them by the validity bitmap, here, in one loop.
 
 using System.Globalization;
-using System.Numerics;
-using System.Numerics.Tensors;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
@@ -139,55 +137,6 @@ public static partial class Columns
             else b.Append(values[i]);
         }
         return b.Build();
-    }
-
-    // ---------------------------------------------------------------------
-    // Aggregates. Each skips the nulls. With none, the numbers go to
-    // TensorPrimitives on the span, which is vectorized.
-
-    public static T Sum<T>(PrimitiveArray<T> a) where T : struct, IEquatable<T>, INumber<T>
-    {
-        if (a.NullCount == 0) return TensorPrimitives.Sum(a.Values);
-
-        var values = a.Values;
-        T sum = T.Zero;
-        for (int i = 0; i < values.Length; i++)
-            if (a.IsValid(i)) sum += values[i];
-        return sum;
-    }
-
-    /// <summary>The mean of the values that are not null, or NaN when there are none.</summary>
-    public static double Mean<T>(PrimitiveArray<T> a) where T : struct, IEquatable<T>, INumber<T>
-    {
-        int n = a.Length - a.NullCount;
-        if (n == 0) return double.NaN;
-        return double.CreateChecked(Sum(a)) / n;
-    }
-
-    /// <summary>The least value that is not null, or None when there is none.</summary>
-    public static BjolangRuntime.Option<T> Min<T>(PrimitiveArray<T> a) where T : struct, IEquatable<T>, INumber<T>
-    {
-        if (a.Length == a.NullCount) return BjolangRuntime.None<T>();
-        if (a.NullCount == 0) return BjolangRuntime.Some(TensorPrimitives.Min(a.Values));
-
-        var values = a.Values;
-        T? best = null;
-        for (int i = 0; i < values.Length; i++)
-            if (a.IsValid(i) && (best is null || values[i] < best.Value)) best = values[i];
-        return BjolangRuntime.Some(best!.Value);
-    }
-
-    /// <summary>The greatest value that is not null, or None when there is none.</summary>
-    public static BjolangRuntime.Option<T> Max<T>(PrimitiveArray<T> a) where T : struct, IEquatable<T>, INumber<T>
-    {
-        if (a.Length == a.NullCount) return BjolangRuntime.None<T>();
-        if (a.NullCount == 0) return BjolangRuntime.Some(TensorPrimitives.Max(a.Values));
-
-        var values = a.Values;
-        T? best = null;
-        for (int i = 0; i < values.Length; i++)
-            if (a.IsValid(i) && (best is null || values[i] > best.Value)) best = values[i];
-        return BjolangRuntime.Some(best!.Value);
     }
 
     // ---------------------------------------------------------------------

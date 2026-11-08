@@ -1211,6 +1211,46 @@ Bjolang 3a9570e. The glue is 6512 lines of C#.
   summary is slower in two of three rounds; the C# kept the places and
   the five quantiles in stackalloc, and Bjolang makes two small arrays.
 
+** Done: the column aggregates in Bjolang
+
+column-sum, column-mean, column-min and column-max are Bjolang functions
+of (bjostat table) now, and Columns.Sum, Mean, Min and Max (49 lines) are
+gone from the glue. The glue is 6463 lines of C#.
+
+- A column with no nulls goes to TensorPrimitives, as before: the same
+  call, so the same results. A column with nulls is read with skip-nulls
+  and a fold, in the order of its rows, where the C# called IsValid for
+  each row.
+- The signatures say (where (Num %a)). A column of a type that is not a
+  number was a C# error; it is a Bjolang type error now.
+- The same results: scratch/aggregates/dump.bjo prints the four of columns
+  of double, float, long, int, short and byte, of 0 to 100 003 rows, with
+  no nulls, nulls and all nulls, of slices of them, with NaN, infinities,
+  -0 and an int that overflows: 1294 lines, the same before and after.
+  With nulls, min and max keep the first of equal values and a NaN only
+  when it is first, as the C#'s < did; without nulls a NaN is the result,
+  as TensorPrimitives gives it. All 15 test files pass with all threads
+  and with one.
+- Measured, the C# version (worktree of 31c34e6) and this alternated,
+  three rounds, µs, 10^6 rows, a null in each 10th:
+
+  | row                  | C#        | Bjolang   |
+  |----------------------+-----------+-----------|
+  | double sum           | 156-157   | 156-156   |
+  | double sum, nulls    | 4793-4901 | 2438-2538 |
+  | double mean, nulls   | 4791-4838 | 2432-2629 |
+  | double min           | 363-364   | 362-364   |
+  | double max, nulls    | 3524-3632 | 2563-2673 |
+  | long sum             | 80-85     | 82-84     |
+  | long sum, nulls      | 4745-4790 | 2432-2582 |
+  | long min, nulls      | 3684-3740 | 2527-2569 |
+
+- What the first version lost: a loop over the rows that called
+  column-valid? for each, as the C# called IsValid, was 27 % faster for a
+  sum but 10 % slower for min and max (3.95 ms), and with the first value
+  found first and no Option in the loop, 20 % slower (4.4 ms). skip-nulls,
+  which reads the validity bitmap a window at a time, is faster than both.
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema

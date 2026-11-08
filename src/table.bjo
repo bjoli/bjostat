@@ -165,12 +165,12 @@
   (clr-from-array (: Bjostat.Columns.FromArray (-> (Array %a) (Array bool) (Column %a)) #:uses-type))
   (clr-from-strings (: Bjostat.Columns.FromStrings (-> (Array string) (Array bool) StringColumn)))
 
-  ;; Aggregates. A column of a type that is not a number is a C# error, for
-  ;; now: (Column %a) does not say that %a is a number.
-  (column-sum (: Bjostat.Columns.Sum (-> (Column %a) %a)))
-  (column-mean (: Bjostat.Columns.Mean (-> (Column %a) double)))
-  (column-min (: Bjostat.Columns.Min (-> (Column %a) (Option %a))))
-  (column-max (: Bjostat.Columns.Max (-> (Column %a) (Option %a))))
+  ;; Aggregates of a span with no nulls, vectorized.
+  (tensor-sum (: System.Numerics.Tensors.TensorPrimitives.Sum (-> (RoSpan %a) %a)))
+  (tensor-min (: System.Numerics.Tensors.TensorPrimitives.Min (-> (RoSpan %a) %a)))
+  (tensor-max (: System.Numerics.Tensors.TensorPrimitives.Max (-> (RoSpan %a) %a)))
+  (number->double (: System.Double.CreateChecked (-> %a double)))
+  (clr-nan (: System.Double.NaN #:get))
 
   ;; Tables
   (clr-make-table (: Bjostat.Tables.Make (-> (Array string) (Array AnyColumn) int Table)))
@@ -818,6 +818,59 @@
 ;; How many values are not null.
 (: (-> (Column %a) int))
 (defun (column-count c) (- (column-length c) (column-null-count c)))
+
+;; The aggregates of a column of numbers skip the nulls. A column with no
+;; nulls goes to TensorPrimitives, which is vectorized. A column with nulls is
+;; read with skip-nulls, in the order of its rows.
+
+;; The sum of the values that are not null, or 0 when there are none. A sum
+;; of integers wraps when it overflows.
+(: (-> (Column %a) %a) (where (Num %a)))
+(defun (column-sum c)
+  (if (= (column-null-count c) 0)
+      (tensor-sum (column-values c))
+      (loop (:for x (skip-nulls (column->cells c)))
+            (:acc s (folding 0 (+ s x))))))
+
+;; The mean of the values that are not null, or NaN when there are none.
+(: (-> (Column %a) double) (where (Num %a)))
+(defun (column-mean c)
+  (def n (column-count c))
+  (if (= n 0)
+      clr-nan
+      (/ (number->double (column-sum c)) (cast double n))))
+
+;; The first value that is not null, of a column that has one. A fold from it
+;; over all the values compares it with itself first, which keeps it.
+(: (-> (Column %a) %a))
+(defun (first-valid c)
+  (def values (column-values c))
+  (let go ((i 0))
+    (if (column-valid? c i) (ro-span-ref values i) (go (+ i 1)))))
+
+;; The least value that is not null, or None when there is none.
+;; - With no nulls, a NaN is the least value, as TensorPrimitives.Min gives it.
+;; - With nulls, the values are compared with <: a NaN is the least value only
+;;   when it is the first value, and of two equal values the first is kept.
+(: (-> (Column %a) (Option %a)) (where (Num %a)))
+(defun (column-min c)
+  (cond
+    ((= (column-count c) 0) None)
+    ((= (column-null-count c) 0) (Some (tensor-min (column-values c))))
+    (else
+     (Some (loop (:for x (skip-nulls (column->cells c)))
+                 (:acc m (folding (first-valid c) (if (< x m) x m))))))))
+
+;; The greatest value that is not null, or None when there is none. NaN as
+;; for `column-min`.
+(: (-> (Column %a) (Option %a)) (where (Num %a)))
+(defun (column-max c)
+  (cond
+    ((= (column-count c) 0) None)
+    ((= (column-null-count c) 0) (Some (tensor-max (column-values c))))
+    (else
+     (Some (loop (:for x (skip-nulls (column->cells c)))
+                 (:acc m (folding (first-valid c) (if (> x m) x m))))))))
 
 ;; ===========================================================================
 ;; Making tables
