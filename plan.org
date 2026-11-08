@@ -1412,6 +1412,55 @@ It now gives an empty array then, as the C# returned the table before a
 copy: 6.01-6.06 against 6.01-8.51 on one thread, 2.18-2.34 against
 2.36-2.43 on 24, and distinct by a string and a long the same.
 
+** Done: a large CSV file cut in Bjolang, and read fast on one thread too
+
+read-csv cut a file of 4 MB or more with glue/CsvChunks.cs: it walked the
+file to each line feed and copied each chunk, with the header, into a
+string of its own. Now read-csv reads the file once into an array of
+bytes, and (text csv)'s new csv-row-end and csv-cut-rows (Bjolang std)
+find the end of the header and the cuts: the quotes of each piece are
+counted with one vectorized call, and only the bytes from each target to
+the next line feed outside quotes are looked at one by one. A piece is a
+range of the bytes, not a copy. CsvFast reads the bytes from the cuts and
+checks the UTF-8 of each piece on its compute thread. CsvChunks.cs is
+gone; the glue is 6169 lines of C# (72 out).
+
+With one compute thread, the file is one piece, read by CsvFast, not by
+(text csv) as before. The fallback is as before: a small file, a file
+with no header or with a byte order mark, quotes that do not close, bytes
+that are not UTF-8, or anything CsvFast does not read go to (text csv),
+which reads the file or says what is wrong, with the line.
+
+- The same results: scratch/csvparts/dump.bjo prints the schema, the
+  rows, the nulls, the first rows and the sha256 of the whole table of 13
+  files of 4 MB or more (plain, quotes with line feeds and doubled quotes,
+  CRLF, no final line feed, a byte order mark, a blank line, a late
+  decimal, long fields, Unicode, dates, date-times, bools and nulls; and three that are
+  errors: bytes that are not UTF-8, a quote that is not closed, a row of
+  too many fields, with their messages) and of the two files above. The
+  same before and after, with all threads and with one. All 15 test files
+  pass with all threads and with one.
+- Measured, 227de18 (worktree) and this alternated, two rounds, the
+  median of 20 runs, ms:
+
+  | read csv           | 227de18 | now       |
+  |--------------------+---------+-----------|
+  | narrow, 24 threads | 40.2-41.3 | 27.6-29.8 |
+  | narrow, 1 thread   | 181-190   | 98.6-98.7 |
+  | wide, 24 threads   | 91.5-95.9 | 73.0-77.2 |
+  | wide, 1 thread     | 481-524   | 296-298   |
+
+  The allocations of the narrow file: 40.6 MB against 91.3 on 24
+  threads, 51.8 MB against 289 on one, with no collection.
+- A worktree with the data files as symbolic links read on one thread
+  only: .NET's FileInfo.Length is the size of the link, not of the file,
+  so the file was small. The data are copied into a worktree now.
+  read-csv takes the size from (std prelude)'s file-info, which follows
+  the link.
+- Still open: CsvFast does not get faster after about 8 threads (measured
+  before, 19-21 ms with 23 pieces against 24-26 with 8). Not looked at:
+  the columns of the pieces are put together one column on a thread.
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema

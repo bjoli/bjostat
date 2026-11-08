@@ -3,14 +3,15 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-// CsvFast: the chunks of a large CSV file into columns, with no string made
+// CsvFast: the pieces of a large CSV file into columns, with no string made
 // for a field and no array for a row.
 //
 // (text csv) gives each row as an array of strings, which CsvColumn then
-// parses. Here each field is a span of the chunk's bytes, given to its
+// parses. Here each field is a span of the file's bytes, given to its
 // CsvColumn as it is found: a quoted field with a doubled quote is the one
-// field that is copied, into a buffer that is used again. The chunks are
-// read on the compute threads.
+// field that is copied, into a buffer that is used again. read-csv cuts the
+// bytes with (text csv)'s csv-cut-rows, and the pieces are read on the
+// compute threads.
 //
 // It reads what (text csv) reads, RFC 4180, or gives up: a row ends at a
 // line feed, after a carriage return or not; a quoted field may hold the
@@ -29,11 +30,16 @@ namespace Bjostat;
 
 public static class CsvFast
 {
-    /// <summary>The names in the header line of the chunk, or None.</summary>
-    public static BjolangRuntime.Option<Utf8String[]> Names(Utf8String chunk, int separator)
+    /// <summary>
+    /// The names in the header line, the bytes up to <paramref name="headerEnd"/>,
+    /// or None: also when they are not UTF-8.
+    /// </summary>
+    public static BjolangRuntime.Option<Utf8String[]> Names(byte[] bytes, int headerEnd, int separator)
     {
+        var header = bytes.AsSpan(0, headerEnd);
+        if (!System.Text.Unicode.Utf8.IsValid(header)) return BjolangRuntime.None<Utf8String[]>();
         var names = new List<Utf8String>();
-        var reader = new Fields(chunk.AsSpan(), (byte)separator);
+        var reader = new Fields(header, (byte)separator);
         while (true)
         {
             var step = reader.Next(out var field);
@@ -45,16 +51,18 @@ public static class CsvFast
 
     /// <summary>
     /// The kind of each of the <paramref name="width"/> columns, guessed from
-    /// the first <paramref name="rows"/> rows after the header as CsvColumn
-    /// guesses a field, String for a column of nulls only; or None.
+    /// the first <paramref name="rows"/> rows of the bytes from
+    /// <paramref name="from"/> to <paramref name="to"/>, rows after the
+    /// header, as CsvColumn guesses a field, String for a column of nulls
+    /// only; or None.
     /// </summary>
-    public static BjolangRuntime.Option<int[]> Guess(Utf8String chunk, int width, int separator, int rows, Utf8String[] nulls)
+    public static BjolangRuntime.Option<int[]> Guess(byte[] bytes, int from, int to, int width, int separator, int rows,
+                                                     Utf8String[] nulls)
     {
         var kinds = new int[width];
         System.Array.Fill(kinds, CsvColumn.Empty);
         var spelled = Spelled(nulls);
-        var reader = new Fields(chunk.AsSpan(), (byte)separator);
-        if (!SkipRow(ref reader)) return BjolangRuntime.None<int[]>();
+        var reader = new Fields(bytes.AsSpan(from, to - from), (byte)separator);
         for (int row = 0; row < rows; row++)
         {
             for (int c = 0; ; c++)
@@ -78,20 +86,22 @@ public static class CsvFast
     }
 
     /// <summary>
-    /// The table of the chunks, each the header line and then rows, read on
-    /// the workers with the columns of the kinds; or None. A column that
+    /// The table of the pieces of the bytes, piece k from cuts[k] to
+    /// cuts[k + 1], each whole rows after the header, read on the compute
+    /// threads with the columns of the kinds; or None. A column that
     /// <paramref name="guessed"/> says was guessed as long becomes doubles in
-    /// a chunk with a decimal, and then in all of them.
+    /// a piece with a decimal, and then in all of them.
     /// </summary>
-    public static BjolangRuntime.Option<RecordBatch> Read(Utf8String[] chunks, Utf8String[] names, int[] kinds,
+    public static BjolangRuntime.Option<RecordBatch> Read(byte[] bytes, int[] cuts, Utf8String[] names, int[] kinds,
                                                           bool[] guessed, int separator, Utf8String[] nulls)
     {
         var spelled = Spelled(nulls);
-        var parts = new CsvColumn[chunks.Length][];
+        int count = cuts.Length - 1;
+        var parts = new CsvColumn[count][];
         int failed = 0;
-        Workers.For(chunks.Length, k =>
+        Workers.For(count, k =>
         {
-            var columns = ReadChunk(chunks[k], kinds, guessed, (byte)separator, spelled);
+            var columns = ReadChunk(bytes.AsSpan(cuts[k], cuts[k + 1] - cuts[k]), kinds, guessed, (byte)separator, spelled);
             if (columns == null) Interlocked.Exchange(ref failed, 1);
             parts[k] = columns!;
         });
@@ -119,14 +129,15 @@ public static class CsvFast
         return BjolangRuntime.Some(new RecordBatch(schema.Build(), columnsOut, length));
     }
 
-    // The rows of one chunk after its header into new columns, or null.
-    private static CsvColumn[]? ReadChunk(Utf8String chunk, int[] kinds, bool[] guessed, byte separator, byte[][] spelled)
+    // The rows of one piece into new columns, or null: also when its bytes
+    // are not UTF-8, which is checked here, on the piece's thread.
+    private static CsvColumn[]? ReadChunk(ReadOnlySpan<byte> chunk, int[] kinds, bool[] guessed, byte separator, byte[][] spelled)
     {
+        if (!System.Text.Unicode.Utf8.IsValid(chunk)) return null;
         int width = kinds.Length;
         var columns = new CsvColumn[width];
         for (int c = 0; c < width; c++) columns[c] = new CsvColumn(kinds[c]);
-        var reader = new Fields(chunk.AsSpan(), separator);
-        if (!SkipRow(ref reader)) return null;
+        var reader = new Fields(chunk, separator);
         while (true)
         {
             for (int c = 0; ; c++)
@@ -150,16 +161,6 @@ public static class CsvFast
                     break;
                 }
             }
-        }
-    }
-
-    private static bool SkipRow(ref Fields reader)
-    {
-        while (true)
-        {
-            var step = reader.Next(out _);
-            if (step == Step.RowEnd) return true;
-            if (step != Step.Field) return false;
         }
     }
 
