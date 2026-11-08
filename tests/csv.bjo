@@ -167,7 +167,7 @@
   (expect "chunks: a decimal after the guess makes the column double" (types-of late) ["n:double" "note:string"])
   (expect "chunks: its value" (cells-ref (: (ok (column-as late "n")) (Cells double)) 190000) 2.5)
   ;; The whole table of a file in chunks, as text, against one thread's, for
-  ;; each thing the reader of chunks reads (glue/CsvFast.cs) or gives to the
+  ;; each thing the reader of chunks reads (src/csv.bjo) or gives to the
   ;; one thread: CRLF, quotes, NA, dates, timestamps, bools, a given int, a
   ;; separator ';', a decimal in a later chunk, and a blank line.
   (: (-> int string string))
@@ -206,4 +206,10 @@
   (expect "chunks: a blank line, read on one thread, gives the table of one thread"
           (same-as-one-thread? (ok (read-csv blank-path)) (ok (csv->table blank-text)))
           #t)
+  (def twice-path (path-combine (temp-dir) "bjostat-test-twice.csv"))
+  (file-write-text twice-path (str "a,a,b\n" (string-join {vecing (str (int->string i) ",2,some text\n")
+                                                                  (:for i (range 0 300000))} "")))
+  (expect "chunks: two columns of one name, as in a small file"
+          (error-of (read-csv twice-path))
+          "two columns are named 'a'.")
   0)

@@ -5,8 +5,9 @@
 
 // Csv: the cells of a CSV file into Arrow columns, for (bjostat csv).
 //
-// (text csv) gives each field as a Bjolang string, which is UTF-8, or
-// CsvFast gives it as a span of a chunk's bytes (AddSpan). A number
+// (text csv) gives each field as a Bjolang string, which is UTF-8, or the
+// reader of the pieces of a large file (src/csv.bjo) gives it as a span of
+// the file's bytes (AddSpan). A number
 // is parsed from those bytes and a string is kept as those bytes, so no
 // cell becomes a UTF-16 string. A field that does not parse answers false,
 // not an exception, because a guess tries several types for each field.
@@ -76,22 +77,29 @@ public sealed class CsvColumn
 
     private const int FirstCapacity = 1024;
 
-    public CsvColumn(int kind)
+    public CsvColumn(int kind) : this(kind, FirstCapacity, FirstCapacity * 8) { }
+
+    /// <summary>
+    /// A column with room for <paramref name="rows"/> values, and for
+    /// <paramref name="bytes"/> bytes of strings, before it grows.
+    /// </summary>
+    public CsvColumn(int kind, int rows, int bytes)
     {
         _kind = kind;
+        rows = Math.Max(rows, FirstCapacity);
         switch (kind)
         {
             case Int:
-            case Date: _ints = Rent<int>(FirstCapacity); break;
+            case Date: _ints = Rent<int>(rows); break;
             case Long:
             case DateTime:
-            case Instant: _longs = Rent<long>(FirstCapacity); break;
-            case Float: _floats = Rent<float>(FirstCapacity); break;
-            case Double: _doubles = Rent<double>(FirstCapacity); break;
-            case Bool: _bools = Rent<byte>(FirstCapacity); break;
+            case Instant: _longs = Rent<long>(rows); break;
+            case Float: _floats = Rent<float>(rows); break;
+            case Double: _doubles = Rent<double>(rows); break;
+            case Bool: _bools = Rent<byte>(rows); break;
             case String:
-                _bytes = Rent<byte>(FirstCapacity * 8);
-                _ends = Rent<int>(FirstCapacity);
+                _bytes = Rent<byte>(Math.Max(bytes, FirstCapacity * 8));
+                _ends = Rent<int>(rows);
                 break;
             default: throw new ArgumentException($"(bjostat csv): no column kind {kind}");
         }
@@ -239,6 +247,110 @@ public sealed class CsvColumn
         };
         Release();
         return ArrowArrayFactory.BuildArray(data);
+    }
+
+    // ---------------------------------------------------------------------
+    // For CsvJoin: the parts of a column that is a piece of a larger one.
+
+    internal int Count => _count;
+    internal int Nulls => _nulls;
+    internal int ByteCount => _byteCount;
+
+    /// <summary>The bytes of one value of the kind, 0 for strings and bools.</summary>
+    internal static int ValueWidth(int kind) => kind switch
+    {
+        Int or Date or Float => 4,
+        Long or DateTime or Instant or Double => 8,
+        _ => 0,
+    };
+
+    internal static IArrowType TypeOf(int kind) => kind switch
+    {
+        Int => Int32Type.Default,
+        Long => Int64Type.Default,
+        Float => FloatType.Default,
+        Double => DoubleType.Default,
+        Date => Date32Type.Default,
+        DateTime => TimeKind.ArrowType(TimeKind.DateTime),
+        Instant => TimeKind.ArrowType(TimeKind.Instant),
+        Bool => BooleanType.Default,
+        _ => StringType.Default,
+    };
+
+    /// <summary>The values of a column of fixed width, as bytes, into <paramref name="to"/>.</summary>
+    internal void CopyValuesTo(Span<byte> to)
+    {
+        ReadOnlySpan<byte> from = _kind switch
+        {
+            Int or Date => MemoryMarshal.AsBytes(_ints.AsSpan(0, _count)),
+            Long or DateTime or Instant => MemoryMarshal.AsBytes(_longs.AsSpan(0, _count)),
+            Float => MemoryMarshal.AsBytes(_floats.AsSpan(0, _count)),
+            _ => MemoryMarshal.AsBytes(_doubles.AsSpan(0, _count)),
+        };
+        from.CopyTo(to);
+    }
+
+    /// <summary>
+    /// The strings into <paramref name="bytes"/>, and where each ends, plus
+    /// <paramref name="byteAt"/>, into <paramref name="ends"/>.
+    /// </summary>
+    internal void CopyStringsTo(Span<int> ends, int byteAt, Span<byte> bytes)
+    {
+        _bytes.AsSpan(0, _byteCount).CopyTo(bytes);
+        var mine = _ends.AsSpan(0, _count);
+        if (byteAt == 0) mine.CopyTo(ends);
+        else for (int i = 0; i < mine.Length; i++) ends[i] = mine[i] + byteAt;
+    }
+
+    /// <summary>A bit for each value, from bit <paramref name="at"/>: 1 when it is valid.</summary>
+    internal void CopyValidTo(byte[] bits, int at)
+    {
+        if (_valid == null) SetBits(bits, at, _count);
+        else CopyBits(_valid, bits, at, _count);
+    }
+
+    /// <summary>The bools as bits, the first in bit 0, and 0 after the last.</summary>
+    internal byte[] BoolBits()
+    {
+        var bits = new byte[(_count + 7) / 8];
+        for (int i = 0; i < _count; i++) bits[i >> 3] |= (byte)(_bools![i] << (i & 7));
+        return bits;
+    }
+
+    /// <summary>The first <paramref name="n"/> bits of <paramref name="from"/>, 0 after them, from bit <paramref name="at"/> of bits that are 0.</summary>
+    internal static void CopyBitsTo(byte[] from, int n, byte[] bits, int at) => CopyBits(from, bits, at, n);
+
+    internal void ReleaseArrays() => Release();
+
+    // Bits from `at` to `at + n` set, in bits that are 0.
+    private static void SetBits(byte[] bits, int at, int n)
+    {
+        int i = 0;
+        for (; i < n && (at & 7) != 0; i++, at++) bits[at >> 3] |= (byte)(1 << (at & 7));
+        int whole = (n - i) >> 3;
+        bits.AsSpan(at >> 3, whole).Fill(0xFF);
+        i += whole << 3;
+        at += whole << 3;
+        for (; i < n; i++, at++) bits[at >> 3] |= (byte)(1 << (at & 7));
+    }
+
+    // The first n bits of `from`, whose bits after them are 0, from bit `at`
+    // of `bits`, which are 0: a byte at a time, shifted.
+    private static void CopyBits(byte[] from, byte[] bits, int at, int n)
+    {
+        int bytes = (n + 7) >> 3, to = at >> 3, shift = at & 7;
+        if (shift == 0)
+        {
+            from.AsSpan(0, bytes).CopyTo(bits.AsSpan(to));
+            return;
+        }
+        for (int i = 0; i < bytes; i++)
+        {
+            int b = from[i];
+            bits[to + i] |= (byte)(b << shift);
+            int high = b >> (8 - shift);
+            if (high != 0) bits[to + i + 1] |= (byte)high;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -464,7 +576,11 @@ public sealed class CsvColumn
 
     public static CsvColumn Make(int kind) => new(kind);
 
+    public static CsvColumn MakeSized(int kind, int rows, int bytes) => new(kind, rows, bytes);
+
     public static bool AddTo(CsvColumn c, Utf8String field) => c.Add(field);
+
+    public static bool AddSpanTo(CsvColumn c, ReadOnlySpan<byte> field) => c.AddSpan(field);
 
     public static bool Widen(CsvColumn c) => c.WidenToDouble();
 
@@ -473,4 +589,106 @@ public sealed class CsvColumn
     public static int JoinKinds(int a, int b) => Join(a, b);
 
     public static IArrowArray BuildOf(CsvColumn c) => c.Build();
+}
+
+/// <summary>
+/// The pieces of one column, read apart, as one column: Start makes its
+/// buffers, Copy copies a piece into them (each piece can be on its own
+/// thread), and Finish makes the column of the buffers. Each value is
+/// copied once. The pieces are all of one kind.
+/// </summary>
+public sealed class CsvJoin
+{
+    private readonly CsvColumn[] _pieces;
+    private readonly int _kind;
+    private readonly int[] _rowAt;
+    private readonly int[] _byteAt;
+    private readonly int _count;
+    private readonly int _nulls;
+    // The values of fixed width, or the bytes of the strings.
+    private readonly byte[] _values;
+    // Of strings: where each starts, and then the end.
+    private readonly byte[]? _offsets;
+    // Of bools: the bits of each piece.
+    private readonly byte[][]? _boolBits;
+
+    private CsvJoin(CsvColumn[] pieces)
+    {
+        _pieces = pieces;
+        _kind = pieces[0].Kind;
+        _rowAt = new int[pieces.Length];
+        _byteAt = new int[pieces.Length];
+        long rows = 0, bytes = 0;
+        for (int k = 0; k < pieces.Length; k++)
+        {
+            if (pieces[k].Kind != _kind) throw new ArgumentException("(bjostat csv): pieces of two kinds");
+            _rowAt[k] = (int)rows;
+            _byteAt[k] = (int)bytes;
+            rows += pieces[k].Count;
+            bytes += pieces[k].ByteCount;
+            _nulls += pieces[k].Nulls;
+        }
+        if (rows > int.MaxValue) throw new TableProblem($"{rows} rows are too many for one column.");
+        if (bytes > int.MaxValue) throw new TableProblem($"{bytes} bytes of strings are too many for one column.");
+        _count = (int)rows;
+        int width = CsvColumn.ValueWidth(_kind);
+        if (_kind == CsvColumn.Bool)
+        {
+            _values = [];
+            _boolBits = new byte[pieces.Length][];
+        }
+        else if (width == 0)
+        {
+            _values = GC.AllocateUninitializedArray<byte>((int)bytes);
+            _offsets = GC.AllocateUninitializedArray<byte>((_count + 1) * sizeof(int));
+            MemoryMarshal.Cast<byte, int>(_offsets.AsSpan())[0] = 0;
+        }
+        else _values = GC.AllocateUninitializedArray<byte>(checked(_count * width));
+    }
+
+    /// <summary>The buffers of the column of the pieces, to be filled by Copy.</summary>
+    public static CsvJoin Start(CsvColumn[] pieces) => new(pieces);
+
+    /// <summary>Copies piece k into the buffers. Finish gives the pieces' arrays back to the pools.</summary>
+    public static void Copy(CsvJoin j, int k) => j.CopyPiece(k);
+
+    /// <summary>The column, after Copy of each piece.</summary>
+    public static IArrowArray Finish(CsvJoin j) => j.Build();
+
+    private void CopyPiece(int k)
+    {
+        var p = _pieces[k];
+        int width = CsvColumn.ValueWidth(_kind);
+        if (_kind == CsvColumn.Bool) _boolBits![k] = p.BoolBits();
+        else if (width == 0)
+            p.CopyStringsTo(MemoryMarshal.Cast<byte, int>(_offsets.AsSpan()).Slice(_rowAt[k] + 1, p.Count),
+                            _byteAt[k], _values.AsSpan(_byteAt[k], p.ByteCount));
+        else p.CopyValuesTo(_values.AsSpan(_rowAt[k] * width, p.Count * width));
+    }
+
+    private IArrowArray Build()
+    {
+        var validity = ArrowBuffer.Empty;
+        if (_nulls > 0)
+        {
+            var bits = new byte[(_count + 7) / 8];
+            for (int k = 0; k < _pieces.Length; k++) _pieces[k].CopyValidTo(bits, _rowAt[k]);
+            validity = new ArrowBuffer(bits);
+        }
+        foreach (var p in _pieces) p.ReleaseArrays();
+        var type = CsvColumn.TypeOf(_kind);
+        ArrayData data;
+        if (_kind == CsvColumn.Bool)
+        {
+            var bits = new byte[(_count + 7) / 8];
+            for (int k = 0; k < _pieces.Length; k++)
+                CsvColumn.CopyBitsTo(_boolBits![k], _pieces[k].Count, bits, _rowAt[k]);
+            data = new ArrayData(type, _count, _nulls, 0, new[] { validity, new ArrowBuffer(bits) });
+        }
+        else if (_offsets != null)
+            data = new ArrayData(type, _count, _nulls, 0,
+                new[] { validity, new ArrowBuffer(_offsets), new ArrowBuffer(_values) });
+        else data = new ArrayData(type, _count, _nulls, 0, new[] { validity, new ArrowBuffer(_values) });
+        return ArrowArrayFactory.BuildArray(data);
+    }
 }

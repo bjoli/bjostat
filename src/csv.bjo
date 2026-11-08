@@ -27,14 +27,15 @@
 ;; The rows are read one at a time by (text csv). Only the rows of the guess
 ;; are held as strings; after them each field goes into its column at once.
 ;;
-;; A file of 4 MB or more with a header is read into one array of bytes,
-;; cut by (text csv)'s csv-cut-rows into one piece of whole rows for each
-;; compute thread (one piece with one thread), and the pieces are read on the
-;; compute threads without (text csv): each field is a span of the bytes,
-;; given to its column as it is found (glue/CsvFast.cs). The types are
-;; guessed from the first rows of the file, a guessed column of longs that
-;; meets a decimal in any piece becomes one of doubles in all of them, and
-;; the pieces are put one after the other. When the file is not
+;; A file of 4 MB or more with a header is read into one array of bytes, in
+;; parts on the compute threads, cut by (text csv)'s csv-cut-rows into one
+;; piece of whole rows for each compute thread (one piece with one thread),
+;; and the pieces are read on the compute threads without (text csv): each
+;; field is a span of the bytes, given to its column as it is found (see
+;; "Reading in pieces"). The types are guessed from the first rows of the
+;; file, a guessed column of longs that meets a decimal in any piece becomes
+;; one of doubles in all of them, and the pieces are put one after the other
+;; by CsvJoin (glue/Csv.cs), which copies each value once. When the file is not
 ;; what that reader reads (a blank line, a carriage return or a quote inside
 ;; a field that is not quoted, a row of another number of fields) or a field
 ;; is not of its column's type, the file is read on one thread as above,
@@ -46,32 +47,40 @@
 (import (text csv))
 (import (bjostat table))
 (import (bjostat query))
-(import (only (std parallel) computing-each compute-thread-count))
-
-(import/extern
-  (install-workers (: Bjostat.Workers.Install (-> (-> int (-> int Unit) Unit) int void))))
-
-;; The glue of this module (CsvFast) runs its parts on (std parallel)'s compute
-;; threads. See glue/Workers.cs.
-(: (-> int (-> int Unit) Unit))
-(defun (run-on-compute-threads n work)
-  (ignore (computing-each n work))
-  unit)
-
-(def _workers
-  (begin (install-workers run-on-compute-threads (compute-thread-count)) #t))
+(import (only (std parallel) computing-each))
+(import (only (std array) array-copy!))
+(import (only (std maths) quotient remainder))
 
 (import/class (CsvColumn (: Bjostat.CsvColumn)))
-(import/extern (read-all-bytes (: System.IO.File.ReadAllBytes (-> string (Array byte)) #:blocking)))
-
-;; The pieces of a large file, read with no string made for a field: see
-;; glue/CsvFast.cs. Each answers None where the file is not what it reads,
-;; and read-csv then reads the file on one thread.
+;; A large file is read in parts on the compute threads, into one array that
+;; is not zeroed first.
+(import/class
+  (SafeFileHandle (: Microsoft.Win32.SafeHandles.SafeFileHandle))
+  (FileMode (: System.IO.FileMode))
+  (FileAccess (: System.IO.FileAccess))
+  (FileShare (: System.IO.FileShare))
+  (FileOptions (: System.IO.FileOptions)))
 (import/extern
-  (fast-names (: Bjostat.CsvFast.Names (-> (Array byte) int int (Option (Array string)))))
-  (fast-guess (: Bjostat.CsvFast.Guess (-> (Array byte) int int int int int (Array string) (Option (Array int)))))
-  (fast-read (: Bjostat.CsvFast.Read (-> (Array byte) (Array int) (Array string) (Array int) (Array bool) int
-                                          (Array string) (Option Table)))))
+  (open-handle (: System.IO.File.OpenHandle (-> string FileMode FileAccess FileShare FileOptions long SafeFileHandle)))
+  (handle-length (: System.IO.RandomAccess.GetLength (-> SafeFileHandle long)))
+  (read-at (: System.IO.RandomAccess.Read (-> SafeFileHandle (Span byte) long int) #:blocking))
+  (close-handle (: Microsoft.Win32.SafeHandles.SafeFileHandle.Dispose (-> SafeFileHandle void)))
+  (uninitialized-bytes (: System.GC.AllocateUninitializedArray (-> int bool (Array byte)))))
+
+;; For the reader of the pieces of a large file (see "Reading in pieces").
+(import/class (CsvJoin (: Bjostat.CsvJoin)))
+(import/extern
+  (index-of-any3 (: System.MemoryExtensions.IndexOfAny (-> (RoSpan byte) byte byte byte int)))
+  (index-of-any2 (: System.MemoryExtensions.IndexOfAny (-> (RoSpan byte) byte byte int)))
+  (index-of-byte (: System.MemoryExtensions.IndexOf (-> (RoSpan byte) byte int)))
+  (same-bytes? (: System.MemoryExtensions.SequenceEqual (-> (RoSpan byte) (RoSpan byte) bool)))
+  (utf8-valid? (: System.Text.Unicode.Utf8.IsValid (-> (RoSpan byte) bool)))
+  (guess-span (: Bjostat.CsvColumn.GuessSpan (-> (RoSpan byte) int)))
+  (make-sized-column (: Bjostat.CsvColumn.MakeSized (-> int int int CsvColumn)))
+  (column-add-span! (: Bjostat.CsvColumn.AddSpanTo (-> CsvColumn (RoSpan byte) bool)))
+  (join-start (: Bjostat.CsvJoin.Start (-> (Array CsvColumn) CsvJoin)))
+  (join-copy! (: Bjostat.CsvJoin.Copy (-> CsvJoin int void)))
+  (join-finish (: Bjostat.CsvJoin.Finish (-> CsvJoin AnyColumn))))
 
 ;; The kinds of a CsvColumn. Long, Double and String are the order of a
 ;; guess: each holds what the one before it holds.
@@ -167,22 +176,53 @@
 ;; byte order mark.
 (: (-> string (Option (Array byte))))
 (defun (file-bytes path)
-  (def (Ok bytes) (try (read-all-bytes path) #:catch (System.IO.IOException System.UnauthorizedAccessException))
+  (def (Ok (Some bytes)) (try (read-in-parts path) #:catch (System.IO.IOException System.UnauthorizedAccessException))
     :leave-with None)
   (if (and (>= (array-length bytes) 3)
            (= (array-ref bytes 0) 239uy) (= (array-ref bytes 1) 187uy) (= (array-ref bytes 2) 191uy))
       None
       (Some bytes)))
 
+;; The bytes of the file, read in parts of 1 MB or more on the compute
+;; threads into an array that is not zeroed first; or None: when the file is
+;; larger than an array, or shorter than its length said when it is read.
+;; Raises IOException when it does not open or read.
+(: (-> string (Option (Array byte))))
+(defun (read-in-parts path)
+  (with-open ((h (open-handle path FileMode.Open FileAccess.Read FileShare.Read FileOptions.None 0L)))
+    (def length (handle-length h))
+    ;; Array.MaxLength.
+    (if (> length 2147483591L)
+        None
+        (begin
+          (def n (cast int length))
+          (def bytes (uninitialized-bytes n #f))
+          (def parts (max 1 (min (worker-count) (quotient n 1000000))))
+          (: (-> int int))
+          (defun (at k) (cast int (quotient (* (cast long n) (cast long k)) (cast long parts))))
+          (def whole (computing-each parts (fun (k) (read-range! h bytes (at k) (at (+ k 1))))))
+          (if (some? (find (fun (ok) (not ok)) whole)) None (Some bytes))))))
+
+;; Reads the bytes from `from` to `to` of the file into the same range of
+;; `bytes`. #f when the file ends first.
+(: (-> SafeFileHandle (Array byte) int int bool))
+(defun (read-range! h bytes from to)
+  (let go ((at from))
+    (if (>= at to)
+        #t
+        (begin
+          (def n (read-at h (array->span bytes #:from at #:to to) (cast long at)))
+          (if (> n 0) (go (+ at n)) #f)))))
+
 ;; The table of a large file with a header, or None when the file is small,
-;; is not what the fast reader reads (glue/CsvFast.cs), or does not read with
-;; the types: then read-csv reads it with (text csv), which says what is
-;; wrong. The file is read once, and cut by csv-cut-rows into one piece of
-;; whole rows for each compute thread: a piece is a range of the bytes, not a
-;; copy. The types are guessed from the first rows of the first piece, and
-;; the pieces are read on the compute threads, which check that their bytes
-;; are UTF-8. A category is made after the pieces are put together, so that
-;; all of them have its levels.
+;; is not what the fast reader below reads, or does not read with the types:
+;; then read-csv reads it with (text csv), which says what is wrong. The
+;; file is read once, and cut by csv-cut-rows into one piece of whole rows
+;; for each compute thread: a piece is a range of the bytes, not a copy. The
+;; types are guessed from the first rows of the first piece, and the pieces
+;; are read on the compute threads, which check that their bytes are UTF-8.
+;; A category is made after the pieces are put together, so that all of them
+;; have its levels.
 (: (-> string char (Vec (Tuple string ColumnType)) int (Vec string) (Option Table)))
 (defun (read-pieces path separator types guess-rows nulls)
   (def (Some bytes) (large-file-bytes path) :leave-with None)
@@ -194,20 +234,315 @@
 
 (: (-> (Array byte) (Array int) char (Vec (Tuple string ColumnType)) int (Vec string) (Option Table)))
 (defun (read-cut bytes cuts separator types guess-rows nulls)
-  (def sep (char->integer separator))
-  (def null-names (vec->array nulls))
+  (def sep (cast byte (char->integer separator)))
+  (def null-bytes {arraying (string->bytes n) (:for n nulls)})
   (def plain (vec-map (fun (p) (match p ((Tuple name Category) (Tuple name String)) (_ p))) types))
-  (def (Some names) (fast-names bytes (array-ref cuts 0) sep) :leave-with None)
+  (def (Some names) (header-names bytes (array-ref cuts 0) sep) :leave-with None)
   (def (Ok given) (given-kinds names plain) :leave-with None)
-  (def (Some guessed-kinds)
-    (fast-guess bytes (array-ref cuts 0) (array-ref cuts 1) (array-length names) sep guess-rows null-names)
+  (def width (array-length names))
+  (def (Some g) (guess-kinds bytes (array-ref cuts 0) (array-ref cuts 1) width sep guess-rows null-bytes)
     :leave-with None)
-  (def kinds {arraying (match (vec-ref given i) ((Some k) k) (None (array-ref guessed-kinds i)))
-                       (:for i (range 0 (array-length names)))})
-  (def guessed {arraying (none? g) (:for g given)})
-  (match (fast-read bytes cuts names kinds guessed sep null-names)
-    ((Some t) (match (categorized t types) ((Ok c) (Some c)) ((Err _) None)))
-    (None None)))
+  (def kinds {arraying (match (vec-ref given i) ((Some k) k) (None (array-ref (record-ref g kinds) i)))
+                       (:for i (range 0 width))})
+  (def guessed {arraying (none? k) (:for k given)})
+  (def r (Reading (kinds kinds) (guessed guessed) (separator sep) (nulls null-bytes)
+                  (rows-per-byte (record-ref g rows-per-byte)) (bytes-per-row (record-ref g bytes-per-row))))
+  (def count (- (array-length cuts) 1))
+  (def parts (computing-each count (fun (k) (read-piece bytes (array-ref cuts k) (array-ref cuts (+ k 1)) r))))
+  (if (some? (find (fun (p) (none? p)) parts))
+      None
+      (join-pieces names kinds {arraying (match p ((Some cs) cs) (None (: (make-array 0) (Array CsvColumn))))
+                                         (:for p parts)}
+                   types)))
+
+;; ===========================================================================
+;; Reading in pieces
+;; ===========================================================================
+;;
+;; Each field is a span of the file's bytes, given to its column as it is
+;; found: no string is made for a field and no array for a row. A quoted
+;; field with a doubled quote is the one field that is copied, into a buffer
+;; that is used again.
+;;
+;; It reads what (text csv) reads, RFC 4180, or gives up: a row ends at a
+;; line feed, after a carriage return or not; a quoted field may hold the
+;; separator and line feeds, and two quotes are one. On anything else (a
+;; blank line, a carriage return or a quote inside an unquoted field, a row
+;; of another number of fields, a field that is not of its column's type)
+;; it returns None, and read-csv reads the file with (text csv), which says
+;; what is wrong and where.
+
+;; What follows a field.
+(: int) (def step-field 0)
+(: int) (def step-row-end 1)
+;; Nothing is left: no field.
+(: int) (def step-end 2)
+;; The bytes are not what this reader reads.
+(: int) (def step-bad 3)
+
+;; A field: its bytes from `from` to `to`, of the file or, when `copied?`, of
+;; the reader's buffer; what follows it; and where the next field starts.
+(type (: Found (Struct (: step int) (: from int) (: to int) (: next int) (: copied? bool))))
+
+(: Found) (def bad (Found (step step-bad) (from 0) (to 0) (next 0) (copied? #f)))
+
+;; A quoted field with doubled quotes, without them.
+(type (: Unquoted (Record (: bytes (Array byte) #:mutable))))
+
+(: (-> Unquoted))
+(defun (new-unquoted) (Unquoted (bytes (: (make-array 256) (Array byte)))))
+
+;; The field that starts at `at`, in the bytes up to `end`.
+(: (-> (Array byte) int int byte Unquoted Found))
+(defun (next-field b at end sep unq)
+  (cond
+    ((>= at end) (Found (step step-end) (from at) (to at) (next at) (copied? #f)))
+    ((= (array-ref b at) 34uy) (quoted-field b at end sep unq))
+    (else
+     (def i (index-of-any3 (array->ro-span b #:from at #:to end) sep 10uy 34uy))
+     (def stop (if (< i 0) end (+ at i)))
+     (def cr (index-of-byte (array->ro-span b #:from at #:to stop) 13uy))
+     (cond
+       ((and (< stop end) (= (array-ref b stop) 34uy)) bad)
+       ((< cr 0) (after b at stop stop end sep #f))
+       ;; A carriage return only just before the line feed that ends the row.
+       ((and (= (+ at cr) (- stop 1)) (< stop end) (= (array-ref b stop) 10uy))
+        (after b at (- stop 1) stop end sep #f))
+       (else bad)))))
+
+;; The quoted field that starts at `at`. Two quotes are one, and the field
+;; is then copied into the buffer without them.
+(: (-> (Array byte) int int byte Unquoted Found))
+(defun (quoted-field b at end sep unq)
+  (def start (+ at 1))
+  (let go ((i start) (length 0) (copied? #f))
+    (def j (index-of-byte (array->ro-span b #:from i #:to end) 34uy))
+    (def q (+ i j))
+    (cond
+      ((< j 0) bad)
+      ((and (< (+ q 1) end) (= (array-ref b (+ q 1)) 34uy))
+       (go (+ q 2) (unquote! unq b i (+ q 1) length) #t))
+      (else
+       (def cr? (and (< (+ q 1) end) (= (array-ref b (+ q 1)) 13uy)))
+       (def stop (if cr? (+ q 2) (+ q 1)))
+       (cond
+         ((and cr? (or (>= stop end) (not (= (array-ref b stop) 10uy)))) bad)
+         ((and (< stop end) (not (= (array-ref b stop) sep)) (not (= (array-ref b stop) 10uy))) bad)
+         (copied? (after b 0 (unquote! unq b i q length) stop end sep #t))
+         (else (after b start q stop end sep #f)))))))
+
+;; Appends the bytes from `from` to `to` to the first `length` of the buffer,
+;; and returns the new length.
+(: (-> Unquoted (Array byte) int int int int))
+(defun (unquote! unq b from to length)
+  (def n (- to from))
+  (def buf (record-ref unq bytes))
+  (def room
+    (if (> (+ length n) (array-length buf))
+        (let ((bigger (array-resize buf (max (* 2 (array-length buf)) (+ length n)))))
+          (record-set! unq (bytes bigger))
+          bigger)
+        buf))
+  (array-copy! b from room length n)
+  (+ length n))
+
+;; The field from `from` to `to`, whose end is the byte at `stop`: a
+;; separator, a line feed, or the end of the bytes. A blank line is bad, as
+;; (text csv) skips it, which this reader does not do; so is a separator at
+;; the very end, which leaves an empty last field.
+(: (-> (Array byte) int int int int byte bool Found))
+(defun (after b from to stop end sep copied?)
+  (cond
+    ((>= stop end) (Found (step step-row-end) (from from) (to to) (next stop) (copied? copied?)))
+    ((= (array-ref b stop) sep)
+     (if (>= (+ stop 1) end)
+         bad
+         (Found (step step-field) (from from) (to to) (next (+ stop 1)) (copied? copied?))))
+    (else
+     (def next (+ stop 1))
+     (if (and (< next end) (or (= (array-ref b next) 10uy) (= (array-ref b next) 13uy)))
+         bad
+         (Found (step step-row-end) (from from) (to to) (next next) (copied? copied?))))))
+
+(: (-> (Array byte) Unquoted Found (RoSpan byte)))
+(defun (field-span b unq f)
+  (array->ro-span (if (record-ref f copied?) (record-ref unq bytes) b)
+                  #:from (record-ref f from) #:to (record-ref f to)))
+
+(: (-> (RoSpan byte) (Array (Array byte)) bool))
+(defun (null-field? s nulls)
+  (let go ((i 0))
+    (cond
+      ((= i (array-length nulls)) #f)
+      ((same-bytes? s (array->ro-span (array-ref nulls i))) #t)
+      (else (go (+ i 1))))))
+
+;; The names in the header line, the bytes up to `header-end`, or None: also
+;; when they are not UTF-8.
+(: (-> (Array byte) int byte (Option (Array string))))
+(defun (header-names b header-end sep)
+  (def unq (new-unquoted))
+  (def names (transientvec-empty))
+  (if (not (utf8-valid? (array->ro-span b #:to header-end)))
+      None
+      (let go ((at 0))
+        (def f (next-field b at header-end sep unq))
+        (def step (record-ref f step))
+        (cond
+          ((or (= step step-bad) (= step step-end)) None)
+          (else
+           (transientvec-add! names (bytes->string (if (record-ref f copied?) (record-ref unq bytes) b)
+                                                   #:start (record-ref f from) #:end (record-ref f to)))
+           (if (= step step-row-end)
+               (Some (vec->array (transientvec->vec names)))
+               (go (record-ref f next))))))))
+
+;; The kinds guessed from the first rows, and what the pieces are sized by:
+;; the rows in a byte, and the bytes of each column in a row.
+(type (: Guess (Record (: kinds (Array int))
+                       (: rows-per-byte double)
+                       (: bytes-per-row (Array double)))))
+
+;; The kind of each of the `width` columns, guessed from the first
+;; `guess-rows` rows of the bytes from `from` to `to`, rows after the header,
+;; as CsvColumn guesses a field, string for a column of nulls only; or None.
+(: (-> (Array byte) int int int byte int (Array (Array byte)) (Option Guess)))
+(defun (guess-kinds b from to width sep guess-rows nulls)
+  (def kinds (: (make-array width #:fill kind-empty) (Array int)))
+  (def field-bytes (: (make-array width #:fill 0) (Array int)))
+  (def unq (new-unquoted))
+  (let go ((at from) (c 0) (row 0))
+    (def f (next-field b at to sep unq))
+    (def step (record-ref f step))
+    (cond
+      ((or (= row guess-rows) (and (= step step-end) (= c 0)))
+       (Some (guessed-from kinds field-bytes (- at from) row)))
+      ((or (= step step-bad) (= step step-end) (>= c width)) None)
+      (else
+       (def s (field-span b unq f))
+       (unless (null-field? s nulls)
+         (array-set! kinds c (join-kinds (array-ref kinds c) (guess-span s))))
+       (array-set! field-bytes c (+ (array-ref field-bytes c) (ro-span-length s)))
+       (cond
+         ((not (= step step-row-end)) (go (record-ref f next) (+ c 1) row))
+         ((= c (- width 1)) (go (record-ref f next) 0 (+ row 1)))
+         (else None))))))
+
+(: (-> (Array int) (Array int) int int Guess))
+(defun (guessed-from kinds field-bytes used rows)
+  (Guess (kinds {arraying (if (= k kind-empty) kind-string k) (:for k kinds)})
+         (rows-per-byte (if (> used 0) (/ (cast double rows) (cast double used)) 0.0))
+         (bytes-per-row {arraying (if (> rows 0) (/ (cast double n) (cast double rows)) 0.0)
+                                  (:for n field-bytes)})))
+
+;; What each piece is read with.
+(type (: Reading (Record (: kinds (Array int))
+                         (: guessed (Array bool))
+                         (: separator byte)
+                         (: nulls (Array (Array byte)))
+                         (: rows-per-byte double)
+                         (: bytes-per-row (Array double)))))
+
+;; The rows of the bytes from `from` to `to` into new columns, or None: also
+;; when the bytes are not UTF-8, which is checked here, on the piece's
+;; thread. The columns are sized for the rows the guess expects, and a
+;; tenth more, so that they seldom grow.
+(: (-> (Array byte) int int Reading (Option (Array CsvColumn))))
+(defun (read-piece b from to r)
+  (def kinds (record-ref r kinds))
+  (def rows (+ 64 (cast int (* 1.1 (record-ref r rows-per-byte) (cast double (- to from))))))
+  (def per-row (record-ref r bytes-per-row))
+  (if (not (utf8-valid? (array->ro-span b #:from from #:to to)))
+      None
+      (begin
+        (def cols {arraying (make-sized-column (array-ref kinds c) rows
+                                               (cast int (* (cast double rows) (array-ref per-row c))))
+                            (:for c (range 0 (array-length kinds)))})
+        (def plain? (< (index-of-any2 (array->ro-span b #:from from #:to to) 34uy 13uy) 0))
+        (if (if plain? (read-plain-rows! b from to r cols) (read-rows! b from to r cols (new-unquoted)))
+            (Some cols)
+            None))))
+
+;; The rows of bytes with no quote and no carriage return, which the reader
+;; of read-rows! reads so: each field ends at the next separator or line
+;; feed. It is one loop, with one search for each field.
+(: (-> (Array byte) int int Reading (Array CsvColumn) bool))
+(defun (read-plain-rows! b from to r cols)
+  (def width (array-length cols))
+  (def last (- width 1))
+  (def sep (record-ref r separator))
+  (def guessed (record-ref r guessed))
+  (def nulls (record-ref r nulls))
+  (let go ((at from) (c 0))
+    (cond
+      ((>= at to) (= c 0))
+      ((>= c width) #f)
+      (else
+       (def i (index-of-any2 (array->ro-span b #:from at #:to to) sep 10uy))
+       (def stop (if (< i 0) to (+ at i)))
+       (def next (+ stop 1))
+       (cond
+         ((not (add-field! (array-ref cols c) (array-ref guessed c) nulls (array->ro-span b #:from at #:to stop))) #f)
+         ((>= stop to) (= c last))
+         ;; A separator at the very end leaves an empty last field.
+         ((= (array-ref b stop) sep) (if (< next to) (go next (+ c 1)) #f))
+         ;; A blank line, which (text csv) skips.
+         ((and (< next to) (= (array-ref b next) 10uy)) #f)
+         ((= c last) (go next 0))
+         (else #f))))))
+
+(: (-> (Array byte) int int Reading (Array CsvColumn) Unquoted bool))
+(defun (read-rows! b from to r cols unq)
+  (def width (array-length cols))
+  (def sep (record-ref r separator))
+  (def guessed (record-ref r guessed))
+  (def nulls (record-ref r nulls))
+  (let go ((at from) (c 0))
+    (def f (next-field b at to sep unq))
+    (def step (record-ref f step))
+    (cond
+      ((= step step-end) (= c 0))
+      ((or (= step step-bad) (>= c width)) #f)
+      ((not (add-field! (array-ref cols c) (array-ref guessed c) nulls (field-span b unq f))) #f)
+      ((= step step-field) (go (record-ref f next) (+ c 1)))
+      ((= c (- width 1)) (go (record-ref f next) 0))
+      (else #f))))
+
+;; Adds the field to its column; a field that `#:nulls` names is a null. A
+;; guessed column of longs that meets a decimal becomes one of doubles, as
+;; on one thread.
+(: (-> CsvColumn bool (Array (Array byte)) (RoSpan byte) bool))
+(defun (add-field! col guessed? nulls field)
+  (def s (if (and (> (array-length nulls) 0) (null-field? field nulls)) (ro-span-slice field #:to 0) field))
+  (or (column-add-span! col s)
+      (and guessed? (= (guess-span s) kind-double) (widen! col) (column-add-span! col s))))
+
+;; The columns of the pieces, one after the other. A column of longs that is
+;; doubles in a piece becomes doubles in all of them. Each value is copied
+;; once, and the copies of the pieces of all columns run on the compute
+;; threads. A category is made after, so that it has the levels of all the
+;; pieces.
+(: (-> (Array string) (Array int) (Array (Array CsvColumn)) (Vec (Tuple string ColumnType)) (Option Table)))
+(defun (join-pieces names kinds parts types)
+  (def count (array-length parts))
+  (def width (array-length names))
+  (def joins
+    {arraying (begin
+                (def pieces {arraying (array-ref (array-ref parts k) c) (:for k (range 0 count))})
+                (when (and (= (array-ref kinds c) kind-long)
+                           (some? (find (fun (k) (= (column-kind (array-ref pieces k)) kind-double))
+                                        (range 0 count))))
+                  (loop (:for p pieces) (:do (ignore (widen! p)))))
+                (join-start pieces))
+              (:for c (range 0 width))})
+  (ignore (computing-each (* width count)
+                          (fun (i)
+                            (join-copy! (array-ref joins (quotient i count)) (remainder i count))
+                            unit)))
+  (def columns (computing-each width (fun (c) (join-finish (array-ref joins c)))))
+  (match (make-table {vecing (named-any (array-ref names c) (vec-ref columns c)) (:for c (range 0 width))})
+    ((Ok t) (match (categorized t types) ((Ok c) (Some c)) ((Err _) None)))
+    ((Err _) None)))
 
 ;; The table of CSV text.
 (: (-> string (#:header? bool) (#:separator char) (#:types (Vec (Tuple string ColumnType)))
