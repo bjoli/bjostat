@@ -1146,6 +1146,39 @@ wrapped above about n = 1000.
   no. The tie of two ranks is a <= and >= (same?), as C#'s ==; comparisons
   with a constant are the same either way.
 
+** Done: SAS transport files in Bjolang
+
+glue/Xpt.cs (613 lines) is (bjostat xpt) now, in Bjolang: the records of
+80 bytes through a buffer, the headers and descriptors, the IBM floats, the
+rows and their padding. The columns are made by the builder of glue/Query.cs,
+which stays. The glue is 6715 lines of C#.
+
+- The same results: scratch/xpt/make_files.py writes a file of 300 000 rows
+  (numbers of 2 to 8 bytes, every missing value, -0, dates and datetimes of
+  several formats, Latin-1 text, rows of blanks) and 21 files of one fault
+  each, and scratch/xpt/dump.bjo prints every cell (a double by its bits),
+  every variable and every message: 6 600 662 lines, the same before and
+  after. tests/xpt.bjo passes, and the other 14 test files.
+- Measured, the C# version (worktree of a8ae874) and this alternated, three
+  rounds of 15 reads of the file each, ms: C# 64.4-80.4, median 70.5-72.8;
+  Bjolang 62.2-74.6, median 71.4-72.2.
+- What the first version lost: a string for each cell of text, made with
+  bytes->string and given to a Builder of string, cost 38 ms of 100 (two
+  variables of text). Now each column of text writes its UTF-8 at the end of
+  a Builder of bytes, through its span, with a Builder of ints for the ends
+  and one of bools for the validity, and the three buffers make the
+  StringArray, as the C# did with its arrays.
+- An ArrowBuffer of a byte[] cannot be made from Bjolang: its constructor
+  takes a ReadOnlyMemory<byte>, and both ways to one, the constructor of
+  ReadOnlyMemory<T> and its op_Implicit, are members of a generic type. The
+  buffers are taken from the columns the builders make instead.
+- Two differences, both where the C# failed with an exception that was not
+  an Err: a file cut off inside a header record now reads the bytes that are
+  not there as no text and as a number that is not one, so it is an Err that
+  says which header is wrong; and a date that a column cannot hold is found
+  as the row is read, not when the column is made (the message is the
+  same, of the first such value in the order of the columns).
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema

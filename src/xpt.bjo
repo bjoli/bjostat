@@ -12,31 +12,86 @@
 ;; A number is a column of double, as SAS has no other number; text is a
 ;; column of string. A number of a date format is a column of dates, and one
 ;; of a datetime format a column of timestamps with no zone. A missing value,
-;; '.' or .A to .Z, is a null, and so is text of blanks only. The reading is in
-;; glue/Xpt.cs.
+;; '.' or .A to .Z, is a null, and so is text of blanks only.
+;;
+;; The file is records of 80 bytes. Its library header comes first, then each
+;; member, a dataset: a member header, two records of the member's name and
+;; label, a header of the number of variables, the descriptors of the
+;; variables (one "namestr" of 140 bytes each, packed and padded to 80), the
+;; observation header, and the rows, packed and padded to 80 with blanks. The
+;; next member header, or the end of the file, ends the rows.
+;;
+;; A number is an IBM System/360 float, big-endian: a sign bit, an exponent of
+;; 16 offset by 64 in seven bits, and a fraction of 56 bits. A variable of
+;; fewer than 8 bytes keeps the first bytes of the 8. A missing value is '.'
+;; (or .A to .Z, or ._) in the first byte and zeros after it: a null, as an
+;; empty text, which SAS cannot tell from a missing one.
+;;
+;; A number of a date format (DATE9., MMDDYY10. and the others) is days since
+;; 1960-01-01, and becomes a column of dates; one of a datetime format is
+;; seconds since 1960-01-01T00:00, and becomes one of timestamps with no zone.
+;; Text is Latin-1, the trailing blanks dropped.
+;;
+;; The rows are read 80 bytes at a time through a buffer, so a file is never
+;; held whole: the minute files of NHANES are gigabytes. Where the rows end, a
+;; row of blanks is the padding when it lies in the last record, as in
+;; pandas and haven.
 
 (export read-xpt xpt-variables xpt-members)
 
 (import (std prelude))
+(import (only (std maths) quotient))
+(import (only (std array) array-copy!))
 (import (bjostat table))
 
-(import/extern
-  (clr-read (: Bjostat.Xpt.Read (-> string string Table) #:exceptions (Bjostat.TableProblem)))
-  (clr-variables (: Bjostat.Xpt.Variables (-> string string Table) #:exceptions (Bjostat.TableProblem)))
-  (clr-members (: Bjostat.Xpt.Members (-> string (Array string)) #:exceptions (Bjostat.TableProblem))))
+(import/class
+  (FileStream (: System.IO.FileStream (-> string FileMode FileAccess FileShare int FileStream)))
+  (FileMode (: System.IO.FileMode))
+  (FileAccess (: System.IO.FileAccess))
+  (FileShare (: System.IO.FileShare))
+  (StringComparison (: System.StringComparison))
+  ;; The columns are built by the builder of (bjostat query), glue/Query.cs.
+  ((Builder %a) (: Bjostat.Builder))
+  ;; A column of text is put together from the buffers of three builders.
+  (ArrowBuffer (: Apache.Arrow.ArrowBuffer))
+  (ArrayData (: Apache.Arrow.ArrayData))
+  (TextArray (: Apache.Arrow.StringArray (-> int ArrowBuffer ArrowBuffer ArrowBuffer int int TextArray))))
 
-(: (-> (Result System.Exception %a) (Result TableError %a)))
-(defun (problem-or r)
-  (match r
-    ((Ok v) (Ok v))
-    ((Err e) (Err (TableError (message (.-Message e)))))))
+(import/extern
+  (clr-latin-1 (: System.Text.Encoding.Latin1 #:get))
+  (same-text? (: System.String.Equals (-> string string StringComparison bool)))
+  (scale-b (: System.Math.ScaleB (-> double int double)))
+  (dfloor (: System.Math.Floor (-> double double)))
+  ;; To even, as C#'s Math.Round.
+  (dround (: System.Math.Round (-> double double)))
+
+  (builder-make (: Bjostat.BuilderOps.Make (-> int (Builder %a)) #:uses-type))
+  (builder-add (: Bjostat.BuilderOps.Add (-> (Builder %a) %a (Builder %a))))
+  (builder-add-null (: Bjostat.BuilderOps.AddNull (-> (Builder %a) (Builder %a))))
+  (builder-count (: Bjostat.BuilderOps.Count (-> (Builder %a) int)))
+  (builder-build (: Bjostat.BuilderOps.Build (-> (Builder %a) AnyColumn)))
+  (builder-build-dates (: Bjostat.BuilderOps.BuildDates (-> (Builder int) AnyColumn)))
+  (builder-build-micros (: Bjostat.BuilderOps.BuildMicros (-> (Builder long) bool AnyColumn)))
+  (builder-extend (: Bjostat.BuilderOps.Extend (-> (Builder %a) int (Builder %a))))
+  (builder-span (: Bjostat.BuilderOps.Span (-> (Builder %a) int int (Span %a))))
+  (make-columns (: Bjostat.Tables.Make (-> (Array string) (Array AnyColumn) int Table)))
+  (column-data (: Apache.Arrow.IArrowArray.Data (-> AnyColumn ArrayData) #:get))
+  (data-buffers (: Apache.Arrow.ArrayData.Buffers (-> ArrayData (Array ArrowBuffer)) #:get))
+  (empty-buffer (: Apache.Arrow.ArrowBuffer.Empty #:get)))
+
+;; ===========================================================================
+;; What the module gives
+;; ===========================================================================
 
 ;; The table of the dataset `#:member` of the file, or of its first when no
 ;; member is named. A file that does not open, or is not a transport file of
 ;; version 5, is an Err that says so.
 (: (-> string (#:member string) (Result TableError Table)))
 (defun (read-xpt path #:member "")
-  (problem-or (clr-read path member)))
+  (with-file path
+    (fun (rs)
+      (def (Ok m) (find-member rs path member) :propagate)
+      (read-member rs m))))
 
 ;; A table of a row for each variable of the dataset: name, label, type (of
 ;; its column), length (in bytes, in the file) and format (SAS's). NHANES's
@@ -44,11 +99,676 @@
 ;; years at screening".
 (: (-> string (#:member string) (Result TableError Table)))
 (defun (xpt-variables path #:member "")
-  (problem-or (clr-variables path member)))
+  (with-file path
+    (fun (rs)
+      (def (Ok m) (find-member rs path member) :propagate)
+      (Ok (variables-table m)))))
 
 ;; The names of the datasets of the file. A file of NHANES has one.
 (: (-> string (Result TableError (Vec string))))
 (defun (xpt-members path)
-  (match (problem-or (clr-members path))
-    ((Ok a) (Ok (array->vec a)))
-    ((Err e) (Err e))))
+  (with-file path (fun (rs) (member-names rs path))))
+
+;; ===========================================================================
+;; Errors and the file
+;; ===========================================================================
+
+(: (-> string (Result TableError %a)))
+(defun (refuse message) (Err (TableError (message message))))
+
+(: (-> string string (Result TableError %a)))
+(defun (problem path what)
+  (refuse (str path " is not a SAS transport file of version 5: " what)))
+
+;; What `read` gives of the records of the file. A file that does not open,
+;; and a read that fails, are an Err of the path and what .NET says.
+(: (-> string (-> Records (Result TableError %a)) (Result TableError %a)))
+(defun (with-file path read)
+  (match (try (FileStream. path FileMode.Open FileAccess.Read FileShare.Read 65536)
+           #:catch (System.IO.IOException System.UnauthorizedAccessException))
+    ((Err e) (refuse (str path ": " (.-Message e))))
+    ((Ok stream)
+     (match (try (with-open ((s stream)) (read (make-records s)))
+              #:catch (System.IO.IOException))
+       ((Ok r) r)
+       ((Err e) (refuse (str path ": " (.-Message e))))))))
+
+;; ===========================================================================
+;; Records of 80 bytes
+;; ===========================================================================
+;;
+;; Through a buffer of 4096 of them. The record is the bytes of `buffer` from
+;; `start`, `size` of them: 80, or fewer for the last of a file whose end was
+;; cut off. `unread` gives the last record again.
+
+(: int)
+(def record-length 80)
+
+(type (: Records (Record (: stream FileStream)
+                         (: buffer (Array byte))
+                         (: at int #:mutable)
+                         (: limit int #:mutable)
+                         (: start int #:mutable)
+                         (: size int #:mutable)
+                         (: unread bool #:mutable))))
+
+(: (-> FileStream Records))
+(defun (make-records stream)
+  (Records (stream stream) (buffer (make-array (* record-length 4096)))
+           (at 0) (limit 0) (start 0) (size 0) (unread #f)))
+
+;; The next record, or #f at the end of the file.
+(: (-> Records bool))
+(defun (next! rs)
+  (cond
+    ((get rs .unread)
+     (set! rs .unread #f)
+     #t)
+    ((and (< (- (get rs .limit) (get rs .at)) record-length) (not (fill! rs))) #f)
+    (else
+     (def at (get rs .at))
+     (def n (min record-length (- (get rs .limit) at)))
+     (record-set! rs (start at) (size n) (at (+ at n)))
+     #t)))
+
+;; The next `next!` gives the last record again.
+(: (-> Records void))
+(defun (unread! rs) (set! rs .unread #t))
+
+;; Moves what is left to the start and reads after it; #f at the end.
+(: (-> Records bool))
+(defun (fill! rs)
+  (def* (buf (get rs .buffer))
+        (at (get rs .at))
+        (left (- (get rs .limit) at)))
+  (array-copy! buf at buf 0 left)
+  (def end
+    (let go ((end left))
+      (if (>= end (array-length buf))
+          end
+          (let ((read (.Read (get rs .stream) buf end (- (array-length buf) end))))
+            (if (> read 0) (go (+ end read)) end)))))
+  (record-set! rs (at 0) (limit end))
+  (> end 0))
+
+;; Whether the record starts with the bytes.
+(: (-> Records (Array byte) bool))
+(defun (starts-with? rs prefix)
+  (def* (buf (get rs .buffer))
+        (from (get rs .start))
+        (n (array-length prefix)))
+  (and (>= (get rs .size) n)
+       (let go ((i 0))
+         (cond
+           ((= i n) #t)
+           ((= (array-ref buf (+ from i)) (array-ref prefix i)) (go (+ i 1)))
+           (else #f)))))
+
+;; The Latin-1 text of `n` bytes of the record from `at`, blanks and zeros
+;; after it dropped. Past the end of a short record there is nothing.
+(: (-> Records int int string))
+(defun (record-text rs at n)
+  (latin-1 (get rs .buffer) (+ (get rs .start) at) (max 0 (min n (- (get rs .size) at)))))
+
+;; The number of `n` decimal digits of the record from `at`, or -1.
+(: (-> Records int int int))
+(defun (record-digits rs at n)
+  (if (> (+ at n) (get rs .size)) -1 (digits (get rs .buffer) (+ (get rs .start) at) n)))
+
+;; ===========================================================================
+;; Bytes
+;; ===========================================================================
+
+(: (-> string (Array byte)))
+(defun (header-bytes s) (string->bytes s))
+
+(: (Array byte))
+(def library-header (header-bytes "HEADER RECORD*******LIBRARY HEADER RECORD!!!!!!!"))
+(: (Array byte))
+(def library-v8-header (header-bytes "HEADER RECORD*******LIBV8   HEADER RECORD!!!!!!!"))
+(: (Array byte))
+(def member-header (header-bytes "HEADER RECORD*******MEMBER  HEADER RECORD!!!!!!!"))
+(: (Array byte))
+(def member-v8-header (header-bytes "HEADER RECORD*******MEMBV8  HEADER RECORD!!!!!!!"))
+(: (Array byte))
+(def descriptor-header (header-bytes "HEADER RECORD*******DSCRPTR HEADER RECORD!!!!!!!"))
+(: (Array byte))
+(def namestr-header (header-bytes "HEADER RECORD*******NAMESTR HEADER RECORD!!!!!!!"))
+(: (Array byte))
+(def obs-header (header-bytes "HEADER RECORD*******OBS     HEADER RECORD!!!!!!!"))
+(: (Array byte))
+(def any-header (header-bytes "HEADER RECORD*******"))
+
+;; The end of the bytes from `from` to `end` with the blanks and zeros after
+;; them dropped.
+(: (-> (Array byte) int int int))
+(defun (text-end b from end)
+  (let go ((e end))
+    (if (and (> e from) (let ((c (array-ref b (- e 1)))) (or (= c 32uy) (= c 0uy))))
+        (go (- e 1))
+        e)))
+
+;; The Latin-1 text of `n` bytes from `from`, blanks and zeros after it
+;; dropped.
+(: (-> (Array byte) int int string))
+(defun (latin-1 b from n)
+  (bytes->string b #:encoding clr-latin-1 #:start from #:end (text-end b from (+ from n))))
+
+;; A big-endian short, and an int.
+(: (-> (Array byte) int int))
+(defun (short-at b i)
+  (def v (bitwise-ior (shift-left (cast int (array-ref b i)) 8) (cast int (array-ref b (+ i 1)))))
+  (if (>= v 32768) (- v 65536) v))
+
+(: (-> (Array byte) int int))
+(defun (int-at b i)
+  (bitwise-ior (shift-left (cast int (array-ref b i)) 24) (shift-left (cast int (array-ref b (+ i 1))) 16)
+               (shift-left (cast int (array-ref b (+ i 2))) 8) (cast int (array-ref b (+ i 3)))))
+
+;; The number of the decimal digits, or -1 when one is not a digit.
+(: (-> (Array byte) int int int))
+(defun (digits b from n)
+  (let go ((i from) (acc 0))
+    (cond
+      ((= i (+ from n)) acc)
+      (:def c (cast int (array-ref b i)))
+      ((or (< c 48) (> c 57)) -1)
+      (else (go (+ i 1) (+ (* acc 10) (- c 48)))))))
+
+;; The IBM float of `n` bytes from `from`, or None at a missing value. Fewer
+;; than 8 bytes are the first of the 8, the rest zero.
+(: (-> (Array byte) int int (Option double)))
+(defun (ibm-double b from n)
+  (def fraction
+    (let go ((i 1) (f 0UL))
+      (if (< i n)
+          (go (+ i 1) (bitwise-ior f (shift-left (cast ulong (array-ref b (+ from i))) (- 56 (* 8 i)))))
+          f)))
+  (def first (cast int (array-ref b from)))
+  (def negative? (not (= (bitwise-and first 128) 0)))
+  (cond
+    ;; '.', '_' and 'A' to 'Z' are SAS's missing values.
+    ((= fraction 0UL)
+     (if (or (= first 46) (= first 95) (and (>= first 65) (<= first 90)))
+         None
+         (Some (if negative? (- 0.0) 0.0))))
+    (else
+     (def v (scale-b (cast double fraction) (- (* 4 (- (bitwise-and first 127) 64)) 56)))
+     (Some (if negative? (- v) v)))))
+
+;; ===========================================================================
+;; The headers
+;; ===========================================================================
+
+;; What a variable's cells become.
+(type (: Kind (Union NumberVar TextVar DateVar DateTimeVar)))
+
+(type (: Variable (Record (: name string)
+                          (: label string)
+                          (: format string)
+                          (: kind Kind)
+                          (: length int)
+                          (: position int))))
+
+(type (: Member (Record (: name string)
+                        (: label string)
+                        (: variables (Array Variable))
+                        (: row-length int))))
+
+;; The library header and its two records.
+(: (-> Records string (Result TableError void)))
+(defun (start! rs path)
+  (cond
+    ((not (next! rs)) (problem path "it is empty."))
+    ((starts-with? rs library-v8-header)
+     (refuse (str path " is a SAS transport file of version 8, and read-xpt reads version 5, "
+                  "the format of NHANES. Version 8 has long names; save the dataset with the "
+                  "XPORT engine, or as CSV.")))
+    ((not (starts-with? rs library-header))
+     (problem path (str "it does not start with the library header. A file of SAS's CPORT, "
+                        "or a .sas7bdat, is another format.")))
+    ((not (and (next! rs) (next! rs))) (problem path "the library header is cut short."))
+    (else (Ok unit))))
+
+;; The member named `wanted`, or the first when it is "", with the records at
+;; its rows.
+(: (-> Records string string (Result TableError Member)))
+(defun (find-member rs path wanted)
+  (def (Ok _started) (start! rs path) :propagate)
+  (let go ((seen (: [] (Vec string))))
+    (cond
+      ((not (next! rs))
+       (if (vec-empty? seen)
+           (problem path "it has no member.")
+           (refuse (str path " has no member '" wanted "'. Its members are: " (string-join seen ", ") "."))))
+      ((not (starts-with? rs member-header))
+       (problem path "a member header was expected where the last member's rows end."))
+      (:def (Ok m) (member-after-header rs path) :propagate)
+      ((or (string-empty? wanted) (same-text? (get m .name) wanted StringComparison.OrdinalIgnoreCase)) (Ok m))
+      (else
+       (skip-rows! rs)
+       (go (vec-add seen (get m .name)))))))
+
+;; The names of the members.
+(: (-> Records string (Result TableError (Vec string))))
+(defun (member-names rs path)
+  (def (Ok _started) (start! rs path) :propagate)
+  (let go ((names (: [] (Vec string))))
+    (cond
+      ((not (next! rs)) (Ok names))
+      ((not (starts-with? rs member-header))
+       (problem path "a member header was expected where the last member's rows end."))
+      (:def (Ok m) (member-after-header rs path) :propagate)
+      (else
+       (skip-rows! rs)
+       (go (vec-add names (get m .name)))))))
+
+;; The member whose header is the record, with the records at its rows.
+(: (-> Records string (Result TableError Member)))
+(defun (member-after-header rs path)
+  (cond
+    ((starts-with? rs member-v8-header)
+     (refuse (str path " has a member of version 8, and read-xpt reads version 5.")))
+    (:def size (record-digits rs 74 4))
+    ((not (or (= size 140) (= size 136)))
+     (problem path (str "a variable's descriptor is " (int->string size) " bytes, not 140.")))
+    ((not (and (next! rs) (starts-with? rs descriptor-header)))
+     (problem path "the descriptor header is missing."))
+    ((not (next! rs)) (problem path "a member header is cut short."))
+    (:def name (record-text rs 8 8))
+    ((not (next! rs)) (problem path "a member header is cut short."))
+    (:def label (record-text rs 32 40))
+    ((not (and (next! rs) (starts-with? rs namestr-header)))
+     (problem path (str "the header of the variables of '" name "' is missing.")))
+    (:def count (record-digits rs 54 4))
+    ((< count 0) (problem path (str "the number of the variables of '" name "' is not a number.")))
+    ;; The descriptors, packed over records and padded to a whole one.
+    (:def bytes (: (make-array (* (quotient (+ (* count size) (- record-length 1)) record-length) record-length))
+                   (Array byte)))
+    ((not (read-descriptors! rs bytes)) (problem path (str "the variables of '" name "' are cut short.")))
+    (:def (Ok vars) (descriptors bytes count size path name) :propagate)
+    ;; Version 8's labels would come here; then the rows.
+    ((not (next! rs)) (problem path (str "the rows of '" name "' have no header.")))
+    ((starts-with? rs obs-header)
+     (Ok (Member (name name) (label label) (variables vars)
+                 (row-length (loop (:for v vars)
+                                   (:acc m (folding 0 (max m (+ (get v .position) (get v .length))))))))))
+    ((starts-with? rs any-header)
+     (refuse (str path ": '" name "' has a header of version 8 (" (record-text rs 20 8)
+                  "), and read-xpt reads version 5.")))
+    (else (problem path (str "the rows of '" name "' have no header.")))))
+
+;; The records into `bytes`, which is a whole number of them; #f when the
+;; file ends first.
+(: (-> Records (Array byte) bool))
+(defun (read-descriptors! rs bytes)
+  (let go ((at 0))
+    (cond
+      ((>= at (array-length bytes)) #t)
+      ((or (not (next! rs)) (< (get rs .size) record-length)) #f)
+      (else
+       (array-copy! (get rs .buffer) (get rs .start) bytes at record-length)
+       (go (+ at record-length))))))
+
+(: (-> (Array byte) int int string string (Result TableError (Array Variable))))
+(defun (descriptors bytes count size path member)
+  (def vars (: (make-array count) (Array Variable)))
+  (let go ((i 0))
+    (if (= i count)
+        (Ok vars)
+        (match (descriptor bytes (* i size) path member)
+          ((Err e) (Err e))
+          ((Ok v)
+           (array-set! vars i v)
+           (go (+ i 1)))))))
+
+;; The namestr at `at`: big-endian shorts and an int among names padded with
+;; blanks.
+(: (-> (Array byte) int string string (Result TableError Variable)))
+(defun (descriptor d at path member)
+  (def* (vtype (short-at d at))
+        (vlength (short-at d (+ at 4)))
+        (name (latin-1 d (+ at 8) 8))
+        (label (latin-1 d (+ at 16) 40))
+        (format (string-upcase (latin-1 d (+ at 56) 8)))
+        (position (int-at d (+ at 84)))
+        (which (str "'" name "' of '" member "'")))
+  (def (Ok kind)
+    (cond
+      ((= vtype 1)
+       (cond
+         ((or (< vlength 2) (> vlength 8))
+          (problem path (str which " is a number of " (int->string vlength) " bytes; a number is 2 to 8.")))
+         ((date-format? format) (Ok DateVar))
+         ((datetime-format? format) (Ok DateTimeVar))
+         (else (Ok NumberVar))))
+      ((= vtype 2)
+       (if (< vlength 1)
+           (problem path (str which " is text of " (int->string vlength) " bytes."))
+           (Ok TextVar)))
+      (else
+       (problem path (str which " is of type " (int->string vtype) "; a variable is 1, a number, or 2, text."))))
+    :propagate)
+  (if (< position 0)
+      (problem path (str which " is at " (int->string position) " in a row."))
+      (Ok (Variable (name name) (label label) (format format) (kind kind) (length vlength) (position position)))))
+
+(: (Vec string))
+(def date-formats
+  ["DATE" "DAY" "E8601DA" "B8601DA" "IS8601DA" "JULIAN" "MONYY" "MMYY" "YYMM" "YYMON" "YYQ" "YEAR"
+   "QTR" "MONTH" "WEEKDATE" "WEEKDATX" "WEEKDAY" "WORDDATE" "WORDDATX" "DOWNAME" "MONNAME" "NLDATE"
+   "EURDFDD"])
+
+(: (Vec string))
+(def datetime-formats
+  ["DATETIME" "E8601DT" "B8601DT" "IS8601DT" "E8601DZ" "DATEAMPM" "MDYAMPM" "NLDATM"])
+
+(: (-> string bool))
+(defun (date-format? f)
+  (or (string-starts-with? f "MMDDYY") (string-starts-with? f "DDMMYY") (string-starts-with? f "YYMMDD")
+      (any? (fun (x) (= x f)) date-formats)))
+
+(: (-> string bool))
+(defun (datetime-format? f)
+  (any? (fun (x) (= x f)) datetime-formats))
+
+;; A row for each variable: its name, label, the type of its column, its
+;; length in bytes and its SAS format.
+(: (-> Member Table))
+(defun (variables-table m)
+  (def vars (get m .variables))
+  (def lengths (: (builder-make 1024) (Builder int)))
+  (loop (:for v vars) (:do (ignore (builder-add lengths (get v .length)))))
+  (make-columns #["name" "label" "type" "length" "format"]
+                #[(text-column vars (fun (v) (get v .name)))
+                  (text-column vars (fun (v) (get v .label)))
+                  (text-column vars (fun (v) (match (get v .kind)
+                                               (NumberVar "double")
+                                               (TextVar "string")
+                                               (DateVar "date")
+                                               (DateTimeVar "datetime"))))
+                  (builder-build lengths)
+                  (text-column vars (fun (v) (get v .format)))]
+                (array-length vars)))
+
+;; A column of a text of each variable, a null where it is empty.
+(: (-> (Array Variable) (-> Variable string) AnyColumn))
+(defun (text-column vars f)
+  (def b (: (builder-make 1024) (Builder string)))
+  (loop (:for v vars)
+        (:do (let ((s (f v)))
+               (ignore (if (string-empty? s) (builder-add-null b) (builder-add b s))))))
+  (builder-build b))
+
+;; ===========================================================================
+;; The rows
+;; ===========================================================================
+
+;; Whether the record is the header of a member, which ends the rows.
+(: (-> Records bool))
+(defun (member-start? rs)
+  (or (starts-with? rs member-header) (starts-with? rs member-v8-header)))
+
+;; Past the rows of a member, to the next member header or the end.
+(: (-> Records void))
+(defun (skip-rows! rs)
+  (let go ()
+    (when (next! rs)
+      (if (member-start? rs) (unread! rs) (go)))))
+
+;; A column of text as it is read: the UTF-8 of the cells one after another,
+;; where each ends, and whether each is there. A string for each cell would
+;; cost an array each: of a file of 300 000 rows with two variables of text,
+;; that was 38 ms of 100.
+(type (: Text (Record (: bytes (Builder byte))
+                      (: ends (Builder int))
+                      (: valid (Builder bool))
+                      (: nulls int #:mutable))))
+
+;; Where the cells of a variable go.
+(type (: Sink (Union (: Numbers (Builder double))
+                     (: Days (Builder int))
+                     (: Micros (Builder long))
+                     (: Texts Text))))
+
+(: (-> Variable Sink))
+(defun (sink-of v)
+  (match (get v .kind)
+    (NumberVar (Numbers (builder-make 1024)))
+    (TextVar
+     (def ends (: (builder-make 1025) (Builder int)))
+     (ignore (builder-add ends 0))
+     (Texts (Text (bytes (builder-make 4096)) (ends ends) (valid (builder-make 1024)) (nulls 0))))
+    (DateVar (Days (builder-make 1024)))
+    (DateTimeVar (Micros (builder-make 1024)))))
+
+;; A member's rows as they are read. `row` is the row being filled, `filled`
+;; bytes of it so far. `pending` is the number of rows of blanks not added
+;; yet: a row of blanks may be the padding, and it is a row when one that is
+;; not blank comes after it. `problems` has the first value of each column
+;; that its column cannot hold.
+(type (: Rows (Record (: vars (Array Variable))
+                      (: sinks (Array Sink))
+                      (: problems (Array (Option string)))
+                      (: row (Array byte))
+                      (: blank (Array byte))
+                      (: filled int #:mutable)
+                      (: pending int #:mutable))))
+
+;; SAS's day 0, 1960-01-01, is 3653 days before 1970-01-01, and so many
+;; seconds.
+(: double)
+(def days-to-1970 3653.0)
+
+(: double)
+(def seconds-to-1970 (* 3653.0 86400.0))
+
+(: (-> Records Member (Result TableError Table)))
+(defun (read-member rs m)
+  (def vars (get m .variables))
+  (def width (get m .row-length))
+  (def st (Rows (vars vars)
+                (sinks {arraying (sink-of v) (:for v vars)})
+                (problems (make-array (array-length vars) #:fill None))
+                (row (make-array (max width 1)))
+                (blank (make-array width #:fill 32uy))
+                (filled 0)
+                (pending 0)))
+  (when (> width 0)
+    (end-rows! st (read-rows! rs st)))
+  (finish st))
+
+;; The rows, to the next member header or the end of the file; the bytes of
+;; the records they were in.
+(: (-> Records Rows long))
+(defun (read-rows! rs st)
+  (let go ((region 0L))
+    (cond
+      ((not (next! rs)) region)
+      ((member-start? rs)
+       (unread! rs)
+       region)
+      (else
+       (take-record! st (get rs .buffer) (get rs .start) (get rs .size))
+       (go (+ region (cast long (get rs .size))))))))
+
+;; The `n` bytes of a record from `from` into rows.
+(: (-> Rows (Array byte) int int void))
+(defun (take-record! st buf from n)
+  (def* (row (get st .row))
+        (width (array-length (get st .blank))))
+  (let go ((at from) (left n))
+    (cond
+      ((= left 0) unit)
+      (:def filled (get st .filled))
+      (:def take (min (- width filled) left))
+      (else
+       (array-copy! buf at row filled take)
+       (cond
+         ((< (+ filled take) width) (set! st .filled (+ filled take)))
+         ((blank? row width)
+          (record-set! st (filled 0) (pending (+ (get st .pending) 1))))
+         (else
+          (set! st .filled 0)
+          (add-pending! st (get st .pending))
+          (add-row! st row)))
+       (go (+ at take) (- left take))))))
+
+;; Whether the first `width` bytes are blanks.
+(: (-> (Array byte) int bool))
+(defun (blank? row width)
+  (let go ((i 0))
+    (cond
+      ((= i width) #t)
+      ((= (array-ref row i) 32uy) (go (+ i 1)))
+      (else #f))))
+
+;; `k` rows of blanks.
+(: (-> Rows int void))
+(defun (add-pending! st k)
+  (set! st .pending 0)
+  (loop (:for _i (range 0 k)) (:do (add-row! st (get st .blank)))))
+
+;; The rows of blanks at the end that lie in the padding, under 80 bytes, are
+;; not rows; those before them are.
+(: (-> Rows long void))
+(defun (end-rows! st region)
+  (def width (cast long (array-length (get st .blank))))
+  (def padding (- region (* (quotient region width) width)))
+  (add-pending!
+   st
+   (let go ((pending (get st .pending)) (padding padding))
+     (if (and (> pending 0) (< (+ padding width) (cast long record-length)))
+         (go (- pending 1) (+ padding width))
+         pending))))
+
+(: (-> Rows (Array byte) void))
+(defun (add-row! st row)
+  (def* (vars (get st .vars))
+        (sinks (get st .sinks)))
+  (loop (:for i (range 0 (array-length vars)))
+        (:do (let ((v (array-ref vars i)))
+               (add-cell! st i v (array-ref sinks i) row (get v .position) (get v .length))))))
+
+(: (-> Rows int Variable Sink (Array byte) int int void))
+(defun (add-cell! st i v sink row from n)
+  (match sink
+    ((Numbers b)
+     (ignore (match (ibm-double row from n)
+               ((Some x) (builder-add b x))
+               (None (builder-add-null b)))))
+    ((Texts t) (add-text! t row from n))
+    ((Days b)
+     (ignore (match (ibm-double row from n)
+               ((Some x)
+                (def d (- (dfloor x) days-to-1970))
+                (if (and (>= d -2147483648.0) (<= d 2147483647.0))
+                    (builder-add b (cast int d))
+                    (begin
+                      (problem! st i (str "'" (get v .name) "' has the date " (.ToString x) " in row "
+                                          (int->string (builder-count b))
+                                          ", which is not a day a date column holds."))
+                      (builder-add-null b))))
+               (None (builder-add-null b)))))
+    ((Micros b)
+     (ignore (match (ibm-double row from n)
+               ((Some x)
+                (def us (dround (* (- x seconds-to-1970) 1e6)))
+                (if (and (>= us -9223372036854775808.0) (<= us 9223372036854775807.0))
+                    (builder-add b (cast long us))
+                    (begin
+                      (problem! st i (str "'" (get v .name) "' has the datetime " (.ToString x) " in row "
+                                          (int->string (builder-count b))
+                                          ", which is not one a timestamp column holds."))
+                      (builder-add-null b))))
+               (None (builder-add-null b)))))))
+
+;; The first value that column `i` cannot hold, kept.
+(: (-> Rows int string void))
+(defun (problem! st i message)
+  (def problems (get st .problems))
+  (when (none? (array-ref problems i))
+    (array-set! problems i (Some message))))
+
+;; A cell of Latin-1, blanks and zeros after it dropped; a null when nothing
+;; is left. Its bytes are written as UTF-8 at the end of the column's.
+(: (-> Text (Array byte) int int void))
+(defun (add-text! t row from n)
+  (def* (end (text-end row from (+ from n)))
+        (bytes (get t .bytes)))
+  (if (= end from)
+      (begin
+        (set! t .nulls (+ (get t .nulls) 1))
+        (ignore (builder-add (get t .valid) #f)))
+      (let ((at (builder-count bytes))
+            (k (utf-8-length row from end)))
+        (ignore (builder-extend bytes k))
+        (latin-1->utf-8! row from end (builder-span bytes at k))
+        (ignore (builder-add (get t .valid) #t))))
+  (ignore (builder-add (get t .ends) (builder-count bytes))))
+
+;; The number of bytes of the Latin-1 from `from` to `end` in UTF-8: two for
+;; each from 128 up.
+(: (-> (Array byte) int int int))
+(defun (utf-8-length b from end)
+  (let go ((i from) (k (- end from)))
+    (cond
+      ((= i end) k)
+      ((>= (array-ref b i) 128uy) (go (+ i 1) (+ k 1)))
+      (else (go (+ i 1) k)))))
+
+;; The Latin-1 bytes from `from` to `end` as UTF-8 into `out`.
+(: (-> (Array byte) int int (Span byte) void))
+(defun (latin-1->utf-8! b from end out)
+  (let go ((i from) (k 0))
+    (cond
+      ((= i end) unit)
+      (:def c (cast int (array-ref b i)))
+      ((< c 128)
+       (span-set! out k (cast byte c))
+       (go (+ i 1) (+ k 1)))
+      (else
+       (span-set! out k (cast byte (bitwise-ior 192 (shift-right c 6))))
+       (span-set! out (+ k 1) (cast byte (bitwise-ior 128 (bitwise-and c 63))))
+       (go (+ i 1) (+ k 2))))))
+
+;; The buffer of the values of a column the builders made.
+(: (-> AnyColumn ArrowBuffer))
+(defun (values-buffer c) (array-ref (data-buffers (column-data c)) 1))
+
+;; The column of strings of the text: the ends are its offsets, and the bits
+;; of the column of bools its validity, when there is a null.
+(: (-> Text AnyColumn))
+(defun (build-text t)
+  (def* (nulls (get t .nulls))
+        (ends (get t .ends))
+        (count (- (builder-count ends) 1))
+        (offsets (values-buffer (builder-build ends)))
+        (bytes (values-buffer (builder-build (get t .bytes))))
+        (valid (values-buffer (builder-build (get t .valid)))))
+  (cast AnyColumn (TextArray. count offsets bytes (if (= nulls 0) empty-buffer valid) nulls 0)))
+
+;; The table of the columns, or the first value one cannot hold.
+(: (-> Rows (Result TableError Table)))
+(defun (finish st)
+  (def vars (get st .vars))
+  (match (find some? (get st .problems))
+    ((Some (Some message)) (refuse message))
+    (_
+     (def sinks (get st .sinks))
+     (def rows
+       (if (= (array-length sinks) 0)
+           0
+           (match (array-ref sinks 0)
+             ((Numbers b) (builder-count b))
+             ((Texts t) (builder-count (get t .valid)))
+             ((Days b) (builder-count b))
+             ((Micros b) (builder-count b)))))
+     (def columns
+       {arraying (match s
+                   ((Numbers b) (builder-build b))
+                   ((Texts t) (build-text t))
+                   ((Days b) (builder-build-dates b))
+                   ((Micros b) (builder-build-micros b #f)))
+                 (:for s sinks)})
+     (Ok (make-columns {arraying (get v .name) (:for v vars)} columns rows)))))
