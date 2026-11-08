@@ -1228,8 +1228,9 @@
 (: (-> Table (#:by (Vec string)) (Result TableError Table)))
 (defun (table-distinct t #:by [])
   (def (Ok keys) (key-columns t (if (vec-empty? by) (table-names t) by)) :propagate)
+  ;; Empty when each row is distinct: then the table is the result.
   (def firsts (clr-firsts keys (table-row-count t)))
-  (Ok (if (= (array-length firsts) (table-row-count t))
+  (Ok (if (= (array-length firsts) 0)
           t
           (clr-take t firsts (array-length firsts)))))
 

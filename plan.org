@@ -1322,6 +1322,96 @@ kept them. The glue is 6241 lines of C# (222 out).
   functions with no lambda, kept-row-numbers and value-row-numbers, are
   calls, once each; the same loops.
 
+** Measured against Polars, November 8
+
+bjostat at commit ce183c5 (the ports of that day: the XPT files, the
+quantiles, the column aggregates, distinct, append and the pivots, and
+the column names compared ordinally) against Polars 2.1.0, on the two
+files above, one run after another (scratch/run-polars.sh; the tables by
+scratch/polars_tables.py). The median of 20 runs, in ms. The same results
+as Polars, but the last digits of the standard deviation and the
+correlation, and the 101 groups by the quantity of the wide file (100 in
+bjostat, which leaves out the rows of a null key).
+
+The narrow file:
+
+| Operation | bjostat, 24 threads | bjostat, 1 thread | Polars, 1 | Polars, 24 |
+|-----+-----+-----+-----+-----|
+| read csv | 41.9 | 191 | 73.5 | 18.6 |
+| filter, kept rows | 2.77 | 4.12 | 4.06 | 2.64 |
+| new column | 1.22 | 2.84 | 0.61 | 0.82 |
+| group by string, sum | 5.19 | 7.99 | 8.62 | 2.44 |
+| group by long, sum and count | 6.76 | 6.82 | 6.97 | 1.72 |
+| sort by a number | 20.1 | 51.7 | 55.1 | 26.3 |
+| sort by a string, then a number | 23.8 | 57.5 | 343 | 48.1 |
+| join by a string to the keys | 10.6 | 38.3 | 45.9 | 12.6 |
+| join by a long, one to one | 16.2 | 20.7 | 104 | 21.9 |
+| standard deviation | 0.836 | 0.838 | 0.48 | 0.49 |
+| median | 6.14 | 9.14 | 11.2 | 3.37 |
+| correlation | 2.09 | 2.1 | 1.1 | 1.22 |
+| summary of the table | 18.4 | 25.1 | 47 | 26.1 |
+| categorize a string column | 1.08 | 4.55 | 13.4 | 2.35 |
+| group by category, sum | 2.99 | 3.01 | 6.01 | 1.51 |
+| sort by a category, then a number | 20.7 | 44.2 | 274 | 39 |
+| count by a category | 0.144 | 0.722 | 5.77 | 1.53 |
+| join by a category to the keys | 5.63 | 4.97 | 26.5 | 8.66 |
+| distinct by a string and a long | 2.37 | 9.69 | 25.3 | 14.7 |
+| distinct rows | 3.5 | 6.77 | 124 | 83.2 |
+| append, two tables | 11.1 | 15.6 | 11.7 | 9.37 |
+| pivot longer, two columns | 4.7 | 3.9 | 4.8 | 4.88 |
+| pivot wider, two columns | 15 | 26.6 | 246 | 107 |
+| count by a string and a long | 1.83 | 6.8 | 8.11 | 2.98 |
+| crosstab of a string and a long | 2.49 | 10.6 | 8.55 | 3.43 |
+
+The wide file:
+
+| Operation | bjostat, 24 threads | bjostat, 1 thread | Polars, 1 | Polars, 24 |
+|-----+-----+-----+-----+-----|
+| read csv | 90.5 | 485 | 217 | 36.6 |
+| filter, kept rows | 6.68 | 11.5 | 9.5 | 6.34 |
+| new column | 1.65 | 1.66 | 0.96 | 1.12 |
+| group by string, sum | 14.7 | 17.7 | 47.8 | 21.5 |
+| group by long, sum and count | 7.9 | 7.34 | 9.13 | 2.32 |
+| sort by a number | 28.4 | 56.6 | 102 | 41.7 |
+| sort by a string, then a number | 39.5 | 78.9 | 416 | 63.9 |
+| join by a string to the keys | 13.4 | 49.6 | 105 | 17.7 |
+| join by a long, one to one | 13.4 | 26 | 175 | 34.5 |
+| standard deviation | 1.55 | 1.55 | 0.83 | 0.83 |
+| median | 6.21 | 9.11 | 11.9 | 4.9 |
+| correlation | 3.46 | 3.46 | 3.55 | 3.98 |
+| summary of the table | 29.8 | 69.9 | 164 | 95.7 |
+| categorize a string column | 6.45 | 10.9 | 27.1 | 2.9 |
+| group by category, sum | 6.52 | 6.53 | 31.7 | 15 |
+| sort by a category, then a number | 30.2 | 60.8 | 381 | 59.2 |
+| count by a category | 1.06 | 1.04 | 27.4 | 14.8 |
+| join by a category to the keys | 7.22 | 7.22 | 75.9 | 13.3 |
+| distinct by a string and a long | 17.7 | 40.7 | 148 | 63.1 |
+| distinct rows | 5.67 | 8.62 | 180 | 108 |
+| append, two tables | 15.6 | 19 | 23.1 | 17.9 |
+| pivot longer, two columns | 4.58 | 7.71 | 4.86 | 4.89 |
+| pivot wider, two columns | 16.7 | 34.9 | 238 | 107 |
+| count by a string and a long | 16.2 | 44.8 | 348 | 98.9 |
+| crosstab of a string and a long | 25.5 | 34.6 | 314 | 110 |
+
+bjostat on 24 threads is faster than Polars on 24 at 15 of 25 (narrow) and
+18 (wide), against 10 and 11 on October 30; on one thread faster than
+Polars on one at 18 and 20. Polars is still faster at reading the CSV, a
+group by a long, the standard deviation and the correlation (0.84 ms
+against 0.48 on the narrow file, from 2.47 on October 30), and a group by
+a string and the categorizing of the narrow file.
+
+Against November 6 (scratch/bench-2026-11-06/a), five rows looked slower.
+Measured again, a8ae874 (the commit before that day) and ce183c5
+alternated, three rounds: a join by a long is bimodal, about 10 or 19 ms
+in both (8.9-11.8 at ce183c5, 19.2-19.6 at a8ae874 on 24 threads; 20.5-21.3
+in both on one); a group by a category, a new column and pivot longer the
+same. distinct rows was slower, 7.5-7.8 against 5.8-6.1 ms on one thread,
+and allocated 3.9 MB more: ReshapeOps.Firsts copied the first row of each
+group, 10^6 ints, before table-distinct saw that each row was distinct.
+It now gives an empty array then, as the C# returned the table before a
+copy: 6.01-6.06 against 6.01-8.51 on one thread, 2.18-2.34 against
+2.36-2.43 on 24, and distinct by a string and a long the same.
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema

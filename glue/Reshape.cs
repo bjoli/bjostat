@@ -866,11 +866,15 @@ public static class Reshape
 /// </summary>
 public static class ReshapeOps
 {
-    /// <summary>The first row of each group of equal keys, in the order of the rows.</summary>
+    /// <summary>
+    /// The first row of each group of equal keys, in the order of the rows;
+    /// empty when each row is a group of its own, so that a caller keeps the
+    /// rows as they are without a copy of n row numbers.
+    /// </summary>
     public static int[] Firsts(IArrowArray[] keys, int n)
     {
         Reshape.Groups(keys, n, out var firsts, out _, false, needGroupIds: false);
-        return firsts.ToArray();
+        return firsts.Count == n ? System.Array.Empty<int>() : firsts.ToArray();
     }
 
     /// <summary>The group of each row, and the first row of each group.</summary>
