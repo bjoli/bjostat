@@ -1583,6 +1583,134 @@ indices, in one pass). The glue is 5630 lines of C# (478 out).
   each group's counts into a Vec to search them; and each count column
   copied twice (now FromArrayAt).
 
+** Done: Columns and Tables in Bjolang
+
+Bjolang can now construct a generic .NET type and import the members of
+one (Bjolang's CHANGELOG, "Generic .NET types can be constructed, and their
+members imported"). glue/Columns.cs was there because it could not: the
+members of PrimitiveArray<T> were reached through generic static methods.
+Now they are imports in src/table.bjo ("Columns and tables in Arrow"), and
+what was C# logic is Bjolang:
+
+- The columns: their length, nulls and values, a cell as an Option, the
+  typed array of a column (a type test with ~:is~), and a column of strings
+  through Arrow's StringArray.Builder.
+- The text of a cell for ~table->string~, with the same .NET calls as the
+  C#: Math.Round away from 0, ToString "R" and "G" in the invariant
+  culture, DateOnly and DateTime for dates and timestamps.
+- Arrow's name of a column's type, as ~type-of-column~ reads it.
+- Tables: a schema of fields, a slice, the names, and Arrow IPC files read
+  and written, with ~with-open~ and ~try~. ArrowFileReader has no batch
+  count that is not async; ReadNextRecordBatch returns null after the last
+  batch, and a type test of the result as an object finds it.
+
+What stays C#: Columns.FromArray and FromArrayAt, which write the values as
+the bytes of an ArrowBuffer (Bjolang cannot see a span of numbers as a span
+of bytes), and Tables.IndexOf, which the rest of the glue uses. src/xpt.bjo
+made its table with Tables.Make; it has its own ~make-columns~ now, over the
+same imports. The glue is 5419 lines of C# (211 out).
+
+- The same results: scratch/columns/dump.bjo prints the schema, the nulls
+  and every cell at four settings of ~#:digits~ of a table of each kind of
+  column (doubles with -0, infinities, NaN, 2.551e-11 and 1e300, floats,
+  longs and ints at their limits, shorts, bytes, strings with nulls and
+  non-ASCII text), of slices, an empty slice and a selection, of a CSV
+  table of dates, date-times, instants, bools and doubles, categorized, of
+  the messages of a missing column and of another type, and of IPC files
+  written and read back: 439 lines, the same before and after. All 15 test
+  files pass with all threads and with one.
+- Measured, the C# version (worktree of 7b6a539) and this alternated, three
+  rounds each (scratch/columns/bench.bjo):
+
+  | row                          | C#             | Bjolang        |
+  |------------------------------+----------------+----------------|
+  | column-ref, 1M               | 5.60-5.70 ms   | 5.66-5.68 ms   |
+  | string-column-ref, 1M        | 17.9-19.0 ms   | 17.8-18.5 ms   |
+  | table->string, 1000 rows     | 268-302 µs     | 268-272 µs     |
+  | doubles of 30 columns        | 3.05-3.37 µs   | 3.02-3.14 µs   |
+  | table-schema, 30 columns     | 1.50-1.83 µs   | 1.44-1.45 µs   |
+  | make-table, 30 columns       | 11.4-13.9 µs   | 10.9-11.1 µs   |
+  | array->string-column, 100k   | 5.05-5.13 ms   | 2.97-3.05 ms   |
+  | table-slice, 1000 times      | 120-134 µs     | 121-128 µs     |
+  | read-arrow, 1M rows          | 3.85-11.4 ms   | 3.80-3.92 ms   |
+  | write-arrow, 1M rows         | 10.4-10.5 ms   | 10.4-10.5 ms   |
+
+  ~array->string-column~ is faster because the C# took a ~string[]~, so
+  that the call made a .NET string of every string before the builder
+  saw one; now each string is converted as it is added (5.08 MB against
+  5.85). Then Bjolang could import ~Utf8String.AsSpan~ (the second finding
+  below), and each string's UTF-8 bytes go to the builder as they are:
+  0.92-1.09 ms and 2.03 MB, three runs. ~table->string~ allocates 3 % more (623 KB against 605). The one
+  slow read of the C# (11.4 ms) was one run of three.
+
+Found in Bjolang on the way, for its Todo.org:
+- A call by argument types does not leave out a trailing optional
+  parameter, as the resolution of a generic method does. Field's
+  constructor, StringArray.Builder.Build and Append, and
+  ArrowArrayConcatenator.Concatenate are given ~(clr-default)~ for it.
+- Fixed in Bjolang: an import of an instance method of
+  BjoString.Utf8String saw its receiver as BjoString.Utf8String, not as
+  Bjolang's ~string~, so ~Utf8String.AsSpan~ could not be imported. Now it
+  can, and the bytes are read-only: Bjolang refuses MemoryMarshal,
+  SequenceMarshal and Unsafe, which could make them writable.
+- An overloaded .NET member, as RecordBatch.Column of an int and of a
+  string, is ambiguous at a call whose argument type is not known yet. A
+  typed Bjolang function in front of the import decides it.
+- A Bjolang function does not upcast its arguments, as an import does:
+  ~(clr-new-field name clr-string-type)~ needs ~(cast ArrowType ...)~.
+
+** Done: the joins in Bjolang
+
+glue/Join.cs is Bjolang now, in src/table.bjo ("Joins: the rows that
+match"), with the four ways of the C#: by codes for one key that is a
+category in both tables; by the distance from the least for one key of
+integers whose right keys are dense; merged when both sides are sorted and
+the right keys unique; else by hashes, in a hash table of the right rows in
+64 parts on the compute threads. The left rows are matched in parts of
+65 536 with ~computing-each~. Also the check of the keys, which types are
+one type, the rows taken with nulls and the columns of nulls, which the
+pivots and appends use. Join.cs keeps KeyType, which Reshape.cs asks;
+Categories.IsType, LevelBytes and Nulls are public for the Bjolang. The
+glue is 4805 lines of C# (614 out).
+
+- The same results: scratch/join/dump.bjo prints the four joins of tables
+  with one key of each type (doubles with NaN, -0 and nulls, floats,
+  longs dense, sorted and unique, and sparse, ints, shorts, bytes,
+  strings, bools, dates, date-times, instants), two and three keys,
+  categories of other levels and of the same table, empty tables, names
+  both tables have, tables of 300 003 and 200 000 rows by each path (a
+  sha256 of the whole result), the messages of keys that cannot be, and a
+  pivot and two appends: 759 lines, the same before and after. All 15
+  test files pass with all threads and with one.
+- Measured, the C# version (worktree of 7b6a539) and this alternated, three
+  rounds each, 1M left rows (scratch/join/bench.bjo), ms:
+
+  | row                        | C#          | Bjolang     |
+  |----------------------------+-------------+-------------|
+  | string to the keys         | 11.7-15.8   | 12.7-12.8   |
+  | long, one to one, dense    | 11.8-20.0   | 11.3-11.5   |
+  | long, sorted, merged       | 13.9-21.4   | 12.7-12.8   |
+  | long, sparse, hashed       | 22.4-27.4   | 24.5-25.0   |
+  | left, sparse, hashed       | 28.9-30.5   | 32.3-32.6   |
+  | semi, sparse, hashed       | 19.2-24.4   | 22.0-22.7   |
+  | anti, sparse, hashed       | 23.0-27.0   | 25.4-26.6   |
+  | category to the keys       | 5.03-7.63   | 6.29-6.33   |
+  | two keys, hashed           | 13.4-17.1   | 14.1-14.6   |
+
+  The same memory or less: 61.9 MB against 65.7 merged, 40.5 against 46.4
+  hashed. The left join is 4-12 % slower (31.0-31.7 ms in two runs alone);
+  the difference to the inner join is the rows taken with nulls, a bit
+  of each row of each right column. Not found further.
+- What the first version lost, 1.5 to 2.4 times as slow: ~cell~ in a
+  loop, which reads PrimitiveArray.Values, and so makes the span, at each
+  row (the C# took the span once); the keys as longs with ~{arraying
+  ...}~, which grows a builder and copies it; an array of longs for the
+  keys made before the column was found not to be one of integers (8 MB
+  for a join by strings); and the matches of one part copied twice.
+- Bjolang found on the way: a struct with no parameterless constructor in
+  its metadata, as System.HashCode, could not be constructed. Now
+  ~(HashCode.)~ is ~new System.HashCode()~, and AddBytes changes it.
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema

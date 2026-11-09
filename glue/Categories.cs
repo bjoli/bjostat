@@ -29,7 +29,7 @@ public static class Categories
     public static bool Is(IArrowArray a) =>
         a is DictionaryArray { Dictionary: StringArray, Indices: Int32Array };
 
-    internal static bool IsType(IArrowType t) =>
+    public static bool IsType(IArrowType t) =>
         t is DictionaryType { IndexType: Int32Type, ValueType: StringType };
 
     /// <summary>
@@ -928,7 +928,7 @@ public static class Categories
     public static IArrowArray Codes(IArrowArray a) => ((DictionaryArray)a).Indices;
 
     /// <summary>The level of row <paramref name="i"/>, which is not null.</summary>
-    internal static ReadOnlySpan<byte> LevelBytes(DictionaryArray d, int i) =>
+    public static ReadOnlySpan<byte> LevelBytes(DictionaryArray d, int i) =>
         ((StringArray)d.Dictionary).GetBytes(((Int32Array)d.Indices).Values[i]);
 
     /// <summary>
@@ -991,6 +991,6 @@ public static class Categories
     }
 
     /// <summary>A category of n nulls, with no levels.</summary>
-    internal static IArrowArray Nulls(int n) =>
+    public static IArrowArray Nulls(int n) =>
         Make(new ArrowBuffer(new byte[n * sizeof(int)]), new ArrowBuffer(new byte[(n + 7) / 8]), n, n, System.Array.Empty<string>());
 }

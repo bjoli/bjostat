@@ -71,7 +71,7 @@
 (import/extern
   (clr-take (: Bjostat.Query.Take (-> Table (Array int) int Table)))
   (clr-with-column (: Bjostat.Query.WithColumn (-> Table string AnyColumn Table)))
-  (any-length (: Bjostat.Columns.Length (-> AnyColumn int)))
+  (any-length (: Apache.Arrow.IArrowArray.Length (-> AnyColumn int) #:get))
 
   ;; A builder is changed in place, and answered so that it is a
   ;; collector's accumulator.

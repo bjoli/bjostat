@@ -72,7 +72,11 @@
 (import (only (std simd) Simd128 Simd256))
 (import (only (std maths) quotient))
 (import (only (std atomic) atomic-array-increment!))
-(import (only (std array) array-fill!))
+(import (only (std array) array-fill! array-copy!))
+(import (only (std interop) clr-default))
+(import (only (std mutable vec) MutableVec mutablevec mutablevec-with-capacity mutablevec-add!
+              mutablevec-length mutablevec->array))
+(import (only (std mutable map) MutableMap mutablemap-with-capacity mutablemap-set! mutablemap-ref-or))
 
 ;; SimdSource, for the cells of a column of numbers: the re-exported methods
 ;; carry the trait to importers, as `chunk-size` carries Chunkable.
@@ -85,7 +89,7 @@
 (import/extern
   (install-workers (: Bjostat.Workers.Install (-> (-> int (-> int Unit) Unit) int void))))
 
-;; The glue of this module (Categories, Counts, Join, Reshape, Sort) runs its parts on (std parallel)'s compute
+;; The glue of this module (Categories, Reshape, Sort) runs its parts on (std parallel)'s compute
 ;; threads. See glue/Workers.cs.
 (: (-> int (-> int Unit) Unit))
 (defun (run-on-compute-threads n work)
@@ -96,40 +100,75 @@
   (begin (install-workers run-on-compute-threads (compute-thread-count)) #t))
 
 (import/class
-  (Table (: Apache.Arrow.RecordBatch))
+  (Table (: Apache.Arrow.RecordBatch (-> Schema (Array AnyColumn) int Table)))
   (AnyColumn (: Apache.Arrow.IArrowArray))
   ((Column %a) (: Apache.Arrow.PrimitiveArray))
   (StringColumn (: Apache.Arrow.StringArray))
   ((ClrCells %a) (: Bjostat.Cells))
   (ArrowType (: Apache.Arrow.Types.IArrowType))
   (Schema (: Apache.Arrow.Schema))
-  (Field (: Apache.Arrow.Field))
-  (ArrayData (: Apache.Arrow.ArrayData)))
+  (SchemaBuilder (: Apache.Arrow.Schema+Builder (-> SchemaBuilder)))
+  ;; The last argument is the field's metadata, null for none.
+  (Field (: Apache.Arrow.Field
+            (-> string ArrowType bool (ClrEnumerable (ClrPair System.String System.String)) Field)))
+  ((ClrEnumerable %a) (: System.Collections.Generic.IEnumerable))
+  ((ClrReadOnlyList %a) (: System.Collections.Generic.IReadOnlyList))
+  ((ClrPair %k %v) (: System.Collections.Generic.KeyValuePair))
+  (ArrayData (: Apache.Arrow.ArrayData))
+  (ArrowStringBuilder (: Apache.Arrow.StringArray+Builder (-> ArrowStringBuilder)))
+  (MemoryAllocator (: Apache.Arrow.Memory.MemoryAllocator))
+  (Encoding (: System.Text.Encoding))
+  (ArrowTypeId (: Apache.Arrow.Types.ArrowTypeId))
+  (TimestampType (: Apache.Arrow.Types.TimestampType))
+  (TimeUnit (: Apache.Arrow.Types.TimeUnit))
+  (MidpointRounding (: System.MidpointRounding))
+  (FormatProvider (: System.IFormatProvider))
+  (ClrDate (: System.DateOnly))
+  (ClrDateTime (: System.DateTime (-> long DateTimeKind ClrDateTime)))
+  (DateTimeKind (: System.DateTimeKind))
+  (Stream (: System.IO.Stream))
+  (FileStream (: System.IO.FileStream))
+  (ArrowFileReader (: Apache.Arrow.Ipc.ArrowFileReader (-> Stream ArrowFileReader)))
+  (ArrowFileWriter (: Apache.Arrow.Ipc.ArrowFileWriter (-> Stream Schema ArrowFileWriter))))
 
 (import/extern
   ;; Any column
-  (clr-type-name (: Bjostat.Columns.TypeName (-> AnyColumn string)))
-  (any-length (: Bjostat.Columns.Length (-> AnyColumn int)))
-  (any-null-count (: Bjostat.Columns.NullCount (-> AnyColumn int)))
-  (any->string (: Bjostat.Columns.CellText (-> AnyColumn int int string)))
-  (column->any (: Bjostat.Columns.Any (-> (Column %a) AnyColumn)))
-  (strings->any (: Bjostat.Columns.AnyStrings (-> StringColumn AnyColumn)))
+  (any-length (: Apache.Arrow.IArrowArray.Length (-> AnyColumn int) #:get))
+  (any-null-count (: Apache.Arrow.IArrowArray.NullCount (-> AnyColumn int) #:get))
+  (any-null? (: Apache.Arrow.IArrowArray.IsNull (-> AnyColumn int bool)))
+  (category? (: Bjostat.Categories.Is (-> AnyColumn bool)))
 
-  ;; Typed columns, after the type was checked
-  (as-doubles (: Bjostat.Columns.AsDoubles (-> AnyColumn (Column double))))
-  (as-floats (: Bjostat.Columns.AsFloats (-> AnyColumn (Column float))))
-  (as-longs (: Bjostat.Columns.AsLongs (-> AnyColumn (Column long))))
-  (as-ints (: Bjostat.Columns.AsInts (-> AnyColumn (Column int))))
-  (as-strings (: Bjostat.Columns.AsStrings (-> AnyColumn StringColumn)))
+  ;; Typed columns. The values at a null are unspecified.
+  (column-values (: Apache.Arrow.PrimitiveArray.Values (-> (Column %a) (RoSpan %a)) #:get))
+  (column-length (: Apache.Arrow.PrimitiveArray.Length (-> (Column %a) int) #:get))
+  (column-null-count (: Apache.Arrow.PrimitiveArray.NullCount (-> (Column %a) int) #:get))
+  (column-valid? (: Apache.Arrow.PrimitiveArray.IsValid (-> (Column %a) int bool)))
+  (string-column-length (: Apache.Arrow.StringArray.Length (-> StringColumn int) #:get))
+  (string-column-null-count (: Apache.Arrow.StringArray.NullCount (-> StringColumn int) #:get))
+  (string-column-valid? (: Apache.Arrow.StringArray.IsValid (-> StringColumn int bool)))
+  (string-column-bytes (: Apache.Arrow.StringArray.GetBytes (-> StringColumn int (RoSpan byte))))
+  ;; The encoding is null: Arrow's strings are UTF-8.
+  (string-column-text (: Apache.Arrow.StringArray.GetString (-> StringColumn int Encoding string)))
+  (utf-8->string (: BjoString.Utf8String.FromUtf8 (-> (RoSpan byte) string)))
 
-  (column-values (: Bjostat.Columns.Values (-> (Column %a) (RoSpan %a))))
-  (column-length (: Bjostat.Columns.TypedLength (-> (Column %a) int)))
-  (column-null-count (: Bjostat.Columns.TypedNullCount (-> (Column %a) int)))
-  (column-valid? (: Bjostat.Columns.TypedIsValid (-> (Column %a) int bool)))
-  (column-ref (: Bjostat.Columns.Ref (-> (Column %a) int (Option %a))))
-  (string-column-length (: Bjostat.Columns.StringsLength (-> StringColumn int)))
-  (string-column-null-count (: Bjostat.Columns.StringsNullCount (-> StringColumn int)))
-  (string-column-ref (: Bjostat.Columns.StringRef (-> StringColumn int (Option string))))
+  ;; The text of a cell
+  (clr-type-id (: Apache.Arrow.Types.IArrowType.TypeId (-> ArrowType ArrowTypeId) #:get))
+  (clr-type-name-of (: Apache.Arrow.Types.IArrowType.Name (-> ArrowType string) #:get))
+  (timestamp-zone (: Apache.Arrow.Types.TimestampType.Timezone (-> TimestampType System.String) #:get))
+  (timestamp-unit (: Apache.Arrow.Types.TimestampType.Unit (-> TimestampType TimeUnit) #:get))
+  (clr-null-or-empty? (: System.String.IsNullOrEmpty (-> System.String bool)))
+  (dictionary-levels (: Apache.Arrow.DictionaryArray.Dictionary (-> Apache.Arrow.DictionaryArray AnyColumn) #:get))
+  (dictionary-codes (: Apache.Arrow.DictionaryArray.Indices (-> Apache.Arrow.DictionaryArray AnyColumn) #:get))
+  (invariant-culture (: System.Globalization.CultureInfo.InvariantCulture #:get))
+  (double-text (: System.Double.ToString (-> double string FormatProvider string)))
+  (double-finite? (: System.Double.IsFinite (-> double bool)))
+  (math-round (: System.Math.Round (-> double int MidpointRounding double)))
+  (date-of-day-number (: System.DateOnly.FromDayNumber (-> int ClrDate)))
+  (date-text (: System.DateOnly.ToString (-> ClrDate string FormatProvider string)))
+  (datetime-text (: System.DateTime.ToString (-> ClrDateTime string FormatProvider string)))
+  (datetime-ticks (: System.DateTime.Ticks (-> ClrDateTime long) #:get))
+  (datetime-second (: System.DateTime.Second (-> ClrDateTime int) #:get))
+  (bool-cell (: Apache.Arrow.BooleanArray.GetBoolean (-> Apache.Arrow.BooleanArray int bool)))
 
   ;; Cells, at the type their use gives. #:uses-type: these test typeof(T),
   ;; so a use that does not decide the type is a compile error.
@@ -170,7 +209,15 @@
   ;; Building. The flags are empty for a column with no nulls, or one for
   ;; each value, #f at a null.
   (clr-from-array (: Bjostat.Columns.FromArray (-> (Array %a) (Array bool) (Column %a)) #:uses-type))
-  (clr-from-strings (: Bjostat.Columns.FromStrings (-> (Array string) (Array bool) StringColumn)))
+  ;; A string is added as its UTF-8 bytes, which Arrow's strings are. The
+  ;; allocator is null: Arrow's default.
+  (string-builder-add! (: Apache.Arrow.StringArray+Builder.Append
+                          (-> ArrowStringBuilder (RoSpan byte) ArrowStringBuilder)))
+  (string-bytes (: BjoString.Utf8String.AsSpan (-> string (RoSpan byte))))
+  (string-builder-add-null! (: Apache.Arrow.StringArray+Builder.AppendNull
+                               (-> ArrowStringBuilder ArrowStringBuilder)))
+  (string-builder-build (: Apache.Arrow.StringArray+Builder.Build
+                           (-> ArrowStringBuilder MemoryAllocator StringColumn)))
 
   ;; Aggregates of a span with no nulls, vectorized.
   (tensor-sum (: System.Numerics.Tensors.TensorPrimitives.Sum (-> (RoSpan %a) %a)))
@@ -180,17 +227,16 @@
   (clr-nan (: System.Double.NaN #:get))
 
   ;; Tables
-  (clr-make-table (: Bjostat.Tables.Make (-> (Array string) (Array AnyColumn) int Table)))
-  (clr-names (: Bjostat.Tables.Names (-> Table (Array string))))
-  (table-column-count (: Bjostat.Tables.ColumnCount (-> Table int)))
-  (table-row-count (: Bjostat.Tables.RowCount (-> Table int)))
-  (clr-column (: Bjostat.Tables.Column (-> Table int AnyColumn)))
+  (table-column-count (: Apache.Arrow.RecordBatch.ColumnCount (-> Table int) #:get))
+  (table-row-count (: Apache.Arrow.RecordBatch.Length (-> Table int) #:get))
+  (clr-column-at (: Apache.Arrow.RecordBatch.Column (-> Table int AnyColumn)))
+  ;; Ordinal, as glue/Columns.cs says. The glue uses it too.
   (clr-index-of (: Bjostat.Tables.IndexOf (-> Table string int)))
-  (clr-slice (: Bjostat.Tables.Slice (-> Table int int Table)))
+  (clr-batch-slice (: Apache.Arrow.RecordBatch.Slice (-> Table int int Table)))
+  (schema-builder-add! (: Apache.Arrow.Schema+Builder.Field (-> SchemaBuilder Field SchemaBuilder)))
+  (schema-builder-build (: Apache.Arrow.Schema+Builder.Build (-> SchemaBuilder Schema)))
   (clr-unsortable (: Bjostat.Sorting.Unsortable (-> AnyColumn string)))
   (clr-sort-by (: Bjostat.Sorting.SortBy (-> Table (Array int) (Array bool) Table)))
-  (clr-join (: Bjostat.Joins.Join (-> Table Table (Array string) int Table)))
-  (clr-key-problem (: Bjostat.Joins.KeyProblem (-> Table Table (Array string) string)))
 
   ;; Reshaping: the kernels of glue/Reshape.cs and glue/Join.cs.
   (clr-firsts (: Bjostat.ReshapeOps.Firsts (-> (Array AnyColumn) int (Array int))))
@@ -202,14 +248,9 @@
   (clr-repeated (: Bjostat.Reshape.Repeated (-> (Array string) int AnyColumn)))
   (clr-select (: Bjostat.Reshape.Select (-> Table (Array int) Table)))
   (clr-take (: Bjostat.Query.Take (-> Table (Array int) int Table)))
-  (clr-take-or-null (: Bjostat.Joins.TakeOrNull (-> Table (Array int) (Array AnyColumn))))
-  (clr-nulls (: Bjostat.Joins.Nulls (-> ArrowType int AnyColumn)))
   (clr-key-type? (: Bjostat.Joins.KeyType (-> ArrowType bool)))
-  (clr-same-type? (: Bjostat.Joins.SameType (-> ArrowType ArrowType bool)))
   (clr-arrow-name (: Bjostat.ColumnTypes.ArrowName (-> ArrowType string)))
-  (clr-from-fields (: Bjostat.Tables.FromFields (-> (Array Field) (Array AnyColumn) int Table)))
-  (clr-new-field (: Bjostat.Tables.NewField (-> string ArrowType Field)))
-  (clr-any-valid? (: Bjostat.Columns.IsValid (-> AnyColumn int bool)))
+  (clr-any-valid? (: Apache.Arrow.IArrowArray.IsValid (-> AnyColumn int bool)))
   (clr-schema (: Apache.Arrow.RecordBatch.Schema (-> Table Schema) #:get))
   (schema-field (: Apache.Arrow.Schema.GetFieldByIndex (-> Schema int Field)))
   (field-name (: Apache.Arrow.Field.Name (-> Field string) #:get))
@@ -234,10 +275,289 @@
   (clr-codes (: Bjostat.Categories.Codes (-> AnyColumn AnyColumn)))
   (clr-first-seen (: Bjostat.Categories.FirstSeen (-> AnyColumn AnyColumn)))
 
-  ;; Files. Arrow reports a file it cannot read with exceptions of several
-  ;; types, so every exception is an Err.
-  (clr-read-file (: Bjostat.Tables.ReadFile (-> string Table) #:exceptions (System.Exception)))
-  (clr-write-file (: Bjostat.Tables.WriteFile (-> Table string void) #:exceptions (System.Exception))))
+  ;; Files
+  (file-open-read (: System.IO.File.OpenRead (-> string FileStream)))
+  (file-create (: System.IO.File.Create (-> string FileStream)))
+  (reader-schema (: Apache.Arrow.Ipc.ArrowFileReader.Schema (-> ArrowFileReader Schema) #:get))
+  (reader-next (: Apache.Arrow.Ipc.ArrowFileReader.ReadNextRecordBatch (-> ArrowFileReader Table)))
+  (writer-write! (: Apache.Arrow.Ipc.ArrowFileWriter.WriteRecordBatch (-> ArrowFileWriter Table void)))
+  (writer-end! (: Apache.Arrow.Ipc.ArrowFileWriter.WriteEnd (-> ArrowFileWriter void)))
+  (concatenate-columns (: Apache.Arrow.ArrowArrayConcatenator.Concatenate
+                          (-> (ClrReadOnlyList AnyColumn) MemoryAllocator AnyColumn))))
+
+;; ===========================================================================
+;; Columns and tables in Arrow
+;; ===========================================================================
+;;
+;; The members of Arrow that the rest of the module uses. They were
+;; glue/Columns.cs while Bjolang could not use the members of a generic .NET
+;; type, as PrimitiveArray<T>.
+
+(: (-> (Column %a) AnyColumn))
+(defun (column->any c) (cast AnyColumn c))
+
+(: (-> StringColumn AnyColumn))
+(defun (strings->any c) (cast AnyColumn c))
+
+;; A column as its typed Arrow array. The caller has checked the type by its
+;; name, so another type is a fault of this module.
+(: (-> string (Column %a)))
+(defun (wrong-column-type wanted)
+  (panic! (str "(bjostat table): the column is not a column of " wanted)))
+
+(: (-> AnyColumn (Column double)))
+(defun (as-doubles a)
+  (match a
+    ((:is Apache.Arrow.DoubleArray c) (cast (Column double) c))
+    (_ (wrong-column-type "double"))))
+
+(: (-> AnyColumn (Column float)))
+(defun (as-floats a)
+  (match a
+    ((:is Apache.Arrow.FloatArray c) (cast (Column float) c))
+    (_ (wrong-column-type "float"))))
+
+(: (-> AnyColumn (Column long)))
+(defun (as-longs a)
+  (match a
+    ((:is Apache.Arrow.Int64Array c) (cast (Column long) c))
+    (_ (wrong-column-type "long"))))
+
+(: (-> AnyColumn (Column int)))
+(defun (as-ints a)
+  (match a
+    ((:is Apache.Arrow.Int32Array c) (cast (Column int) c))
+    (_ (wrong-column-type "int"))))
+
+(: (-> AnyColumn StringColumn))
+(defun (as-strings a)
+  (match a
+    ((:is Apache.Arrow.StringArray c) c)
+    (_ (panic! "(bjostat table): the column is not a column of strings"))))
+
+;; The value at row `i`, or None at a null.
+(: (-> (Column %a) int (Option %a)))
+(defun (column-ref c i)
+  (if (column-valid? c i) (Some (ro-span-ref (column-values c) i)) None))
+
+;; The string at row `i`, or None at a null. The bytes are checked and copied
+;; once.
+(: (-> StringColumn int (Option string)))
+(defun (string-column-ref c i)
+  (if (string-column-valid? c i) (Some (utf-8->string (string-column-bytes c i))) None))
+
+;; Arrow's name of the column's type, as `type-of-column` reads it: the name
+;; of the type id, as "Double" or "Int64", and "TimestampTz" for a timestamp
+;; with a time zone and "Category" for a category.
+(: (-> AnyColumn string))
+(defun (clr-type-name a)
+  (def type (data-type (clr-data a)))
+  (cond
+    ((zoned-timestamp-type? type) "TimestampTz")
+    ((category? a) "Category")
+    (else (.ToString (clr-type-id type)))))
+
+(: (-> ArrowType bool))
+(defun (zoned-timestamp-type? type)
+  (match type
+    ((:is Apache.Arrow.Types.TimestampType t) (not (clr-null-or-empty? (timestamp-zone t))))
+    (_ #f)))
+
+;; A column of the strings. `valid` is empty for a column with no nulls, or as
+;; long as the strings, #f at each null.
+(: (-> (Array string) (Array bool) StringColumn))
+(defun (clr-from-strings values valid)
+  (def n (array-length values))
+  (when (and (> (array-length valid) 0) (not (= (array-length valid) n)))
+    (panic! (str "(bjostat table): " (int->string (array-length valid)) " validity flags for "
+                 (int->string n) " values")))
+  (def b (ArrowStringBuilder.))
+  (loop (:for i (range 0 n))
+        (:do (if (and (> (array-length valid) 0) (not (array-ref valid i)))
+                 (ignore (string-builder-add-null! b))
+                 (ignore (string-builder-add! b (string-bytes (array-ref values i)))))))
+  (string-builder-build b (clr-default)))
+
+;; ---------------------------------------------------------------------------
+;; The text of a cell, for a printed table
+
+;; DateOnly.DayNumber of 1970-01-01.
+(def epoch-day-number 719162)
+
+;; The ticks of 1970-01-01T00:00.
+(def epoch-ticks 621355968000000000L)
+
+;; The text of row `i`: "null" at a null. With `digits` 0 or more, a double
+;; or a float is rounded to that many decimals first; below 0, it is all of
+;; it. A rounded number is still the shortest text, so 10 stays "10". A
+;; number that rounds to 0 and is not 0 keeps that many significant digits.
+(: (-> AnyColumn int int string))
+(defun (any->string a i digits)
+  (if (any-null? a i)
+      "null"
+      (match a
+        ((:is Apache.Arrow.DoubleArray c) (number-text (cell (cast (Column double) c) i) digits))
+        ((:is Apache.Arrow.FloatArray c) (number-text (cast double (cell (cast (Column float) c) i)) digits))
+        ((:is Apache.Arrow.Int64Array c) (.ToString (cell (cast (Column long) c) i) invariant-culture))
+        ((:is Apache.Arrow.Int32Array c) (.ToString (cell (cast (Column int) c) i) invariant-culture))
+        ((:is Apache.Arrow.Int16Array c) (.ToString (cell (cast (Column short) c) i) invariant-culture))
+        ((:is Apache.Arrow.UInt8Array c) (.ToString (cell (cast (Column byte) c) i) invariant-culture))
+        ((:is Apache.Arrow.UInt16Array c) (.ToString (cell (cast (Column ushort) c) i) invariant-culture))
+        ((:is Apache.Arrow.UInt32Array c) (.ToString (cell (cast (Column uint) c) i) invariant-culture))
+        ((:is Apache.Arrow.UInt64Array c) (.ToString (cell (cast (Column ulong) c) i) invariant-culture))
+        ((:is Apache.Arrow.BooleanArray c) (if (bool-cell c i) "#t" "#f"))
+        ((:is Apache.Arrow.StringArray c) (string-column-text c i (clr-default)))
+        ;; ISO 8601, as (std datetime) writes them.
+        ((:is Apache.Arrow.Date32Array c)
+         (date-text (date-of-day-number (+ (cell (cast (Column int) c) i) epoch-day-number))
+                    "yyyy-MM-dd" invariant-culture))
+        ((:is Apache.Arrow.TimestampArray c) (timestamp-text c i))
+        ((:is Apache.Arrow.DictionaryArray d)
+         (if (category? a) (category-text d i) (unknown-type-text a)))
+        (_ (unknown-type-text a)))))
+
+(: (-> (Column %a) int %a))
+(defun (cell c i) (ro-span-ref (column-values c) i))
+
+(: (-> AnyColumn string))
+(defun (unknown-type-text a)
+  (str "<" (clr-type-name-of (data-type (clr-data a))) ">"))
+
+;; The number rounded to `digits` decimals, at most 15, away from 0 at a
+;; half. Below 0, the number.
+(: (-> double int double))
+(defun (rounded x digits)
+  (if (< digits 0) x (math-round x (min digits 15) MidpointRounding.AwayFromZero)))
+
+;; The text of a number rounded to `digits` decimals. A number that is not 0
+;; and rounds to 0, as a small p-value, is written with `digits` significant
+;; digits instead (2.551e-11), so that it does not show as 0.
+(: (-> double int string))
+(defun (number-text x digits)
+  (def r (rounded x digits))
+  (if (or (not (= r 0.0)) (= x 0.0) (not (double-finite? x)))
+      (double-text r "R" invariant-culture)
+      (string-replace (double-text x (str "G" (int->string (max digits 1))) invariant-culture) "E-" "e-")))
+
+;; The ticks of a timestamp of the unit. Nanoseconds are rounded down.
+(: (-> long TimeUnit long))
+(defun (timestamp-ticks raw unit)
+  (+ epoch-ticks
+     (cond
+       ((= unit TimeUnit.Second) (* raw 10000000L))
+       ((= unit TimeUnit.Millisecond) (* raw 10000L))
+       ((= unit TimeUnit.Microsecond) (* raw 10L))
+       (else (def q (/ raw 100L))
+             (if (< (% raw 100L) 0L) (- q 1L) q)))))
+
+;; A timestamp as ISO 8601: the date and the time, with the seconds and their
+;; fraction only when they are not 0, and "Z" for one with a time zone.
+(: (-> Apache.Arrow.TimestampArray int string))
+(defun (timestamp-text c i)
+  (match (data-type (clr-data (cast AnyColumn c)))
+    ((:is Apache.Arrow.Types.TimestampType type)
+     (def dt (ClrDateTime. (timestamp-ticks (cell (cast (Column long) c) i) (timestamp-unit type))
+                           DateTimeKind.Unspecified))
+     (def format
+       (cond
+         ((not (= 0L (% (datetime-ticks dt) 10000000L))) "yyyy-MM-ddTHH:mm:ss.FFFFFFF")
+         ((not (= 0 (datetime-second dt))) "yyyy-MM-ddTHH:mm:ss")
+         (else "yyyy-MM-ddTHH:mm")))
+     (str (datetime-text dt format invariant-culture)
+          (if (clr-null-or-empty? (timestamp-zone type)) "" "Z")))
+    (_ (panic! "(bjostat table): a timestamp column without a timestamp type"))))
+
+;; The level of row `i` of a category, which is not null.
+(: (-> Apache.Arrow.DictionaryArray int string))
+(defun (category-text d i)
+  (match (dictionary-levels d)
+    ((:is Apache.Arrow.StringArray levels)
+     (match (dictionary-codes d)
+       ((:is Apache.Arrow.Int32Array codes)
+        (string-column-text levels (cell (cast (Column int) codes) i) (clr-default)))
+       (_ (panic! "(bjostat table): a category without int codes"))))
+    (_ (panic! "(bjostat table): a category without string levels"))))
+
+;; ---------------------------------------------------------------------------
+;; Tables
+
+;; A table of the columns, all of one length, under the names.
+(: (-> (Array string) (Array AnyColumn) int Table))
+(defun (clr-make-table names columns length)
+  (clr-from-fields
+   {arraying (clr-new-field (array-ref names i) (data-type (clr-data (array-ref columns i))))
+             (:for i (range 0 (array-length names)))}
+   columns
+   length))
+
+;; A table of the columns under the fields, which keep their nullability and
+;; metadata.
+(: (-> (Array Field) (Array AnyColumn) int Table))
+(defun (clr-from-fields fields columns length)
+  (def b (SchemaBuilder.))
+  (loop (:for f fields) (:do (ignore (schema-builder-add! b f))))
+  (Table. (schema-builder-build b) columns length))
+
+;; A field of the name and type that can hold nulls.
+(: (-> string ArrowType Field))
+(defun (clr-new-field name type) (Field. name type #t (clr-default)))
+
+(: (-> Table (Array string)))
+(defun (clr-names t)
+  (def schema (clr-schema t))
+  {arraying (field-name (schema-field schema i)) (:for i (range 0 (table-column-count t)))})
+
+;; The column at the index. Typed here: Arrow has a Column of a name too.
+(: (-> Table int AnyColumn))
+(defun (clr-column t i) (clr-column-at t i))
+
+;; The rows from `from` up to `to`, without a copy.
+(: (-> Table int int Table))
+(defun (clr-slice t from to) (clr-batch-slice t from (- to from)))
+
+;; ---------------------------------------------------------------------------
+;; Arrow IPC files
+
+;; The record batches of the reader, in order. The reader returns null after
+;; the last.
+(: (-> ArrowFileReader (Vec Table)))
+(defun (read-batches reader)
+  (let loop ((acc []))
+    (match (cast System.Object (reader-next reader))
+      ((:is Apache.Arrow.RecordBatch b) (loop (vec-add acc b)))
+      (_ acc))))
+
+;; The record batches of an Arrow IPC file as one table: each column's pieces
+;; are concatenated, so that a column is one span. None for a file with a
+;; schema and no batch. Arrow reports a file it cannot read with exceptions
+;; of several types, so every exception is an Err.
+(: (-> string (Result System.Exception (Option Table))))
+(defun (clr-read-file path)
+  (try
+    (with-open ((s (file-open-read path))
+                (r (ArrowFileReader. s)))
+      (def batches (read-batches r))
+      (cond
+        ((= (vec-length batches) 0) None)
+        ((= (vec-length batches) 1) (Some (vec-ref batches 0)))
+        (else
+         (def schema (reader-schema r))
+         (def columns
+           {arraying (concatenate-columns (vec->array (vec-map (fun (b) (clr-column b i)) batches))
+                                          (clr-default))
+                     (:for i (range 0 (table-column-count (vec-ref batches 0))))})
+         (Some (Table. schema columns (fold (fun (b n) (+ n (table-row-count b))) 0 batches))))))
+    #:catch (System.Exception)))
+
+(: (-> Table string (Result System.Exception Unit)))
+(defun (clr-write-file t path)
+  (try
+    (with-open ((s (file-create path))
+                (w (ArrowFileWriter. s (clr-schema t))))
+      (writer-write! w t)
+      (writer-end! w)
+      unit)
+    #:catch (System.Exception)))
 
 ;; ===========================================================================
 ;; Errors and types
@@ -1108,6 +1428,803 @@
                        {arraying (clr-index-of t (sort-key-name k)) (:for k keys)}
                        {arraying (match k ((descending _) #t) (_ #f)) (:for k keys)}))))
 
+;; ===========================================================================
+;; Joins: the rows that match
+;; ===========================================================================
+;;
+;; The right rows are found for each left row in one of four ways:
+;; - One key that is a category in both tables: by codes, in an array.
+;; - One key of integers, dates or timestamps whose right keys are dense: in
+;;   an array by the key's distance from the least.
+;; - One such key, both sides sorted, the right keys unique and neither with
+;;   nulls: the two are merged.
+;; - Else by the hash of the keys, in a hash table of the right rows in 64
+;;   parts by the top bits of the hash.
+;; The left rows are matched in parts of `join-part-rows` on the compute
+;; threads, each part with lists of its own, put one after the other in the
+;; order of the parts. So the left rows keep their order, and the right rows
+;; of each are in their order. Two nulls are equal keys, and so are two NaNs.
+
+(import/class
+  (HashCode (: System.HashCode (-> HashCode)))
+  ((Rom %a) (: System.ReadOnlyMemory (-> (Array %a) (Rom %a))))
+  (ArrowBuffer (: Apache.Arrow.ArrowBuffer (-> (Rom byte) ArrowBuffer)))
+  (ArrayDataOf (: Apache.Arrow.ArrayData
+                  (-> ArrowType int int int (Array ArrowBuffer) (Array ArrayDataOf) ArrayDataOf ArrayDataOf))))
+
+(import/extern
+  (hash-add-bytes! (: System.HashCode.AddBytes (-> HashCode (RoSpan byte) void)))
+  (hash-value (: System.HashCode.ToHashCode (-> HashCode int)))
+  (double-bits (: System.BitConverter.DoubleToUInt64Bits (-> double ulong)))
+  (float-bits (: System.BitConverter.SingleToUInt32Bits (-> float uint)))
+  (double-nan? (: System.Double.IsNaN (-> double bool)))
+  (float-nan? (: System.Single.IsNaN (-> float bool)))
+  (bytes-equal? (: System.MemoryExtensions.SequenceEqual (-> (RoSpan %a) (RoSpan %a) bool)))
+  (same-object? (: System.Object.ReferenceEquals (-> System.Object System.Object bool)))
+  (same-clr-string? (: System.String.Equals (-> System.String System.String bool)))
+  (binary-search (: System.Array.BinarySearch (-> (Array %a) %a int)))
+  (slice-column (: Apache.Arrow.ArrowArrayFactory.Slice (-> AnyColumn int int AnyColumn)))
+  (build-column (: Apache.Arrow.ArrowArrayFactory.BuildArray (-> ArrayDataOf AnyColumn)))
+  (level-bytes (: Bjostat.Categories.LevelBytes (-> Apache.Arrow.DictionaryArray int (RoSpan byte))))
+  (category-type? (: Bjostat.Categories.IsType (-> ArrowType bool)))
+  (category-nulls (: Bjostat.Categories.Nulls (-> int AnyColumn)))
+  (column-array-data (: Apache.Arrow.IArrowArray.Data (-> AnyColumn ArrayDataOf) #:get))
+  (array-data-type (: Apache.Arrow.ArrayData.DataType (-> ArrayDataOf ArrowType) #:get))
+  (array-data-length (: Apache.Arrow.ArrayData.Length (-> ArrayDataOf int) #:get))
+  (array-data-null-count (: Apache.Arrow.ArrayData.NullCount (-> ArrayDataOf int) #:get))
+  (array-data-offset (: Apache.Arrow.ArrayData.Offset (-> ArrayDataOf int) #:get))
+  (array-data-buffers (: Apache.Arrow.ArrayData.Buffers (-> ArrayDataOf (Array ArrowBuffer)) #:get))
+  (array-data-children (: Apache.Arrow.ArrayData.Children (-> ArrayDataOf (Array ArrayDataOf)) #:get))
+  (array-data-dictionary (: Apache.Arrow.ArrayData.Dictionary (-> ArrayDataOf ArrayDataOf) #:get))
+  (buffer-empty? (: Apache.Arrow.ArrowBuffer.IsEmpty (-> ArrowBuffer bool) #:get))
+  (buffer-span (: Apache.Arrow.ArrowBuffer.Span (-> ArrowBuffer (RoSpan byte)) #:get))
+  (empty-buffer (: Apache.Arrow.ArrowBuffer.Empty #:get))
+  (bit-width (: Apache.Arrow.Types.FixedWidthType.BitWidth (-> Apache.Arrow.Types.FixedWidthType int) #:get)))
+
+;; The rows of a part of a join's left table.
+(def join-part-rows 65536)
+
+;; The parts of a join's hash table: 64, by the top 6 bits of the hash.
+(def hash-parts 64)
+(def hash-part-shift 58)
+
+;; The rows that match, as the row of the left table and the row of the
+;; right one, -1 where a left join found none. A semi or an anti join has
+;; only the left rows.
+(type (: Matches (Record (: left (MutableVec int)) (: right (MutableVec int)))))
+
+(: (-> int int Matches))
+(defun (new-matches left-capacity right-capacity)
+  (Matches (left (mutablevec-with-capacity left-capacity))
+           (right (mutablevec-with-capacity right-capacity))))
+
+(: (-> Matches int int void))
+(defun (add-match! m l r)
+  (mutablevec-add! (record-ref m left) l)
+  (mutablevec-add! (record-ref m right) r))
+
+;; A left row with no match in a left join, or one that a semi or an anti
+;; join keeps.
+(: (-> Matches int bool int void))
+(defun (add-unmatched! m l found kind)
+  (when (and (= kind 1) (not found)) (add-match! m l -1))
+  (when (or (and (= kind 2) found) (and (= kind 3) (not found)))
+    (mutablevec-add! (record-ref m left) l)))
+
+;; The matches of the parts one after the other: the left rows and the
+;; right rows.
+(: (-> (Vec Matches) (Tuple (Array int) (Array int))))
+(defun (matches->arrays parts)
+  (: (-> (Vec (MutableVec int)) (Array int)))
+  (defun (joined lists)
+    (def out (: (make-array (fold (fun (l n) (+ n (mutablevec-length l))) 0 lists)) (Array int)))
+    (ignore (fold (fun (l at)
+                    (array-copy! (mutablevec->array l) 0 out at (mutablevec-length l))
+                    (+ at (mutablevec-length l)))
+                  0 lists))
+    out)
+  (if (= (vec-length parts) 1)
+      (Tuple (mutablevec->array (record-ref (vec-ref parts 0) left))
+             (mutablevec->array (record-ref (vec-ref parts 0) right)))
+      (Tuple (joined (vec-map (fun (m) (record-ref m left)) parts))
+             (joined (vec-map (fun (m) (record-ref m right)) parts)))))
+
+;; Runs `match` on the left rows in parts on the compute threads, each part
+;; with matches of its own, in the order of the parts.
+(: (-> int int (-> int int Matches void) (Vec Matches)))
+(defun (in-left-parts ln kind match-part)
+  (def parts (quotient (+ ln (- join-part-rows 1)) join-part-rows))
+  (computing-each parts (fun (p)
+                          (def from (* p join-part-rows))
+                          (def to (min ln (+ from join-part-rows)))
+                          (def m (new-matches (- to from) (if (< kind 2) (- to from) 0)))
+                          (match-part from to m)
+                          m)))
+
+;; Whether the rows are each row of a table of n rows, once and in order:
+;; then the table's columns are the result's as they are.
+(: (-> (Array int) int bool))
+(defun (in-order? rows n)
+  (and (= (array-length rows) n)
+       (let check ((i 0))
+         (cond
+           ((= i n) #t)
+           ((= (array-ref rows i) i) (check (+ i 1)))
+           (else #f)))))
+
+;; ---------------------------------------------------------------------------
+;; By codes: one key that is a category in both tables
+
+(: (-> AnyColumn AnyColumn bool))
+(defun (both-categories? a b) (and (category? a) (category? b)))
+
+(: (-> AnyColumn Apache.Arrow.DictionaryArray))
+(defun (as-dictionary a)
+  (match a
+    ((:is Apache.Arrow.DictionaryArray d) d)
+    (_ (panic! "(bjostat table): a category that is not a dictionary"))))
+
+(: (-> AnyColumn StringColumn))
+(defun (levels-of d) (as-strings (dictionary-levels (as-dictionary d))))
+
+(: (-> AnyColumn (Column int)))
+(defun (category-codes-of d) (as-ints (dictionary-codes (as-dictionary d))))
+
+;; Each right level is given the left code of the same string once, and the
+;; right rows are then in chains by left code, in an array. The slot after
+;; the last code is the nulls'.
+(: (-> AnyColumn AnyColumn int (Vec Matches)))
+(defun (match-categories left right kind)
+  (def left-levels (levels-of left))
+  (def right-levels (levels-of right))
+  (def null-slot (string-column-length left-levels))
+  (def left-code (: (mutablemap-with-capacity null-slot) (MutableMap string int)))
+  (loop (:for c (range 0 null-slot))
+        (:do (mutablemap-set! left-code (utf-8->string (string-column-bytes left-levels c)) c)))
+  ;; -1 for a right level that the left table does not have.
+  (def code-of
+    {arraying (mutablemap-ref-or left-code (utf-8->string (string-column-bytes right-levels c)) -1)
+              (:for c (range 0 (string-column-length right-levels)))})
+  (def rn (any-length right))
+  (def next (: (make-array rn) (Array int)))
+  (def heads (: (make-array (+ null-slot 1)) (Array int)))
+  (array-fill! heads -1)
+  (def rcodes (column-values (category-codes-of right)))
+  (let chain ((r (- rn 1)))
+    (when (>= r 0)
+      (def slot (if (any-null? right r) null-slot (array-ref code-of (ro-span-ref rcodes r))))
+      (when (>= slot 0)
+        (array-set! next r (array-ref heads slot))
+        (array-set! heads slot r))
+      (chain (- r 1))))
+  (def ln (any-length left))
+  (def lcodes (column-values (category-codes-of left)))
+  (def nulls? (> (any-null-count left) 0))
+  (def m (new-matches ln (if (< kind 2) ln 0)))
+  (loop (:for l (range 0 ln))
+        (:do (def first (array-ref heads (if (and nulls? (any-null? left l)) null-slot (ro-span-ref lcodes l))))
+             (when (< kind 2)
+               (let walk ((r first))
+                 (when (>= r 0)
+                   (add-match! m l r)
+                   (walk (array-ref next r)))))
+             (add-unmatched! m l (>= first 0) kind)))
+  [m])
+
+;; ---------------------------------------------------------------------------
+;; One key of integers
+
+;; The keys as longs, when they are integers, dates or timestamps: the types
+;; whose equal keys are equal numbers.
+(: (-> AnyColumn (Option (Array long))))
+(defun (integer-keys a)
+  (def n (any-length a))
+  (match a
+    ((:is Apache.Arrow.Int64Array c)
+     (def vals (column-values (cast (Column long) c)))
+     (def out (: (make-array n) (Array long)))
+     (loop (:for i (range 0 n)) (:do (array-set! out i (ro-span-ref vals i))))
+     (Some out))
+    ((:is Apache.Arrow.Int32Array c)
+     (def vals (column-values (cast (Column int) c)))
+     (def out (: (make-array n) (Array long)))
+     (loop (:for i (range 0 n)) (:do (array-set! out i (cast long (ro-span-ref vals i)))))
+     (Some out))
+    ((:is Apache.Arrow.Int16Array c)
+     (def vals (column-values (cast (Column short) c)))
+     (def out (: (make-array n) (Array long)))
+     (loop (:for i (range 0 n)) (:do (array-set! out i (cast long (ro-span-ref vals i)))))
+     (Some out))
+    ((:is Apache.Arrow.UInt8Array c)
+     (def vals (column-values (cast (Column byte) c)))
+     (def out (: (make-array n) (Array long)))
+     (loop (:for i (range 0 n)) (:do (array-set! out i (cast long (ro-span-ref vals i)))))
+     (Some out))
+    ((:is Apache.Arrow.UInt16Array c)
+     (def vals (column-values (cast (Column ushort) c)))
+     (def out (: (make-array n) (Array long)))
+     (loop (:for i (range 0 n)) (:do (array-set! out i (cast long (ro-span-ref vals i)))))
+     (Some out))
+    ((:is Apache.Arrow.UInt32Array c)
+     (def vals (column-values (cast (Column uint) c)))
+     (def out (: (make-array n) (Array long)))
+     (loop (:for i (range 0 n)) (:do (array-set! out i (cast long (ro-span-ref vals i)))))
+     (Some out))
+    ((:is Apache.Arrow.UInt64Array c)
+     (def vals (column-values (cast (Column ulong) c)))
+     (def out (: (make-array n) (Array long)))
+     (loop (:for i (range 0 n)) (:do (array-set! out i (cast long (ro-span-ref vals i)))))
+     (Some out))
+    ((:is Apache.Arrow.Date32Array c)
+     (def vals (column-values (cast (Column int) c)))
+     (def out (: (make-array n) (Array long)))
+     (loop (:for i (range 0 n)) (:do (array-set! out i (cast long (ro-span-ref vals i)))))
+     (Some out))
+    ((:is Apache.Arrow.TimestampArray c)
+     (def vals (column-values (cast (Column long) c)))
+     (def out (: (make-array n) (Array long)))
+     (loop (:for i (range 0 n)) (:do (array-set! out i (ro-span-ref vals i))))
+     (Some out))
+    (_ None)))
+
+;; The matches by one key of integers, without hashes, or None when the keys
+;; are neither dense nor sorted and unique, and the hashes are to be used.
+(: (-> AnyColumn AnyColumn int (Option (Vec Matches))))
+(defun (match-integers lk rk kind)
+  (match (Tuple (integer-keys lk) (integer-keys rk))
+    ((Tuple (Some lv) (Some rv))
+     (def rn (array-length rv))
+     (def right-nulls? (> (any-null-count rk) 0))
+     (def left-nulls? (> (any-null-count lk) 0))
+     ;; The least and the greatest right key, and whether the right keys
+     ;; are ascending and unique with no null.
+     (def (Tuple least greatest sorted? seen?)
+       (let scan ((r 0) (least 9223372036854775807L) (greatest (- -9223372036854775807L 1L))
+                  (sorted? #t) (previous 0L) (seen? #f))
+         (cond
+           ((= r rn) (Tuple least greatest sorted? seen?))
+           ((and right-nulls? (any-null? rk r)) (scan (+ r 1) least greatest #f previous seen?))
+           (else
+            (def v (array-ref rv r))
+            (scan (+ r 1) (min least v) (max greatest v)
+                  (and sorted? (or (not seen?) (> v previous))) v #t)))))
+     (cond
+       ;; Dense: room for each key from the least to the greatest, at most
+       ;; twice the right rows and some more.
+       ((and (> rn 0) seen?
+             (<= (cast ulong (- greatest least)) (+ (* 2UL (cast ulong rn)) 1024UL)))
+        (Some (match-dense lk rk lv rv least (+ (cast int (- greatest least)) 1) kind)))
+       ((and (> rn 0) sorted? (not right-nulls?) (not left-nulls?) (ascending? lv))
+        (Some (match-merged lv rv kind)))
+       (else None)))
+    (_ None)))
+
+(: (-> (Array long) bool))
+(defun (ascending? v)
+  (let check ((i 1))
+    (cond
+      ((>= i (array-length v)) #t)
+      ((< (array-ref v i) (array-ref v (- i 1))) #f)
+      (else (check (+ i 1))))))
+
+;; The right rows in chains by the key's distance from the least, in an
+;; array, from the last row so that each chain is in the order of the rows.
+;; The slot after the last key is the nulls'.
+(: (-> AnyColumn AnyColumn (Array long) (Array long) long int int (Vec Matches)))
+(defun (match-dense lk rk lv rv least slots kind)
+  (def rn (array-length rv))
+  (def null-slot slots)
+  (def heads (: (make-array (+ slots 1)) (Array int)))
+  (array-fill! heads -1)
+  (def next (: (make-array rn) (Array int)))
+  (def right-nulls? (> (any-null-count rk) 0))
+  (def left-nulls? (> (any-null-count lk) 0))
+  (let chain ((r (- rn 1)))
+    (when (>= r 0)
+      (def slot (if (and right-nulls? (any-null? rk r)) null-slot (cast int (- (array-ref rv r) least))))
+      (array-set! next r (array-ref heads slot))
+      (array-set! heads slot r)
+      (chain (- r 1))))
+  (in-left-parts (array-length lv) kind
+                 (fun (from to m)
+                   (loop (:for l (range from to))
+                         (:do (def first
+                                (if (and left-nulls? (any-null? lk l))
+                                    (array-ref heads null-slot)
+                                    (begin
+                                      (def d (- (array-ref lv l) least))
+                                      (if (< (cast ulong d) (cast ulong slots)) (array-ref heads (cast int d)) -1))))
+                              (when (< kind 2)
+                                (let walk ((r first))
+                                  (when (>= r 0)
+                                    (add-match! m l r)
+                                    (walk (array-ref next r)))))
+                              (add-unmatched! m l (>= first 0) kind))))))
+
+;; Both keys ascending, the right ones unique and neither null: each left row
+;; has at most one right row, found by walking both in order. A part of the
+;; left rows finds where to start in the right rows by halving.
+(: (-> (Array long) (Array long) int (Vec Matches)))
+(defun (match-merged lv rv kind)
+  (def rn (array-length rv))
+  (in-left-parts (array-length lv) kind
+                 (fun (from to m)
+                   (when (< from to)
+                     (def start (binary-search rv (array-ref lv from)))
+                     (ignore
+                      (fold (fun (l r0)
+                              (def v (array-ref lv l))
+                              (def r (let skip ((r r0)) (if (and (< r rn) (< (array-ref rv r) v)) (skip (+ r 1)) r)))
+                              (def found (and (< r rn) (= (array-ref rv r) v)))
+                              (when (and found (< kind 2)) (add-match! m l r))
+                              (add-unmatched! m l found kind)
+                              r)
+                            (if (< start 0) (- -1 start) start)
+                            (range from to)))))))
+
+;; ---------------------------------------------------------------------------
+;; By the hashes of the keys
+
+;; The matches by the hash of the keys. The right rows are put in a hash
+;; table of the first row of each hash, and the next row of each row with the
+;; same hash. The rows are put in from the last, each before the ones there,
+;; so each chain is in the order of the rows. The table is in parts by the
+;; top bits of the hash, each built on a compute thread. A row is in one
+;; part, so the parts write `next` at other rows.
+(: (-> (Array AnyColumn) (Array AnyColumn) int (Vec Matches)))
+(defun (match-hashes lk rk kind)
+  (def rn (any-length (array-ref rk 0)))
+  (def next (: (make-array rn) (Array int)))
+  (def rh (hashes-in-parts rk rn))
+  (def by-part {vecing (: (mutablevec) (MutableVec int)) (:for _q (range 0 hash-parts))})
+  (loop (:for r (range 0 rn))
+        (:do (mutablevec-add! (vec-ref by-part (hash-part (array-ref rh r))) r)))
+  (def tables
+    (computing-each hash-parts
+                    (fun (q)
+                      (def rows (mutablevec->array (vec-ref by-part q)))
+                      (def heads (: (mutablemap-with-capacity (array-length rows)) (MutableMap ulong int)))
+                      (let put ((i (- (array-length rows) 1)))
+                        (when (>= i 0)
+                          (def r (array-ref rows i))
+                          (def h (array-ref rh r))
+                          (array-set! next r (mutablemap-ref-or heads h -1))
+                          (mutablemap-set! heads h r)
+                          (put (- i 1))))
+                      heads)))
+  (def same {arraying (key-equality (array-ref lk k) (array-ref rk k)) (:for k (range 0 (array-length lk)))})
+  (def ln (any-length (array-ref lk 0)))
+  ;; The hash table is only read here, which a Dictionary allows on many
+  ;; threads.
+  (in-left-parts ln kind
+                 (fun (from to m)
+                   (def lh (hashes {arraying (slice-column a from (- to from)) (:for a lk)} (- to from)))
+                   (loop (:for l (range from to))
+                         (:do (def h (array-ref lh (- l from)))
+                              (def found
+                                (let walk ((r (mutablemap-ref-or (vec-ref tables (hash-part h)) h -1)) (found #f))
+                                  (cond
+                                    ((< r 0) found)
+                                    ((not (same-keys? same l r)) (walk (array-ref next r) found))
+                                    ((>= kind 2) #t)
+                                    (else (add-match! m l r) (walk (array-ref next r) #t)))))
+                              (add-unmatched! m l found kind))))))
+
+(: (-> ulong int))
+(defun (hash-part h) (cast int (shift-right h hash-part-shift)))
+
+;; The hashes of the rows, in parts on the compute threads.
+(: (-> (Array AnyColumn) int (Array ulong)))
+(defun (hashes-in-parts keys n)
+  (if (< n (* 2 join-part-rows))
+      (hashes keys n)
+      (begin
+        (def h (: (make-array n) (Array ulong)))
+        (def parts (quotient (+ n (- join-part-rows 1)) join-part-rows))
+        (ignore (computing-each parts
+                                (fun (p)
+                                  (def from (* p join-part-rows))
+                                  (def to (min n (+ from join-part-rows)))
+                                  (def part (hashes {arraying (slice-column a from (- to from)) (:for a keys)} (- to from)))
+                                  (array-copy! part 0 h from (- to from))
+                                  unit)))
+        h)))
+
+;; The hash of each row's keys. A null and a NaN each have one hash, and
+;; -0.0 has that of 0.0, since they are equal keys.
+(: (-> (Array AnyColumn) int (Array ulong)))
+(defun (hashes keys n)
+  (def h (: (make-array n) (Array ulong)))
+  (array-fill! h 14695981039346656037UL)
+  ;; The value of each row in one key, then mixed into its hash.
+  (def v (: (make-array n) (Array ulong)))
+  (loop (:for a keys)
+        (:do (key-values! v a n)
+             ;; A null has one hash, whatever value is under it: after a left
+             ;; join, that is the value of another row.
+             (when (> (any-null-count a) 0)
+               (loop (:for i (range 0 n))
+                     (:do (when (any-null? a i) (array-set! v i 0x9E3779B97F4A7C15UL)))))
+             (loop (:for i (range 0 n))
+                   (:do (array-set! h i (hash-step (array-ref h i) (array-ref v i)))))))
+  h)
+
+(: (-> ulong ulong ulong))
+(defun (hash-step h v)
+  (def x (* (bitwise-xor h v) 1099511628211UL))
+  (bitwise-xor x (shift-right x 29)))
+
+(: (-> (RoSpan byte) ulong))
+(defun (bytes-hash bytes)
+  (def hc (HashCode.))
+  (hash-add-bytes! hc bytes)
+  (* (cast ulong (cast uint (hash-value hc))) 0x9E3779B97F4A7C15UL))
+
+;; The value of each row of a key, for its hash.
+(: (-> (Array ulong) AnyColumn int void))
+(defun (key-values! v a n)
+  (match a
+    ((:is Apache.Arrow.DoubleArray c)
+     (def vals (column-values (cast (Column double) c)))
+     (loop (:for i (range 0 n))
+           (:do (def x (ro-span-ref vals i))
+                (array-set! v i (if (double-nan? x) 0x7FF8000000000001UL (double-bits (if (= x 0.0) 0.0 x)))))))
+    ((:is Apache.Arrow.FloatArray c)
+     (def vals (column-values (cast (Column float) c)))
+     (loop (:for i (range 0 n))
+           (:do (def x (ro-span-ref vals i))
+                (array-set! v i (if (float-nan? x)
+                                    0x7FC00001UL
+                                    (cast ulong (float-bits (if (= x (cast float 0.0)) (cast float 0.0) x))))))))
+    ((:is Apache.Arrow.Int64Array c)
+     (def vals (column-values (cast (Column long) c)))
+     (loop (:for i (range 0 n)) (:do (array-set! v i (cast ulong (ro-span-ref vals i))))))
+    ((:is Apache.Arrow.Int32Array c)
+     (def vals (column-values (cast (Column int) c)))
+     (loop (:for i (range 0 n)) (:do (array-set! v i (cast ulong (ro-span-ref vals i))))))
+    ((:is Apache.Arrow.Int16Array c)
+     (def vals (column-values (cast (Column short) c)))
+     (loop (:for i (range 0 n)) (:do (array-set! v i (cast ulong (ro-span-ref vals i))))))
+    ((:is Apache.Arrow.UInt8Array c)
+     (def vals (column-values (cast (Column byte) c)))
+     (loop (:for i (range 0 n)) (:do (array-set! v i (cast ulong (ro-span-ref vals i))))))
+    ((:is Apache.Arrow.UInt16Array c)
+     (def vals (column-values (cast (Column ushort) c)))
+     (loop (:for i (range 0 n)) (:do (array-set! v i (cast ulong (ro-span-ref vals i))))))
+    ((:is Apache.Arrow.UInt32Array c)
+     (def vals (column-values (cast (Column uint) c)))
+     (loop (:for i (range 0 n)) (:do (array-set! v i (cast ulong (ro-span-ref vals i))))))
+    ((:is Apache.Arrow.UInt64Array c)
+     (def vals (column-values (cast (Column ulong) c)))
+     (loop (:for i (range 0 n)) (:do (array-set! v i (ro-span-ref vals i)))))
+    ((:is Apache.Arrow.Date32Array c)
+     (def vals (column-values (cast (Column int) c)))
+     (loop (:for i (range 0 n)) (:do (array-set! v i (cast ulong (ro-span-ref vals i))))))
+    ((:is Apache.Arrow.TimestampArray c)
+     (def vals (column-values (cast (Column long) c)))
+     (loop (:for i (range 0 n)) (:do (array-set! v i (cast ulong (ro-span-ref vals i))))))
+    ((:is Apache.Arrow.BooleanArray c)
+     (loop (:for i (range 0 n)) (:do (array-set! v i (if (bool-cell c i) 1UL 2UL)))))
+    ((:is Apache.Arrow.StringArray c)
+     (loop (:for i (range 0 n)) (:do (array-set! v i (bytes-hash (string-column-bytes c i))))))
+    ((:is Apache.Arrow.DictionaryArray d)
+     (if (category? a)
+         (begin
+           ;; The hash of each level once; a row's is that of its level, so
+           ;; two categories of other levels agree.
+           (def levels (levels-of a))
+           (def nl (string-column-length levels))
+           (def level-hash (: (make-array (+ nl 1)) (Array ulong)))
+           (loop (:for l (range 0 nl)) (:do (array-set! level-hash l (bytes-hash (string-column-bytes levels l)))))
+           (def codes (column-values (category-codes-of a)))
+           (loop (:for i (range 0 n))
+                 (:do (def code (ro-span-ref codes i))
+                      (array-set! v i (array-ref level-hash (if (and (>= code 0) (< code nl)) code nl))))))
+         (not-a-key a)))
+    (_ (not-a-key a))))
+
+(: (-> AnyColumn %a))
+(defun (not-a-key a)
+  (panic! (str "(bjostat table): a column of " (clr-type-name-of (data-type (clr-data a))) " cannot be a key")))
+
+(: (-> (Array (-> int int bool)) int int bool))
+(defun (same-keys? same l r)
+  (let check ((k 0))
+    (cond
+      ((= k (array-length same)) #t)
+      (((array-ref same k) l r) (check (+ k 1)))
+      (else #f))))
+
+;; Whether row i of x and row j of y have equal values.
+(: (-> (Column %v) (Column %v) (-> int int bool)) (where (Eq %v)))
+(defun (column-cells-equal x y)
+  (fun (i j) (= (cell x i) (cell y j))))
+
+;; Whether row i of a and row j of b have the same key, two nulls and two
+;; NaNs being the same. The `=` of doubles is .NET's Equals, which says that
+;; of two NaNs, and of -0.0 and 0.0.
+(: (-> AnyColumn AnyColumn (-> int int bool)))
+(defun (key-equality a b)
+  (def values (value-equality a b))
+  (if (and (= (any-null-count a) 0) (= (any-null-count b) 0))
+      values
+      (fun (i j)
+        (def na (any-null? a i))
+        (def nb (any-null? b j))
+        (if (or na nb) (and na nb) (values i j)))))
+
+(: (-> AnyColumn AnyColumn (-> int int bool)))
+(defun (value-equality a b)
+  (match (Tuple (clr-type-name a) (clr-type-name b))
+    ((Tuple "Double" "Double") (column-cells-equal (as-doubles a) (as-doubles b)))
+    ((Tuple "Float" "Float") (column-cells-equal (as-floats a) (as-floats b)))
+    ((Tuple "Int64" "Int64") (column-cells-equal (as-longs a) (as-longs b)))
+    ((Tuple "Int32" "Int32") (column-cells-equal (as-ints a) (as-ints b)))
+    ((Tuple "Int16" "Int16") (column-cells-equal (as-shorts a) (as-shorts b)))
+    ((Tuple "UInt8" "UInt8") (column-cells-equal (as-bytes a) (as-bytes b)))
+    ((Tuple "UInt16" "UInt16") (column-cells-equal (as-ushorts a) (as-ushorts b)))
+    ((Tuple "UInt32" "UInt32") (column-cells-equal (as-uints a) (as-uints b)))
+    ((Tuple "UInt64" "UInt64") (column-cells-equal (as-ulongs a) (as-ulongs b)))
+    ((Tuple "Date32" "Date32") (column-cells-equal (as-days a) (as-days b)))
+    ((Tuple "Timestamp" "Timestamp") (column-cells-equal (timestamps-of a) (timestamps-of b)))
+    ((Tuple "TimestampTz" "TimestampTz") (column-cells-equal (timestamps-of a) (timestamps-of b)))
+    ((Tuple "Boolean" "Boolean")
+     (def x (bools-of a))
+     (def y (bools-of b))
+     (fun (i j) (= (bool-cell x i) (bool-cell y j))))
+    ((Tuple "String" "String")
+     (def x (as-strings a))
+     (def y (as-strings b))
+     (fun (i j) (bytes-equal? (string-column-bytes x i) (string-column-bytes y j))))
+    ;; Two categories of the same levels compare codes; others, the levels'
+    ;; strings.
+    ((Tuple "Category" "Category")
+     (def x (as-dictionary a))
+     (def y (as-dictionary b))
+     (if (same-object? (cast System.Object (dictionary-levels x)) (cast System.Object (dictionary-levels y)))
+         (column-cells-equal (category-codes-of a) (category-codes-of b))
+         (fun (i j) (bytes-equal? (level-bytes x i) (level-bytes y j)))))
+    (_ (not-a-key a))))
+
+(: (-> AnyColumn (Column short)))
+(defun (as-shorts c) (match c ((:is Apache.Arrow.Int16Array x) (cast (Column short) x)) (_ (not-a-key c))))
+
+(: (-> AnyColumn (Column byte)))
+(defun (as-bytes c) (match c ((:is Apache.Arrow.UInt8Array x) (cast (Column byte) x)) (_ (not-a-key c))))
+
+(: (-> AnyColumn (Column ushort)))
+(defun (as-ushorts c) (match c ((:is Apache.Arrow.UInt16Array x) (cast (Column ushort) x)) (_ (not-a-key c))))
+
+(: (-> AnyColumn (Column uint)))
+(defun (as-uints c) (match c ((:is Apache.Arrow.UInt32Array x) (cast (Column uint) x)) (_ (not-a-key c))))
+
+(: (-> AnyColumn (Column ulong)))
+(defun (as-ulongs c) (match c ((:is Apache.Arrow.UInt64Array x) (cast (Column ulong) x)) (_ (not-a-key c))))
+
+;; The days since 1970 of a column of dates.
+(: (-> AnyColumn (Column int)))
+(defun (as-days c) (match c ((:is Apache.Arrow.Date32Array x) (cast (Column int) x)) (_ (not-a-key c))))
+
+(: (-> AnyColumn (Column long)))
+(defun (timestamps-of c)
+  (match c
+    ((:is Apache.Arrow.TimestampArray x) (cast (Column long) x))
+    (_ (not-a-key c))))
+
+(: (-> AnyColumn Apache.Arrow.BooleanArray))
+(defun (bools-of c)
+  (match c
+    ((:is Apache.Arrow.BooleanArray x) x)
+    (_ (not-a-key c))))
+
+;; ---------------------------------------------------------------------------
+;; The table of the matches
+
+;; What a join keeps: 0 inner, 1 left, 2 semi, 3 anti.
+(: (-> Table Table (Array string) int Table))
+(defun (join-tables left right keys kind)
+  (def lk {arraying (clr-column left (clr-index-of left k)) (:for k keys)})
+  (def rk {arraying (clr-column right (clr-index-of right k)) (:for k keys)})
+  (def one-key? (= (array-length lk) 1))
+  (def parts
+    (cond
+      ((and one-key? (both-categories? (array-ref lk 0) (array-ref rk 0)))
+       (match-categories (array-ref lk 0) (array-ref rk 0) kind))
+      (else
+       (match (if one-key? (match-integers (array-ref lk 0) (array-ref rk 0) kind) None)
+         ((Some parts) parts)
+         (None (match-hashes lk rk kind))))))
+  (def (Tuple lrows rrows) (matches->arrays parts))
+  (def n (array-length lrows))
+  (def ln (table-row-count left))
+  (def taken-left (if (in-order? lrows ln) left (clr-take left lrows n)))
+  (if (>= kind 2)
+      taken-left
+      (joined-columns left right keys taken-left rrows n)))
+
+;; The keys, from the left table, then the other columns of the left table,
+;; then those of the right. A name that both tables have for columns that
+;; are not keys gets ".x" in the left one and ".y" in the right.
+(: (-> Table Table (Array string) Table (Array int) int Table))
+(defun (joined-columns left right keys taken-left rrows n)
+  (: (-> string bool))
+  (defun (key? name) (any? (fun (k) (= k name)) keys))
+  (def left-names (clr-names left))
+  (def right-names (clr-names right))
+  (: (-> (Array string) string bool))
+  (defun (other-column? names name) (and (not (key? name)) (any? (fun (x) (= x name)) names)))
+  (def left-schema (clr-schema left))
+  (def right-schema (clr-schema right))
+  (def taken-right
+    (if (in-order? rrows (table-row-count right))
+        {arraying (clr-column right i) (:for i (range 0 (table-column-count right)))}
+        (clr-take-or-null right rrows)))
+  (def key-columns
+    {vecing (begin
+              (def i (clr-index-of left k))
+              (Tuple (schema-field left-schema i) (clr-column taken-left i)))
+            (:for k keys)})
+  (def left-columns
+    {vecing (begin
+              (def f (schema-field left-schema i))
+              (def name (field-name f))
+              (Tuple (if (other-column? right-names name) (clr-new-field (str name ".x") (field-type f)) f)
+                     (clr-column taken-left i)))
+            (:for i (range 0 (table-column-count left)))
+            (:when (not (key? (field-name (schema-field left-schema i)))))})
+  (def right-columns
+    {vecing (begin
+              (def f (schema-field right-schema i))
+              (def name (field-name f))
+              (Tuple (clr-new-field (if (other-column? left-names name) (str name ".y") name) (field-type f))
+                     (array-ref taken-right i)))
+            (:for i (range 0 (table-column-count right)))
+            (:when (not (key? (field-name (schema-field right-schema i)))))})
+  (def all (vec-merge key-columns left-columns right-columns))
+  (clr-from-fields {arraying (match c ((Tuple f _) f)) (:for c all)}
+                   {arraying (match c ((Tuple _ col) col)) (:for c all)}
+                   n))
+
+;; The text of the first problem with the keys, or the empty string: a key
+;; that a table does not have, a key of other types in the two tables, a type
+;; that cannot be a key, or a name that is a key twice.
+(: (-> Table Table (Array string) string))
+(defun (join-key-problem left right keys)
+  (: (-> string string))
+  (defun (problem-of k)
+    (def li (clr-index-of left k))
+    (def ri (clr-index-of right k))
+    (cond
+      ((< li 0) (str "the left table has no column '" k "'."))
+      ((< ri 0) (str "the right table has no column '" k "'."))
+      (else
+       (def lt (field-type (schema-field (clr-schema left) li)))
+       (def rt (field-type (schema-field (clr-schema right) ri)))
+       (cond
+         ((not (clr-key-type? lt)) (str "'" k "' is a column of " (clr-arrow-name lt) ", which cannot be a key."))
+         ((not (clr-same-type? lt rt))
+          (str "'" k "' is a column of " (clr-arrow-name lt) " in the left table and of "
+               (clr-arrow-name rt) " in the right."))
+         (else "")))))
+  (cond
+    ((= (array-length keys) 0) "a join needs at least one key.")
+    ((let twice ((i 0))
+       (cond
+         ((= i (array-length keys)) #f)
+         ((any? (fun (j) (= (array-ref keys j) (array-ref keys i))) (range 0 i)) #t)
+         (else (twice (+ i 1)))))
+     "a key is named twice.")
+    (else
+     (let first ((i 0))
+       (cond
+         ((= i (array-length keys)) "")
+         (else
+          (def p (problem-of (array-ref keys i)))
+          (if (= p "") (first (+ i 1)) p)))))))
+
+;; Whether columns of the two types are of one type: a timestamp's unit and
+;; time zone too, and a dictionary only when both are categories.
+(: (-> ArrowType ArrowType bool))
+(defun (clr-same-type? a b)
+  (and (= (clr-type-id a) (clr-type-id b))
+       (match a
+         ((:is Apache.Arrow.Types.TimestampType ta)
+          (match b
+            ((:is Apache.Arrow.Types.TimestampType tb)
+             (and (= (timestamp-unit ta) (timestamp-unit tb))
+                  (same-clr-string? (timestamp-zone ta) (timestamp-zone tb))))
+            (_ #f)))
+         (_ #t))
+       (match a
+         ((:is Apache.Arrow.Types.DictionaryType) (and (category-type? a) (category-type? b)))
+         (_ #t))))
+
+;; ---------------------------------------------------------------------------
+;; Rows taken with nulls
+
+;; The columns of `t` at the rows; a row of -1 is a null in each column.
+(: (-> Table (Array int) (Array AnyColumn)))
+(defun (clr-take-or-null t rows)
+  (def n (array-length rows))
+  (def columns (range 0 (table-column-count t)))
+  (cond
+    ((not (let missing? ((i 0)) (and (< i n) (or (< (array-ref rows i) 0) (missing? (+ i 1))))))
+     (def taken (clr-take t rows n))
+     {arraying (clr-column taken c) (:for c columns)})
+    ((= (table-row-count t) 0)
+     {arraying (clr-nulls (field-type (schema-field (clr-schema t) c)) n) (:for c columns)})
+    (else
+     ;; The rows that are there, at their places; a missing row takes row 0,
+     ;; whose value is then hidden by a null.
+     (def fixed-rows (: (make-array n) (Array int)))
+     (loop (:for i (range 0 n)) (:do (array-set! fixed-rows i (max (array-ref rows i) 0))))
+     (def taken (clr-take t fixed-rows n))
+     {arraying (hide-missing (clr-column taken c) rows) (:for c columns)})))
+
+;; The column with a null at each place whose row is -1.
+(: (-> AnyColumn (Array int) AnyColumn))
+(defun (hide-missing a rows)
+  (def data (column-array-data a))
+  (def buffers (array-data-buffers data))
+  (def offset (array-data-offset data))
+  (def has-valid? (not (or (= (array-data-null-count data) 0) (buffer-empty? (array-ref buffers 0)))))
+  (def n (array-length rows))
+  (def bits (: (make-array (quotient (+ n 7) 8)) (Array byte)))
+  (def nulls
+    (if has-valid?
+        (hidden-bits! bits rows offset (buffer-span (array-ref buffers 0)))
+        (hidden-bits-all-valid! bits rows)))
+  (def new-buffers {arraying (if (= i 0) (ArrowBuffer. (Rom. bits)) (array-ref buffers i))
+                             (:for i (range 0 (array-length buffers)))})
+  (build-column (ArrayDataOf. (array-data-type data) (array-data-length data) nulls offset new-buffers
+                              (array-data-children data) (array-data-dictionary data))))
+
+;; The bits of the rows that are there and valid in `valid`; the number of
+;; the others.
+(: (-> (Array byte) (Array int) int (RoSpan byte) int))
+(defun (hidden-bits! bits rows offset valid)
+  (let set-bits ((i 0) (nulls 0))
+    (if (= i (array-length rows))
+        nulls
+        (begin
+          (def bit (+ offset i))
+          (if (and (>= (array-ref rows i) 0)
+                   (not (= 0 (bitwise-and (cast int (ro-span-ref valid (shift-right bit 3)))
+                                          (shift-left 1 (bitwise-and bit 7))))))
+              (begin (set-bit! bits i) (set-bits (+ i 1) nulls))
+              (set-bits (+ i 1) (+ nulls 1)))))))
+
+(: (-> (Array byte) (Array int) int))
+(defun (hidden-bits-all-valid! bits rows)
+  (let set-bits ((i 0) (nulls 0))
+    (cond
+      ((= i (array-length rows)) nulls)
+      ((>= (array-ref rows i) 0) (set-bit! bits i) (set-bits (+ i 1) nulls))
+      (else (set-bits (+ i 1) (+ nulls 1))))))
+
+(: (-> (Array byte) int void))
+(defun (set-bit! bits i)
+  (def at (shift-right i 3))
+  (array-set! bits at (cast byte (bitwise-ior (cast int (array-ref bits at)) (shift-left 1 (bitwise-and i 7))))))
+
+;; A column of n nulls of the type.
+(: (-> ArrowType int AnyColumn))
+(defun (clr-nulls type n)
+  (: (-> int ArrowBuffer))
+  (defun (zeros k) (ArrowBuffer. (Rom. (: (make-array k) (Array byte)))))
+  (def bits (zeros (quotient (+ n 7) 8)))
+  (: (-> (Array ArrowBuffer) AnyColumn))
+  (defun (column-of buffers) (build-column (ArrayDataOf. type n n 0 buffers (: (clr-default) (Array ArrayDataOf)) (: (clr-default) ArrayDataOf))))
+  (cond
+    ((category-type? type) (category-nulls n))
+    (else
+     (match type
+       ((:is Apache.Arrow.Types.StringType) (column-of #[bits (zeros (* (+ n 1) 4)) empty-buffer]))
+       ((:is Apache.Arrow.Types.BinaryType) (column-of #[bits (zeros (* (+ n 1) 4)) empty-buffer]))
+       ((:is Apache.Arrow.Types.BooleanType) (column-of #[bits (zeros (quotient (+ n 7) 8))]))
+       ((:is Apache.Arrow.Types.FixedWidthType fw) (column-of #[bits (zeros (quotient (* n (bit-width fw)) 8))]))
+       (_ (panic! (str "(bjostat table): a column of " (clr-type-name-of type) " cannot be made of nulls")))))))
+
 ;; Joins, as dplyr's: the rows of two tables whose keys, columns of the same
 ;; names in both, are equal. The rows of the left table keep their order, and
 ;; for each, the right rows it matches come in their order. Two nulls are
@@ -1122,9 +2239,9 @@
 (: (-> Table Table (Vec string) int (Result TableError Table)))
 (defun (join left right keys kind)
   (def names (vec->array keys))
-  (def problem (clr-key-problem left right names))
+  (def problem (join-key-problem left right names))
   (if (= problem "")
-      (Ok (clr-join left right names kind))
+      (Ok (join-tables left right names kind))
       (refuse problem)))
 
 ;; The pairs of rows whose keys are equal.
@@ -1386,7 +2503,7 @@
   (clr-from-fields
    {arraying (cond
                ((< i nk) (field-at t (array-ref kept i)))
-               ((= i nk) (clr-new-field names-to clr-string-type))
+               ((= i nk) (clr-new-field names-to (cast ArrowType clr-string-type)))
                (else (clr-new-field values-to type)))
              (:for i (range 0 (+ nk 2)))}
    {arraying (cond
@@ -2108,7 +3225,8 @@
 (: (-> string (Result TableError Table)))
 (defun (read-arrow path)
   (match (clr-read-file path)
-    ((Ok t) (Ok t))
+    ((Ok (Some t)) (Ok t))
+    ((Ok None) (refuse (str path ": " path " has a schema and no record batch, so it has no rows to read.")))
     ((Err e) (refuse (str path ": " (.-Message e))))))
 
 (: (-> Table string (Result TableError Unit)))

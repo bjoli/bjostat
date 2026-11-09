@@ -38,7 +38,7 @@
     ((Ok v) v)
     ((Err e) (panic! (displayed e)))))
 
-(import/extern (any-rows (: Bjostat.Columns.Length (-> AnyColumn int))))
+(import/extern (any-rows (: Apache.Arrow.IArrowArray.Length (-> AnyColumn int) #:get)))
 
 (: (Row (Tuple double long)))
 (def price-qty (both (col "price") (col "qty")))

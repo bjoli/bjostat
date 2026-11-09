@@ -42,6 +42,7 @@
 (import (std prelude))
 (import (only (std maths) quotient))
 (import (only (std array) array-copy!))
+(import (only (std interop) clr-default))
 (import (bjostat table))
 
 (import/class
@@ -55,7 +56,16 @@
   ;; A column of text is put together from the buffers of three builders.
   (ArrowBuffer (: Apache.Arrow.ArrowBuffer))
   (ArrayData (: Apache.Arrow.ArrayData))
-  (TextArray (: Apache.Arrow.StringArray (-> int ArrowBuffer ArrowBuffer ArrowBuffer int int TextArray))))
+  (TextArray (: Apache.Arrow.StringArray (-> int ArrowBuffer ArrowBuffer ArrowBuffer int int TextArray)))
+  ;; A table is made of a schema and the columns.
+  (ArrowType (: Apache.Arrow.Types.IArrowType))
+  (Schema (: Apache.Arrow.Schema))
+  (SchemaBuilder (: Apache.Arrow.Schema+Builder (-> SchemaBuilder)))
+  ((ClrEnumerable %a) (: System.Collections.Generic.IEnumerable))
+  ((ClrPair %k %v) (: System.Collections.Generic.KeyValuePair))
+  (Field (: Apache.Arrow.Field
+            (-> string ArrowType bool (ClrEnumerable (ClrPair System.String System.String)) Field)))
+  (RecordBatch (: Apache.Arrow.RecordBatch (-> Schema (Array AnyColumn) int RecordBatch))))
 
 (import/extern
   (clr-latin-1 (: System.Text.Encoding.Latin1 #:get))
@@ -74,10 +84,22 @@
   (builder-build-micros (: Bjostat.BuilderOps.BuildMicros (-> (Builder long) bool AnyColumn)))
   (builder-extend (: Bjostat.BuilderOps.Extend (-> (Builder %a) int (Builder %a))))
   (builder-span (: Bjostat.BuilderOps.Span (-> (Builder %a) int int (Span %a))))
-  (make-columns (: Bjostat.Tables.Make (-> (Array string) (Array AnyColumn) int Table)))
+  (data-type (: Apache.Arrow.ArrayData.DataType (-> ArrayData ArrowType) #:get))
+  (schema-builder-add! (: Apache.Arrow.Schema+Builder.Field (-> SchemaBuilder Field SchemaBuilder)))
+  (schema-builder-build (: Apache.Arrow.Schema+Builder.Build (-> SchemaBuilder Schema)))
   (column-data (: Apache.Arrow.IArrowArray.Data (-> AnyColumn ArrayData) #:get))
   (data-buffers (: Apache.Arrow.ArrayData.Buffers (-> ArrayData (Array ArrowBuffer)) #:get))
   (empty-buffer (: Apache.Arrow.ArrowBuffer.Empty #:get)))
+
+;; A table of the columns, all of `rows` rows, under the names. A field can
+;; hold nulls and has no metadata.
+(: (-> (Array string) (Array AnyColumn) int Table))
+(defun (make-columns names columns rows)
+  (def b (SchemaBuilder.))
+  (loop (:for i (range 0 (array-length names)))
+        (:do (def type (data-type (column-data (array-ref columns i))))
+             (ignore (schema-builder-add! b (Field. (array-ref names i) type #t (clr-default))))))
+  (RecordBatch. (schema-builder-build b) columns rows))
 
 ;; ===========================================================================
 ;; What the module gives
