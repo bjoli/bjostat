@@ -1711,6 +1711,44 @@ glue is 4805 lines of C# (614 out).
   its metadata, as System.HashCode, could not be constructed. Now
   ~(HashCode.)~ is ~new System.HashCode()~, and AddBytes changes it.
 
+** Done: array->column in Bjolang
+
+Bjolang can now see a span of numbers as a span of other numbers, with no
+copy: ~span->~ and ~ro-span->~ (Bjolang's CHANGELOG, "span-> and
+ro-span->"). A span of a string's bytes stays read-only. Columns.FromArray
+and FromArrayAt were C# because of that. Now ~array->column~ and
+~clr-longs-at~ are Bjolang, in src/table.bjo ("Making tables"): the values
+are copied once as their bytes into a managed array, and the validity
+bitmap is a managed byte array with ~set-bit!~, not Arrow's
+BitmapBuilder. The trait ~ColumnArray~ (double float long int short byte)
+makes the typed Arrow array of each type from its ArrayData. glue/Columns.cs
+keeps Tables.IndexOf. The glue is 4738 lines of C# (67 out).
+
+- The same results: scratch/columns/dump.bjo (439 lines) and
+  scratch/join/dump.bjo (759 lines), the same before and after. All 15
+  test files pass with all threads and with one.
+- Measured, the C# version (worktree of 1714026) and this alternated,
+  three rounds each (scratch/fromarray/bench.bjo):
+
+  | row                               | C#           | Bjolang      |
+  |-----------------------------------+--------------+--------------|
+  | array->column, 1M doubles         | 879-886 µs   | 858-882 µs   |
+  | array->column, 1M doubles, valid  | 4.37-4.38 ms | 1.91-2.20 ms |
+  | array->column, 1M longs           | 873-900 µs   | 509-744 µs   |
+  | array->column, 1M bytes, valid    | 3.06-3.07 ms | 1.61-1.73 ms |
+  | table-count, 200k groups          | 3.14-3.20 ms | 3.21-3.72 ms |
+
+  The same memory. With validity flags it is faster because
+  BitmapBuilder.Append takes one flag at a time. ~table-count~ uses
+  ~clr-longs-at~ for its counts; 3.72 ms was one round, the other two are
+  3.21.
+- Bjolang found on the way: a trait whose method signatures use a .NET
+  generic that needs a struct, as ~(-> (Array %a) ... (PrimitiveArray %a))~,
+  was a C# interface without the constraint, which C# refused (CS0453).
+  Now the interface and the functions with a ~(where ...)~ on the trait
+  have it. A trait in the ~(where ...)~ of an exported function must be
+  exported too: else a caller gets "no implementation of trait".
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema

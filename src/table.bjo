@@ -44,7 +44,7 @@
   column-sum column-mean column-min column-max column-count
 
   ;; Making tables
-  array->column array->string-column named named-strings named-any make-table
+  ColumnArray array->column array->string-column named named-strings named-any make-table
   table-select table-slice TableRows table-rows
   SortKey table-sort
   inner-join left-join semi-join anti-join
@@ -208,7 +208,6 @@
 
   ;; Building. The flags are empty for a column with no nulls, or one for
   ;; each value, #f at a null.
-  (clr-from-array (: Bjostat.Columns.FromArray (-> (Array %a) (Array bool) (Column %a)) #:uses-type))
   ;; A string is added as its UTF-8 bytes, which Arrow's strings are. The
   ;; allocator is null: Arrow's default.
   (string-builder-add! (: Apache.Arrow.StringArray+Builder.Append
@@ -268,7 +267,6 @@
   (clr-sorted-ids (: Bjostat.ReshapeOps.SortedIds (-> AnyColumn (Option (Tuple (Array int) int)))))
   (clr-dense-limit (: Bjostat.ReshapeOps.DenseLimit long #:get))
   (clr-level-count (: Bjostat.ReshapeOps.LevelCount (-> AnyColumn int)))
-  (clr-longs-at (: Bjostat.Columns.FromArrayAt (-> (Array long) (Array int) (Column long))))
   (clr-categorize (: Bjostat.Categories.Categorize (-> Table string (Array string) Table)
                      #:exceptions (Bjostat.TableProblem)))
   (clr-levels (: Bjostat.Categories.Levels (-> AnyColumn (Array string))))
@@ -284,6 +282,61 @@
   (writer-end! (: Apache.Arrow.Ipc.ArrowFileWriter.WriteEnd (-> ArrowFileWriter void)))
   (concatenate-columns (: Apache.Arrow.ArrowArrayConcatenator.Concatenate
                           (-> (ClrReadOnlyList AnyColumn) MemoryAllocator AnyColumn))))
+
+;; For the joins and for making columns: buffers, array data, hashes.
+(import/class
+  (HashCode (: System.HashCode (-> HashCode)))
+  ((Rom %a) (: System.ReadOnlyMemory (-> (Array %a) (Rom %a))))
+  (ArrowBuffer (: Apache.Arrow.ArrowBuffer (-> (Rom byte) ArrowBuffer)))
+  (ArrayDataOf (: Apache.Arrow.ArrayData
+                  (-> ArrowType int int int (Array ArrowBuffer) (Array ArrayDataOf) ArrayDataOf ArrayDataOf)))
+  ;; The typed arrays a column of numbers is, made of its data.
+  (DoubleArray (: Apache.Arrow.DoubleArray (-> ArrayDataOf DoubleArray)))
+  (FloatArray (: Apache.Arrow.FloatArray (-> ArrayDataOf FloatArray)))
+  (Int64Array (: Apache.Arrow.Int64Array (-> ArrayDataOf Int64Array)))
+  (Int32Array (: Apache.Arrow.Int32Array (-> ArrayDataOf Int32Array)))
+  (Int16Array (: Apache.Arrow.Int16Array (-> ArrayDataOf Int16Array)))
+  (UInt8Array (: Apache.Arrow.UInt8Array (-> ArrayDataOf UInt8Array))))
+
+(import/extern
+  (double-type (: Apache.Arrow.Types.DoubleType.Default #:get))
+  (float-type (: Apache.Arrow.Types.FloatType.Default #:get))
+  (int64-type (: Apache.Arrow.Types.Int64Type.Default #:get))
+  (int32-type (: Apache.Arrow.Types.Int32Type.Default #:get))
+  (int16-type (: Apache.Arrow.Types.Int16Type.Default #:get))
+  (uint8-type (: Apache.Arrow.Types.UInt8Type.Default #:get))
+  ;; An array whose elements are not zeroed first: for one that is written
+  ;; whole before it is read.
+  (uninitialized-array (: System.GC.AllocateUninitializedArray (-> int (Array %a)))))
+
+(import/extern
+  (hash-add-bytes! (: System.HashCode.AddBytes (-> HashCode (RoSpan byte) void)))
+  (hash-value (: System.HashCode.ToHashCode (-> HashCode int)))
+  (double-bits (: System.BitConverter.DoubleToUInt64Bits (-> double ulong)))
+  (float-bits (: System.BitConverter.SingleToUInt32Bits (-> float uint)))
+  (double-nan? (: System.Double.IsNaN (-> double bool)))
+  (float-nan? (: System.Single.IsNaN (-> float bool)))
+  (bytes-equal? (: System.MemoryExtensions.SequenceEqual (-> (RoSpan %a) (RoSpan %a) bool)))
+  (same-object? (: System.Object.ReferenceEquals (-> System.Object System.Object bool)))
+  (same-clr-string? (: System.String.Equals (-> System.String System.String bool)))
+  (binary-search (: System.Array.BinarySearch (-> (Array %a) %a int)))
+  (slice-column (: Apache.Arrow.ArrowArrayFactory.Slice (-> AnyColumn int int AnyColumn)))
+  (build-column (: Apache.Arrow.ArrowArrayFactory.BuildArray (-> ArrayDataOf AnyColumn)))
+  (level-bytes (: Bjostat.Categories.LevelBytes (-> Apache.Arrow.DictionaryArray int (RoSpan byte))))
+  (category-type? (: Bjostat.Categories.IsType (-> ArrowType bool)))
+  (category-nulls (: Bjostat.Categories.Nulls (-> int AnyColumn)))
+  (column-array-data (: Apache.Arrow.IArrowArray.Data (-> AnyColumn ArrayDataOf) #:get))
+  (array-data-type (: Apache.Arrow.ArrayData.DataType (-> ArrayDataOf ArrowType) #:get))
+  (array-data-length (: Apache.Arrow.ArrayData.Length (-> ArrayDataOf int) #:get))
+  (array-data-null-count (: Apache.Arrow.ArrayData.NullCount (-> ArrayDataOf int) #:get))
+  (array-data-offset (: Apache.Arrow.ArrayData.Offset (-> ArrayDataOf int) #:get))
+  (array-data-buffers (: Apache.Arrow.ArrayData.Buffers (-> ArrayDataOf (Array ArrowBuffer)) #:get))
+  (array-data-children (: Apache.Arrow.ArrayData.Children (-> ArrayDataOf (Array ArrayDataOf)) #:get))
+  (array-data-dictionary (: Apache.Arrow.ArrayData.Dictionary (-> ArrayDataOf ArrayDataOf) #:get))
+  (buffer-empty? (: Apache.Arrow.ArrowBuffer.IsEmpty (-> ArrowBuffer bool) #:get))
+  (buffer-span (: Apache.Arrow.ArrowBuffer.Span (-> ArrowBuffer (RoSpan byte)) #:get))
+  (empty-buffer (: Apache.Arrow.ArrowBuffer.Empty #:get))
+  (bit-width (: Apache.Arrow.Types.FixedWidthType.BitWidth (-> Apache.Arrow.Types.FixedWidthType int) #:get)))
 
 ;; ===========================================================================
 ;; Columns and tables in Arrow
@@ -1231,11 +1284,69 @@
 ;; Making tables
 ;; ===========================================================================
 
+;; The numbers a column can be made of with `array->column`: Arrow's typed
+;; array of each, made of its data. The array is only there to say the type.
+(def/trait (ColumnArray %a)
+  (: primitive-column (-> (Array %a) ArrowBuffer ArrowBuffer int int (Column %a))))
+
+;; The data of a column of `type`: its validity bitmap and its values' bytes.
+(: (-> ArrowType ArrowBuffer ArrowBuffer int int ArrayDataOf))
+(defun (primitive-data type bitmap data n nulls)
+  (ArrayDataOf. type n nulls 0 #[bitmap data] (: (clr-default) (Array ArrayDataOf)) (: (clr-default) ArrayDataOf)))
+
+(impl (ColumnArray double)
+  (defun (primitive-column _ bitmap data n nulls)
+    (cast (Column double) (DoubleArray. (primitive-data (cast ArrowType double-type) bitmap data n nulls)))))
+(impl (ColumnArray float)
+  (defun (primitive-column _ bitmap data n nulls)
+    (cast (Column float) (FloatArray. (primitive-data (cast ArrowType float-type) bitmap data n nulls)))))
+(impl (ColumnArray long)
+  (defun (primitive-column _ bitmap data n nulls)
+    (cast (Column long) (Int64Array. (primitive-data (cast ArrowType int64-type) bitmap data n nulls)))))
+(impl (ColumnArray int)
+  (defun (primitive-column _ bitmap data n nulls)
+    (cast (Column int) (Int32Array. (primitive-data (cast ArrowType int32-type) bitmap data n nulls)))))
+(impl (ColumnArray short)
+  (defun (primitive-column _ bitmap data n nulls)
+    (cast (Column short) (Int16Array. (primitive-data (cast ArrowType int16-type) bitmap data n nulls)))))
+(impl (ColumnArray byte)
+  (defun (primitive-column _ bitmap data n nulls)
+    (cast (Column byte) (UInt8Array. (primitive-data (cast ArrowType uint8-type) bitmap data n nulls)))))
+
 ;; A column holding a copy of the array. With `#:valid`, as long as the array,
-;; the value at each #f is a null.
-(: (-> (Array %a) (#:valid (Array bool)) (Column %a)))
+;; the value at each #f is a null. The values are copied as their bytes, once,
+;; and the buffers are managed arrays.
+(: (-> (Array %a) (#:valid (Array bool)) (Column %a)) (where (ColumnArray %a) (Num %a)))
 (defun (array->column a #:valid (make-array 0))
-  (clr-from-array a valid))
+  (def n (array-length a))
+  (def flags (array-length valid))
+  (when (and (> flags 0) (not (= flags n)))
+    (panic! (str "(bjostat table): " (int->string flags) " validity flags for " (int->string n) " values")))
+  (: (RoSpan byte))
+  (def bytes (ro-span-> (array->ro-span a)))
+  (def data (ArrowBuffer. (Rom. (ro-span->array bytes))))
+  (if (= flags 0)
+      (primitive-column a empty-buffer data n 0)
+      (begin
+        (def bits (: (make-array (quotient (+ n 7) 8)) (Array byte)))
+        (def nulls
+          (let mark ((i 0) (nulls 0))
+            (cond
+              ((= i n) nulls)
+              ((array-ref valid i) (set-bit! bits i) (mark (+ i 1) nulls))
+              (else (mark (+ i 1) (+ nulls 1))))))
+        (primitive-column a (ArrowBuffer. (Rom. bits)) data n nulls))))
+
+;; A column of values[at[i]] for each i, with no nulls: one pass, into the
+;; column's buffer.
+(: (-> (Array long) (Array int) (Column long)))
+(defun (clr-longs-at values at)
+  (def n (array-length at))
+  (def bytes (: (uninitialized-array (* n 8)) (Array byte)))
+  (: (Span long))
+  (def out (span-> (array->span bytes)))
+  (loop (:for i (range 0 n)) (:do (span-set! out i (array-ref values (array-ref at i)))))
+  (primitive-column values empty-buffer (ArrowBuffer. (Rom. bytes)) n 0))
 
 (: (-> (Array string) (#:valid (Array bool)) StringColumn))
 (defun (array->string-column a #:valid (make-array 0))
@@ -1444,42 +1555,6 @@
 ;; threads, each part with lists of its own, put one after the other in the
 ;; order of the parts. So the left rows keep their order, and the right rows
 ;; of each are in their order. Two nulls are equal keys, and so are two NaNs.
-
-(import/class
-  (HashCode (: System.HashCode (-> HashCode)))
-  ((Rom %a) (: System.ReadOnlyMemory (-> (Array %a) (Rom %a))))
-  (ArrowBuffer (: Apache.Arrow.ArrowBuffer (-> (Rom byte) ArrowBuffer)))
-  (ArrayDataOf (: Apache.Arrow.ArrayData
-                  (-> ArrowType int int int (Array ArrowBuffer) (Array ArrayDataOf) ArrayDataOf ArrayDataOf))))
-
-(import/extern
-  (hash-add-bytes! (: System.HashCode.AddBytes (-> HashCode (RoSpan byte) void)))
-  (hash-value (: System.HashCode.ToHashCode (-> HashCode int)))
-  (double-bits (: System.BitConverter.DoubleToUInt64Bits (-> double ulong)))
-  (float-bits (: System.BitConverter.SingleToUInt32Bits (-> float uint)))
-  (double-nan? (: System.Double.IsNaN (-> double bool)))
-  (float-nan? (: System.Single.IsNaN (-> float bool)))
-  (bytes-equal? (: System.MemoryExtensions.SequenceEqual (-> (RoSpan %a) (RoSpan %a) bool)))
-  (same-object? (: System.Object.ReferenceEquals (-> System.Object System.Object bool)))
-  (same-clr-string? (: System.String.Equals (-> System.String System.String bool)))
-  (binary-search (: System.Array.BinarySearch (-> (Array %a) %a int)))
-  (slice-column (: Apache.Arrow.ArrowArrayFactory.Slice (-> AnyColumn int int AnyColumn)))
-  (build-column (: Apache.Arrow.ArrowArrayFactory.BuildArray (-> ArrayDataOf AnyColumn)))
-  (level-bytes (: Bjostat.Categories.LevelBytes (-> Apache.Arrow.DictionaryArray int (RoSpan byte))))
-  (category-type? (: Bjostat.Categories.IsType (-> ArrowType bool)))
-  (category-nulls (: Bjostat.Categories.Nulls (-> int AnyColumn)))
-  (column-array-data (: Apache.Arrow.IArrowArray.Data (-> AnyColumn ArrayDataOf) #:get))
-  (array-data-type (: Apache.Arrow.ArrayData.DataType (-> ArrayDataOf ArrowType) #:get))
-  (array-data-length (: Apache.Arrow.ArrayData.Length (-> ArrayDataOf int) #:get))
-  (array-data-null-count (: Apache.Arrow.ArrayData.NullCount (-> ArrayDataOf int) #:get))
-  (array-data-offset (: Apache.Arrow.ArrayData.Offset (-> ArrayDataOf int) #:get))
-  (array-data-buffers (: Apache.Arrow.ArrayData.Buffers (-> ArrayDataOf (Array ArrowBuffer)) #:get))
-  (array-data-children (: Apache.Arrow.ArrayData.Children (-> ArrayDataOf (Array ArrayDataOf)) #:get))
-  (array-data-dictionary (: Apache.Arrow.ArrayData.Dictionary (-> ArrayDataOf ArrayDataOf) #:get))
-  (buffer-empty? (: Apache.Arrow.ArrowBuffer.IsEmpty (-> ArrowBuffer bool) #:get))
-  (buffer-span (: Apache.Arrow.ArrowBuffer.Span (-> ArrowBuffer (RoSpan byte)) #:get))
-  (empty-buffer (: Apache.Arrow.ArrowBuffer.Empty #:get))
-  (bit-width (: Apache.Arrow.Types.FixedWidthType.BitWidth (-> Apache.Arrow.Types.FixedWidthType int) #:get)))
 
 ;; The rows of a part of a join's left table.
 (def join-part-rows 65536)
