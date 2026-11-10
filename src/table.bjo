@@ -45,6 +45,7 @@
 
   ;; Making tables
   ColumnArray array->column array->string-column named named-strings named-any make-table
+  take-rows with-column
   table-select table-slice TableRows table-rows
   SortKey table-sort
   inner-join left-join semi-join anti-join
@@ -119,7 +120,7 @@
   (MemoryAllocator (: Apache.Arrow.Memory.MemoryAllocator))
   (Encoding (: System.Text.Encoding))
   (ArrowTypeId (: Apache.Arrow.Types.ArrowTypeId))
-  (TimestampType (: Apache.Arrow.Types.TimestampType))
+  (TimestampType (: Apache.Arrow.Types.TimestampType (-> TimeUnit System.String TimestampType)))
   (TimeUnit (: Apache.Arrow.Types.TimeUnit))
   (MidpointRounding (: System.MidpointRounding))
   (FormatProvider (: System.IFormatProvider))
@@ -203,8 +204,6 @@
   (clr-next-complete-6 (: Bjostat.CellsOps.NextComplete
                           (-> (ClrCells %a) (ClrCells %b) (ClrCells %c) (ClrCells %d) (ClrCells %e)
                               (ClrCells %f) int int int)))
-  (clr-day-cells (: Bjostat.TimeCells.Days (-> AnyColumn (Option (ClrCells int)))))
-  (clr-micro-cells (: Bjostat.TimeCells.Micros (-> AnyColumn bool (Option (ClrCells long)))))
 
   ;; Building. The flags are empty for a column with no nulls, or one for
   ;; each value, #f at a null.
@@ -235,9 +234,9 @@
   (schema-builder-add! (: Apache.Arrow.Schema+Builder.Field (-> SchemaBuilder Field SchemaBuilder)))
   (schema-builder-build (: Apache.Arrow.Schema+Builder.Build (-> SchemaBuilder Schema)))
   (clr-unsortable (: Bjostat.Sorting.Unsortable (-> AnyColumn string)))
-  (clr-sort-by (: Bjostat.Sorting.SortBy (-> Table (Array int) (Array bool) Table)))
+  (clr-sort-order (: Bjostat.Sorting.SortOrder (-> Table (Array int) (Array bool) (Array int))))
 
-  ;; Reshaping: the kernels of glue/Reshape.cs and glue/Join.cs.
+  ;; Reshaping: the kernels of glue/Reshape.cs.
   (clr-firsts (: Bjostat.ReshapeOps.Firsts (-> (Array AnyColumn) int (Array int))))
   (clr-groups (: Bjostat.ReshapeOps.Groups (-> (Array AnyColumn) int (out (Array int)) (Tuple (Array int) (Array int)))))
   (clr-string-ids (: Bjostat.ReshapeOps.StringIds (-> StringColumn (out (Array int)) (Tuple (Array int) (Array int)))))
@@ -246,8 +245,6 @@
   (clr-interleaved (: Bjostat.Reshape.Interleaved (-> (Array AnyColumn) int AnyColumn)))
   (clr-repeated (: Bjostat.Reshape.Repeated (-> (Array string) int AnyColumn)))
   (clr-select (: Bjostat.Reshape.Select (-> Table (Array int) Table)))
-  (clr-take (: Bjostat.Query.Take (-> Table (Array int) int Table)))
-  (clr-key-type? (: Bjostat.Joins.KeyType (-> ArrowType bool)))
   (clr-arrow-name (: Bjostat.ColumnTypes.ArrowName (-> ArrowType string)))
   (clr-any-valid? (: Apache.Arrow.IArrowArray.IsValid (-> AnyColumn int bool)))
   (clr-schema (: Apache.Arrow.RecordBatch.Schema (-> Table Schema) #:get))
@@ -267,7 +264,7 @@
   (clr-sorted-ids (: Bjostat.ReshapeOps.SortedIds (-> AnyColumn (Option (Tuple (Array int) int)))))
   (clr-dense-limit (: Bjostat.ReshapeOps.DenseLimit long #:get))
   (clr-level-count (: Bjostat.ReshapeOps.LevelCount (-> AnyColumn int)))
-  (clr-categorize (: Bjostat.Categories.Categorize (-> Table string (Array string) Table)
+  (clr-categorize (: Bjostat.Categories.Categorize (-> Table string (Array string) AnyColumn)
                      #:exceptions (Bjostat.TableProblem)))
   (clr-levels (: Bjostat.Categories.Levels (-> AnyColumn (Array string))))
   (clr-codes (: Bjostat.Categories.Codes (-> AnyColumn AnyColumn)))
@@ -307,7 +304,16 @@
   (uint8-type (: Apache.Arrow.Types.UInt8Type.Default #:get))
   ;; An array whose elements are not zeroed first: for one that is written
   ;; whole before it is read.
-  (uninitialized-array (: System.GC.AllocateUninitializedArray (-> int (Array %a)))))
+  (uninitialized-array (: System.GC.AllocateUninitializedArray (-> int (Array %a))))
+  ;; For the copies of rows
+  (dictionary-index-type (: Apache.Arrow.Types.DictionaryType.IndexType
+                            (-> Apache.Arrow.Types.DictionaryType ArrowType) #:get))
+  (ro-span-copy! (: System.ReadOnlySpan.CopyTo (-> (RoSpan %a) (Span %a) void)))
+  (load-16 (: System.Runtime.Intrinsics.Vector128.Create (-> (RoSpan byte) (Simd128 byte))))
+  (store-16! (: System.Runtime.Intrinsics.Vector128.CopyTo (-> (Simd128 byte) (Span byte) void)))
+  ;; The allocator is null: Arrow's default.
+  (concatenate-columns (: Apache.Arrow.ArrowArrayConcatenator.Concatenate
+                          (-> (ClrReadOnlyList AnyColumn) MemoryAllocator AnyColumn))))
 
 (import/extern
   (hash-add-bytes! (: System.HashCode.AddBytes (-> HashCode (RoSpan byte) void)))
@@ -410,6 +416,16 @@
     ((category? a) "Category")
     (else (.ToString (clr-type-id type)))))
 
+;; Whether a column of the type can be a key of a join, a distinct or a count.
+(: (-> ArrowType bool))
+(defun (key-type? type)
+  (def id (clr-type-id type))
+  (or (any? (fun (k) (= k id))
+            [ArrowTypeId.Double ArrowTypeId.Float ArrowTypeId.Int64 ArrowTypeId.Int32 ArrowTypeId.Int16
+             ArrowTypeId.UInt8 ArrowTypeId.UInt16 ArrowTypeId.UInt32 ArrowTypeId.UInt64
+             ArrowTypeId.String ArrowTypeId.Boolean ArrowTypeId.Date32 ArrowTypeId.Timestamp])
+      (category-type? type)))
+
 (: (-> ArrowType bool))
 (defun (zoned-timestamp-type? type)
   (match type
@@ -503,6 +519,13 @@
        (else (def q (/ raw 100L))
              (if (< (% raw 100L) 0L) (- q 1L) q)))))
 
+;; The microseconds since 1970 of a timestamp of the unit, rounded down.
+(: (-> long TimeUnit long))
+(defun (timestamp-micros raw unit)
+  (def d (- (timestamp-ticks raw unit) epoch-ticks))
+  (def q (/ d 10L))
+  (if (< (% d 10L) 0L) (- q 1L) q))
+
 ;; A timestamp as ISO 8601: the date and the time, with the seconds and their
 ;; fraction only when they are not 0, and "Z" for one with a time zone.
 (: (-> Apache.Arrow.TimestampArray int string))
@@ -554,6 +577,25 @@
 ;; A field of the name and type that can hold nulls.
 (: (-> string ArrowType Field))
 (defun (clr-new-field name type) (Field. name type #t (clr-default)))
+
+;; The table with the column under the name: in place of the column of that
+;; name, or after the others when there is none.
+(: (-> Table string AnyColumn Table))
+(defun (with-column t name column)
+  (def schema (clr-schema t))
+  (def ncols (table-column-count t))
+  (def at (clr-index-of t name))
+  (def n (if (< at 0) (+ ncols 1) ncols))
+  (def place (if (< at 0) ncols at))
+  (def field (clr-new-field name (data-type (clr-data column))))
+  (def fields (: (make-array n) (Array Field)))
+  (def columns (: (make-array n) (Array AnyColumn)))
+  (loop (:for i (range 0 ncols))
+        (:do (array-set! fields i (schema-field schema i))
+             (array-set! columns i (clr-column t i))))
+  (array-set! fields place field)
+  (array-set! columns place column)
+  (clr-from-fields fields columns (table-row-count t)))
 
 (: (-> Table (Array string)))
 (defun (clr-names t)
@@ -889,17 +931,58 @@
     ((Some x) (Some (f x)))
     (None None)))
 
+;; The days since 1970 of a column of dates, or None for a column of another
+;; type.
+(: (-> AnyColumn (Option (ClrCells int))))
+(defun (day-cells c)
+  (match c
+    ((:is Apache.Arrow.Date32Array d) (Some (clr-cells-of-column (cast (Column int) d))))
+    (_ None)))
+
+;; The microseconds since 1970 of a column of timestamps with a time zone when
+;; `zoned`, or with none when not; None for a column of another type. A column
+;; of another unit is made one of microseconds first, rounded down.
+(: (-> AnyColumn bool (Option (ClrCells long))))
+(defun (micro-cells c zoned)
+  (match (data-type (clr-data c))
+    ((:is Apache.Arrow.Types.TimestampType ts)
+     (cond
+       ((= (clr-null-or-empty? (timestamp-zone ts)) zoned) None)
+       ((= (timestamp-unit ts) TimeUnit.Microsecond) (Some (clr-cells-of-column (cast (Column long) c))))
+       (else (Some (clr-cells-of-column (cast (Column long) (in-micros c ts)))))))
+    (_ None)))
+
+;; A column of timestamps of the type `ts`, as one of microseconds. Its
+;; validity bitmap is the same, and so is its offset: the values before it are
+;; 0.
+(: (-> AnyColumn TimestampType AnyColumn))
+(defun (in-micros c ts)
+  (def data (column-array-data c))
+  (def end (+ (array-data-offset data) (array-data-length data)))
+  (def unit (timestamp-unit ts))
+  (: (RoSpan long))
+  (def raw (ro-span-> (ro-span-slice (buffer-span (array-ref (array-data-buffers data) 1)) #:to (* end 8))))
+  (def bytes (: (make-array (* end 8)) (Array byte)))
+  (: (Span long))
+  (def micros (span-> (array->span bytes)))
+  (loop (:for i (range (array-data-offset data) end))
+        (:do (span-set! micros i (timestamp-micros (ro-span-ref raw i) unit))))
+  (build-column (ArrayDataOf. (cast ArrowType (TimestampType. TimeUnit.Microsecond (timestamp-zone ts)))
+                              (array-data-length data) (array-data-null-count data) (array-data-offset data)
+                              #[(array-ref (array-data-buffers data) 0) (ArrowBuffer. (Rom. bytes))]
+                              (: (clr-default) (Array ArrayDataOf)) (: (clr-default) ArrayDataOf))))
+
 (: (-> Table string (Result TableError DateCells)))
 (defun (date-cells t name)
-  (time-cells t name "date" (fun (c) (map-some (fun (d) (DateCells (days d))) (clr-day-cells c)))))
+  (time-cells t name "date" (fun (c) (map-some (fun (d) (DateCells (days d))) (day-cells c)))))
 
 (: (-> Table string (Result TableError DateTimeCells)))
 (defun (datetime-cells t name)
-  (time-cells t name "datetime" (fun (c) (map-some (fun (m) (DateTimeCells (micros m))) (clr-micro-cells c #f)))))
+  (time-cells t name "datetime" (fun (c) (map-some (fun (m) (DateTimeCells (micros m))) (micro-cells c #f)))))
 
 (: (-> Table string (Result TableError InstantCells)))
 (defun (instant-cells t name)
-  (time-cells t name "instant" (fun (c) (map-some (fun (m) (InstantCells (micros m))) (clr-micro-cells c #t)))))
+  (time-cells t name "instant" (fun (c) (map-some (fun (m) (InstantCells (micros m))) (micro-cells c #t)))))
 
 ;; A value that (std datetime) has, which is each value of years 1 to 9999.
 (: (-> (Option %a) %a))
@@ -1535,9 +1618,11 @@
           (:acc (vecing e))))
   (if (> (vec-length problems) 0)
       (Err (vec-ref problems 0))
-      (Ok (clr-sort-by t
-                       {arraying (clr-index-of t (sort-key-name k)) (:for k keys)}
-                       {arraying (match k ((descending _) #t) (_ #f)) (:for k keys)}))))
+      (Ok (take-rows t
+                     (clr-sort-order t
+                                     {arraying (clr-index-of t (sort-key-name k)) (:for k keys)}
+                                     {arraying (match k ((descending _) #t) (_ #f)) (:for k keys)})
+                     (table-row-count t)))))
 
 ;; ===========================================================================
 ;; Joins: the rows that match
@@ -2112,7 +2197,7 @@
   (def (Tuple lrows rrows) (matches->arrays parts))
   (def n (array-length lrows))
   (def ln (table-row-count left))
-  (def taken-left (if (in-order? lrows ln) left (clr-take left lrows n)))
+  (def taken-left (if (in-order? lrows ln) left (take-rows left lrows n)))
   (if (>= kind 2)
       taken-left
       (joined-columns left right keys taken-left rrows n)))
@@ -2176,7 +2261,7 @@
        (def lt (field-type (schema-field (clr-schema left) li)))
        (def rt (field-type (schema-field (clr-schema right) ri)))
        (cond
-         ((not (clr-key-type? lt)) (str "'" k "' is a column of " (clr-arrow-name lt) ", which cannot be a key."))
+         ((not (key-type? lt)) (str "'" k "' is a column of " (clr-arrow-name lt) ", which cannot be a key."))
          ((not (clr-same-type? lt rt))
           (str "'" k "' is a column of " (clr-arrow-name lt) " in the left table and of "
                (clr-arrow-name rt) " in the right."))
@@ -2215,6 +2300,421 @@
          (_ #t))))
 
 ;; ---------------------------------------------------------------------------
+;; Copies of rows
+;;
+;; The rows of a table at indices, in that order, in every column: what a
+;; `where`, a sort, a join, a distinct and a count keep. A column of numbers,
+;; codes, bools or strings is copied as its buffers, read directly; a column
+;; of another type is made of slices of its runs of rows.
+;;
+;; Many rows are copied on the compute threads, each column in parts of
+;; `take-part` rows, so that one long column of strings does not take as long
+;; as all the others. Most of the time of a copy is spent to get new memory:
+;; the operating system gives each page of a new array when it is first
+;; written, and the threads get their pages at the same time. The numbers and
+;; the bits of all the parts of all the columns are one pass; strings are two,
+;; the lengths of each part's strings and then the copy, since a part's
+;; strings start where the ones before end. Not one `computing-each` inside
+;; another: a thread that waits there could wait for threads that wait too.
+
+;; The rows of a part of a copy: a multiple of 8, so that each part writes
+;; whole bytes of a bitmap.
+(: take-part int)
+(def take-part 65536)
+
+;; Below this many cells, a copy on one thread is faster than the start of the
+;; others.
+(: take-parallel-cells long)
+(def take-parallel-cells 65536L)
+
+;; The table of the rows at the first `count` indices of `rows`, in that order.
+(: (-> Table (Array int) int Table))
+(defun (take-rows t rows count)
+  (check-rows rows count (table-row-count t))
+  (def ncols (table-column-count t))
+  (def columns
+    (cond
+      ((>= count (* 2 take-part)) (take-in-parts t rows count))
+      ((and (> ncols 1) (>= (* (cast long count) (cast long ncols)) take-parallel-cells))
+       (take-each-column t rows count))
+      (else
+       (def out (: (make-array ncols) (Array AnyColumn)))
+       (loop (:for c (range 0 ncols)) (:do (array-set! out c (take-column (clr-column t c) rows 0 count))))
+       out)))
+  (Table. (clr-schema t) columns count))
+
+;; The columns at the rows, a column on each compute thread.
+(: (-> Table (Array int) int (Array AnyColumn)))
+(defun (take-each-column t rows count)
+  (def taken (computing-each (table-column-count t) (fun (c) (take-column (clr-column t c) rows 0 count))))
+  (vec->array taken))
+
+;; Each row is checked once, here, before the copies read the buffers.
+(: (-> (Array int) int int void))
+(defun (check-rows rows count n)
+  (loop (:for i (range 0 count))
+        (:do (def r (array-ref rows i))
+             (when (or (< r 0) (>= r n))
+               (panic! (str "(bjostat query): row " (int->string r) " of a table of " (int->string n)))))))
+
+(: (-> (RoSpan byte) long void))
+(defun (check-buffer buffer needed)
+  (when (< (cast long (ro-span-length buffer)) needed)
+    (panic! "(bjostat query): a column's buffer is shorter than its length says")))
+
+(: (-> ArrayDataOf int ArrowBuffer))
+(defun (buffer-of data i) (array-ref (array-data-buffers data) i))
+
+;; How a column of the type is copied: 1 as bits, 2 as strings, 3 as values
+;; of a width in bytes, which is the second; 0 as slices.
+(: (-> ArrowType (Tuple int int)))
+(defun (copy-kind type)
+  (: (-> ArrowType (Tuple int int)))
+  (defun (whole-bytes t)
+    (match t
+      ((:is Apache.Arrow.Types.FixedWidthType fw)
+       (def bits (bit-width fw))
+       (if (and (> bits 0) (= (bitwise-and bits 7) 0)) (Tuple 3 (shift-right bits 3)) (Tuple 0 0)))
+      (_ (Tuple 0 0))))
+  (match type
+    ((:is Apache.Arrow.Types.BooleanType _) (Tuple 1 0))
+    ((:is Apache.Arrow.Types.StringType _) (Tuple 2 0))
+    ((:is Apache.Arrow.Types.BinaryType _) (Tuple 2 0))
+    ;; A category: its codes, with the same levels. A DictionaryType is a
+    ;; FixedWidthType too, so this comes first.
+    ((:is Apache.Arrow.Types.DictionaryType d) (whole-bytes (dictionary-index-type d)))
+    (_ (whole-bytes type))))
+
+;; The column at rows[from] to rows[to - 1].
+(: (-> AnyColumn (Array int) int int AnyColumn))
+(defun (take-column a rows from to)
+  (def data (column-array-data a))
+  (def n (- to from))
+  (def type (array-data-type data))
+  (match (copy-kind type)
+    ((Tuple 0 _) (taken-by-slices a rows from to))
+    ((Tuple kind width)
+     (def (Tuple bitmap nulls) (taken-validity data rows from to))
+     (build-column
+       (cond
+         ((= kind 1)
+          (def values (buffer-span (buffer-of data 1)))
+          (check-buffer values (quotient (+ (cast long (array-data-offset data)) (cast long (array-data-length data)) 7L) 8L))
+          (def (Tuple bits _) (taken-bits values (array-data-offset data) rows from to))
+          (data-of type n nulls #[bitmap (ArrowBuffer. (Rom. bits))] (clr-default)))
+         ((= kind 2) (taken-strings data rows from to nulls bitmap))
+         (else
+          (data-of type n nulls #[bitmap (ArrowBuffer. (Rom. (taken-values data width rows from to)))]
+                   (array-data-dictionary data))))))))
+
+(: (-> ArrowType int int (Array ArrowBuffer) ArrayDataOf ArrayDataOf))
+(defun (data-of type n nulls buffers dictionary)
+  (ArrayDataOf. type n nulls 0 buffers (: (clr-default) (Array ArrayDataOf)) dictionary))
+
+;; The validity bitmap of the rows and their number of nulls, read from the
+;; bitmap itself. Empty when there are none.
+(: (-> ArrayDataOf (Array int) int int (Tuple ArrowBuffer int)))
+(defun (taken-validity data rows from to)
+  (if (or (= (array-data-null-count data) 0) (buffer-empty? (buffer-of data 0)))
+      (Tuple empty-buffer 0)
+      (begin
+        (def valid (buffer-span (buffer-of data 0)))
+        (check-buffer valid (quotient (+ (cast long (array-data-offset data)) (cast long (array-data-length data)) 7L) 8L))
+        (def (Tuple bits set) (taken-bits valid (array-data-offset data) rows from to))
+        (def nulls (- (- to from) set))
+        (Tuple (if (= nulls 0) empty-buffer (ArrowBuffer. (Rom. bits))) nulls))))
+
+;; The bits at the rows, and how many of them are set. Each bit is added to a
+;; byte with no jump that depends on it, so a bitmap that is set at random
+;; costs no mispredicted jumps. Each byte is written once, when it is full, so
+;; the array need not be zeroed first.
+(: (-> (RoSpan byte) int (Array int) int int (Tuple (Array byte) int)))
+(defun (taken-bits bitmap offset rows from to)
+  (def n (- to from))
+  (def bits (: (uninitialized-array (shift-right (+ n 7) 3)) (Array byte)))
+  (let go ((i 0) (acc 0) (set 0))
+    (if (< i n)
+        (begin
+          (def j (+ offset (array-ref rows (+ from i))))
+          (def b (bitwise-and (shift-right (cast int (ro-span-ref bitmap (shift-right j 3))) (bitwise-and j 7)) 1))
+          (def now (bitwise-ior acc (shift-left b (bitwise-and i 7))))
+          (if (= (bitwise-and i 7) 7)
+              (begin (array-set! bits (shift-right i 3) (cast byte now)) (go (+ i 1) 0 (+ set b)))
+              (go (+ i 1) now (+ set b))))
+        (begin
+          (unless (= (bitwise-and n 7) 0) (array-set! bits (shift-right n 3) (cast byte acc)))
+          (Tuple bits set)))))
+
+;; The values of `width` bytes at the rows.
+(: (-> ArrayDataOf int (Array int) int int (Array byte)))
+(defun (taken-values data width rows from to)
+  (def bytes (: (uninitialized-array (* (- to from) width)) (Array byte)))
+  (gather-values! data width rows from to (array->span bytes))
+  bytes)
+
+;; The values of `width` bytes at rows[from] to rows[to - 1], into `into`.
+(: (-> ArrayDataOf int (Array int) int int (Span byte) void))
+(defun (gather-values! data width rows from to into)
+  (def offset (array-data-offset data))
+  (def whole (* (+ (cast long offset) (cast long (array-data-length data))) (cast long width)))
+  (def values (buffer-span (buffer-of data 1)))
+  (check-buffer values whole)
+  (def used (ro-span-slice values #:to (cast int whole)))
+  (cond
+    ((= width 8) (gather! (: (ro-span-> used) (RoSpan long)) offset rows from to (: (span-> into) (Span long))))
+    ((= width 4) (gather! (: (ro-span-> used) (RoSpan int)) offset rows from to (: (span-> into) (Span int))))
+    ((= width 2) (gather! (: (ro-span-> used) (RoSpan short)) offset rows from to (: (span-> into) (Span short))))
+    ((= width 1) (gather! used offset rows from to into))
+    (else
+     (loop (:for i (range 0 (- to from)))
+           (:do (def at (* (+ offset (array-ref rows (+ from i))) width))
+                (ro-span-copy! (ro-span-slice used #:from at #:to (+ at width))
+                               (span-slice into #:from (* i width) #:to (* (+ i 1) width))))))))
+
+(: (-> (RoSpan %a) int (Array int) int int (Span %a) void))
+(defun (gather! values offset rows from to into)
+  (loop (:for i (range 0 (- to from)))
+        (:do (span-set! into i (ro-span-ref values (+ offset (array-ref rows (+ from i))))))))
+
+;; The offsets of a column of strings, from its offset on: one more than its
+;; length. Checked against the buffers.
+(: (-> ArrayDataOf (RoSpan int)))
+(defun (string-offsets data)
+  (def offset (array-data-offset data))
+  (def length (array-data-length data))
+  (def bytes (buffer-span (buffer-of data 1)))
+  (check-buffer bytes (* (+ (cast long offset) (cast long length) 1L) 4L))
+  (: (RoSpan int))
+  (def offsets (ro-span-> (ro-span-slice bytes #:from (* offset 4) #:to (* (+ offset length 1) 4))))
+  (check-buffer (buffer-span (buffer-of data 2)) (cast long (ro-span-ref offsets length)))
+  offsets)
+
+;; The strings at the rows: the new offsets first, which give the size of the
+;; bytes, and then each string's bytes.
+(: (-> ArrayDataOf (Array int) int int int ArrowBuffer ArrayDataOf))
+(defun (taken-strings data rows from to nulls bitmap)
+  (def offsets (string-offsets data))
+  (def n (- to from))
+  (def offset-bytes (: (uninitialized-array (* (+ n 1) 4)) (Array byte)))
+  (: (Span int))
+  (def new-offsets (span-> (array->span offset-bytes)))
+  (span-set! new-offsets 0 0)
+  (def total
+    (let sum ((i 0) (total 0))
+      (if (< i n)
+          (begin
+            (def r (array-ref rows (+ from i)))
+            (def next (+ total (- (ro-span-ref offsets (+ r 1)) (ro-span-ref offsets r))))
+            (span-set! new-offsets (+ i 1) next)
+            (sum (+ i 1) next))
+          total)))
+  (def bytes (: (uninitialized-array (+ total 16)) (Array byte)))
+  (copy-strings! offsets (buffer-span (buffer-of data 2)) rows from to offset-bytes bytes 0 (+ total 16))
+  (data-of (array-data-type data) n nulls
+           #[bitmap (ArrowBuffer. (Rom. offset-bytes)) (ArrowBuffer. (Rom. bytes 0 total))]
+           (clr-default)))
+
+;; The bytes of the strings at rows[from] to rows[to - 1], into `into` from
+;; `at` on, each new offset written into `offset-bytes` at its row's place. A
+;; string of at most 16 bytes is copied as 16 bytes, with one load and one
+;; store: the bytes after it are written over by the next string, or are in
+;; the 16 after the end, which the column leaves out. Not when the 16 bytes
+;; would end after `end`, where the next part's strings start, which another
+;; thread may have written; nor when they would be read past the bytes.
+(: (-> (RoSpan int) (RoSpan byte) (Array int) int int (Array byte) (Array byte) int int void))
+(defun (copy-strings! offsets bytes rows from to offset-bytes into at end)
+  (: (Span int))
+  (def new-offsets (span-> (array->span offset-bytes)))
+  (def out (array->span into))
+  (def last-whole (- (ro-span-length bytes) 16))
+  (let copy ((i from) (at at))
+    (when (< i to)
+      (def r (array-ref rows i))
+      (def start (ro-span-ref offsets r))
+      (def length (- (ro-span-ref offsets (+ r 1)) start))
+      (span-set! new-offsets i at)
+      (if (and (<= length 16) (<= start last-whole) (<= (+ at 16) end))
+          (store-16! (load-16 (ro-span-slice bytes #:from start #:to (+ start 16)))
+                     (span-slice out #:from at #:to (+ at 16)))
+          (ro-span-copy! (ro-span-slice bytes #:from start #:to (+ start length))
+                         (span-slice out #:from at #:to (+ at length))))
+      (copy (+ i 1) (+ at length)))))
+
+;; Any other type: each run of rows that follow one another is a slice, and
+;; the slices are put end to end. Fast when the runs are long.
+(: (-> AnyColumn (Array int) int int AnyColumn))
+(defun (taken-by-slices a rows from to)
+  (def slices (: (mutablevec) (MutableVec AnyColumn)))
+  (let run ((i from))
+    (when (< i to)
+      (def start (array-ref rows i))
+      (def n (let more ((n 1))
+               (if (and (< (+ i n) to) (= (array-ref rows (+ i n)) (+ start n))) (more (+ n 1)) n)))
+      (mutablevec-add! slices (slice-column a start n))
+      (run (+ i n))))
+  (if (= (mutablevec-length slices) 0)
+      (slice-column a 0 0)
+      (concatenate-columns (cast (ClrReadOnlyList AnyColumn) (mutablevec->array slices)) (clr-default))))
+
+;; A copy of one column at the rows, in parts of `take-part` rows: `kind` and
+;; `width` as `copy-kind` says, and a column copied whole when it is 0 or 1.
+;; Each part writes its own range of the new arrays.
+(type (: TakePlan (Record (: column AnyColumn)
+                          (: data ArrayDataOf)
+                          (: kind int)
+                          (: width int)
+                          (: count int)
+                          (: parts int)
+                          (: values (Array byte))
+                          (: offset-bytes (Array byte))
+                          ;; The bytes of each part's strings, then where they start.
+                          (: part-bytes (Array int))
+                          (: bytes (Array byte) #:mutable)
+                          (: total int #:mutable)
+                          (: valid (Option (Array byte)))
+                          ;; The valid bits of each part.
+                          (: set (Array int))
+                          (: whole (Option AnyColumn) #:mutable))))
+
+(: (-> AnyColumn int int TakePlan))
+(defun (take-plan a count parts)
+  (def data (column-array-data a))
+  (def (Tuple k w) (copy-kind (array-data-type data)))
+  (def kind (if (< k 2) 0 k))
+  (def length (+ (cast long (array-data-offset data)) (cast long (array-data-length data))))
+  (def valid
+    (if (or (= kind 0) (= (array-data-null-count data) 0) (buffer-empty? (buffer-of data 0)))
+        None
+        (begin
+          (check-buffer (buffer-span (buffer-of data 0)) (quotient (+ length 7L) 8L))
+          (Some (: (uninitialized-array (shift-right (+ count 7) 3)) (Array byte))))))
+  (def none (: (make-array 0) (Array byte)))
+  (when (= kind 3) (check-buffer (buffer-span (buffer-of data 1)) (* length (cast long w))))
+  (when (= kind 2) (ignore (string-offsets data)))
+  (TakePlan (column a) (data data) (kind kind) (width w) (count count) (parts parts)
+            (values (if (= kind 3) (: (uninitialized-array (* count w)) (Array byte)) none))
+            (offset-bytes (if (= kind 2) (: (uninitialized-array (* (+ count 1) 4)) (Array byte)) none))
+            (part-bytes (: (make-array (if (= kind 2) parts 0)) (Array int)))
+            (bytes none) (total 0) (valid valid)
+            (set (: (make-array parts) (Array int)))
+            (whole None)))
+
+;; The rows of part p of a plan.
+(: (-> TakePlan int (Tuple int int)))
+(defun (part-range plan p)
+  (Tuple (* p take-part) (min (record-ref plan count) (* (+ p 1) take-part))))
+
+;; The bits and the values of part p, or the bytes of its strings.
+(: (-> TakePlan (Array int) int void))
+(defun (take-first! plan rows p)
+  (def data (record-ref plan data))
+  (def kind (record-ref plan kind))
+  (def (Tuple from to) (part-range plan p))
+  (cond
+    ((= kind 0)
+     (when (= p 0)
+       (record-set! plan (whole (Some (take-column (record-ref plan column) rows 0 (record-ref plan count)))))))
+    (else
+     (match (record-ref plan valid)
+       ((Some valid)
+        (def (Tuple bits set) (taken-bits (buffer-span (buffer-of data 0)) (array-data-offset data) rows from to))
+        (array-copy! bits 0 valid (shift-right from 3) (array-length bits))
+        (array-set! (record-ref plan set) p set))
+       (None unit))
+     (if (= kind 3)
+         (begin
+           (def w (record-ref plan width))
+           (gather-values! data w rows from to
+                           (span-slice (array->span (record-ref plan values)) #:from (* from w) #:to (* to w))))
+         (begin
+           (def offsets (string-offsets data))
+           (def sum (let add ((i from) (sum 0))
+                      (if (< i to)
+                          (begin
+                            (def r (array-ref rows i))
+                            (add (+ i 1) (+ sum (- (ro-span-ref offsets (+ r 1)) (ro-span-ref offsets r)))))
+                          sum)))
+           (array-set! (record-ref plan part-bytes) p sum))))))
+
+;; For strings: where each part's bytes start, and the array of them. Whether
+;; the plan is one of strings.
+(: (-> TakePlan bool))
+(defun (take-between! plan)
+  (if (not (= (record-ref plan kind) 2))
+      #f
+      (begin
+        (def part-bytes (record-ref plan part-bytes))
+        (def total
+          (let start ((p 0) (total 0L))
+            (if (< p (record-ref plan parts))
+                (begin
+                  (def bytes (array-ref part-bytes p))
+                  (array-set! part-bytes p (cast int total))
+                  (start (+ p 1) (+ total (cast long bytes))))
+                total)))
+        (when (> total 2147483647L)
+          (panic! "(bjostat query): the strings are too many bytes for one column"))
+        (record-set! plan (total (cast int total)))
+        (record-set! plan (bytes (: (uninitialized-array (+ (cast int total) 16)) (Array byte))))
+        (: (Span int))
+        (def new-offsets (span-> (array->span (record-ref plan offset-bytes))))
+        (span-set! new-offsets (record-ref plan count) (cast int total))
+        #t)))
+
+;; For strings: the offsets and the bytes of part p.
+(: (-> TakePlan (Array int) int void))
+(defun (take-second! plan rows p)
+  (when (= (record-ref plan kind) 2)
+    (def data (record-ref plan data))
+    (def (Tuple from to) (part-range plan p))
+    (def part-bytes (record-ref plan part-bytes))
+    (def end (if (< (+ p 1) (record-ref plan parts))
+                 (array-ref part-bytes (+ p 1))
+                 (+ (record-ref plan total) 16)))
+    (copy-strings! (string-offsets data) (buffer-span (buffer-of data 2)) rows from to
+                   (record-ref plan offset-bytes) (record-ref plan bytes) (array-ref part-bytes p) end)))
+
+(: (-> TakePlan AnyColumn))
+(defun (take-result plan)
+  (match (record-ref plan whole)
+    ((Some c) c)
+    (None
+     (def data (record-ref plan data))
+     (def count (record-ref plan count))
+     (def set (loop (:for s (record-ref plan set)) (:acc (summing s))))
+     (def nulls (match (record-ref plan valid) ((Some _) (- count set)) (None 0)))
+     (def bitmap (match (record-ref plan valid)
+                   ((Some valid) (if (= nulls 0) empty-buffer (ArrowBuffer. (Rom. valid))))
+                   (None empty-buffer)))
+     (build-column
+       (if (= (record-ref plan kind) 2)
+           (data-of (array-data-type data) count nulls
+                    #[bitmap (ArrowBuffer. (Rom. (record-ref plan offset-bytes)))
+                      (ArrowBuffer. (Rom. (record-ref plan bytes) 0 (record-ref plan total)))]
+                    (clr-default))
+           (data-of (array-data-type data) count nulls
+                    #[bitmap (ArrowBuffer. (Rom. (record-ref plan values)))]
+                    (array-data-dictionary data)))))))
+
+;; The columns at the rows, each in parts of rows.
+(: (-> Table (Array int) int (Array AnyColumn)))
+(defun (take-in-parts t rows count)
+  (def parts (quotient (+ count (- take-part 1)) take-part))
+  (def ncols (table-column-count t))
+  (def plans (: (make-array ncols) (Array TakePlan)))
+  (loop (:for c (range 0 ncols)) (:do (array-set! plans c (take-plan (clr-column t c) count parts))))
+  (ignore (computing-each (* ncols parts)
+                          (fun (u) (take-first! (array-ref plans (quotient u parts)) rows (% u parts)))))
+  (def strings? (loop (:for plan plans) (:acc (summing (if (take-between! plan) 1 0)))))
+  (def _copied
+    (if (> strings? 0)
+        (computing-each (* ncols parts) (fun (u) (take-second! (array-ref plans (quotient u parts)) rows (% u parts))))
+        []))
+  (def out (: (make-array ncols) (Array AnyColumn)))
+  (loop (:for c (range 0 ncols)) (:do (array-set! out c (take-result (array-ref plans c)))))
+  out)
+
+;; ---------------------------------------------------------------------------
 ;; Rows taken with nulls
 
 ;; The columns of `t` at the rows; a row of -1 is a null in each column.
@@ -2224,7 +2724,7 @@
   (def columns (range 0 (table-column-count t)))
   (cond
     ((not (let missing? ((i 0)) (and (< i n) (or (< (array-ref rows i) 0) (missing? (+ i 1))))))
-     (def taken (clr-take t rows n))
+     (def taken (take-rows t rows n))
      {arraying (clr-column taken c) (:for c columns)})
     ((= (table-row-count t) 0)
      {arraying (clr-nulls (field-type (schema-field (clr-schema t) c)) n) (:for c columns)})
@@ -2233,7 +2733,7 @@
      ;; whose value is then hidden by a null.
      (def fixed-rows (: (make-array n) (Array int)))
      (loop (:for i (range 0 n)) (:do (array-set! fixed-rows i (max (array-ref rows i) 0))))
-     (def taken (clr-take t fixed-rows n))
+     (def taken (take-rows t fixed-rows n))
      {arraying (hide-missing (clr-column taken c) rows) (:for c columns)})))
 
 ;; The column with a null at each place whose row is -1.
@@ -2342,13 +2842,6 @@
 ;; Reshaping
 ;; ===========================================================================
 
-;; The table of a TableProblem's result, or an Err of its message.
-(: (-> (Result System.Exception Table) (Result TableError Table)))
-(defun (problem-or r)
-  (match r
-    ((Ok t) (Ok t))
-    ((Err e) (refuse (.-Message e)))))
-
 ;; ---------------------------------------------------------------------------
 ;; What the reshaping shares
 ;; ---------------------------------------------------------------------------
@@ -2411,7 +2904,7 @@
           (:def name (vec-ref names i))
           (:def (Ok c) (column-index t name) :propagate)
           (:def type (type-at t c))
-          ((not (clr-key-type? type))
+          ((not (key-type? type))
            (refuse (str "'" name "' is a column of " (clr-arrow-name type) ", which cannot be a key.")))
           (else
            (array-set! out i (clr-column t c))
@@ -2434,7 +2927,7 @@
   (def firsts (clr-firsts keys (table-row-count t)))
   (Ok (if (= (array-length firsts) 0)
           t
-          (clr-take t firsts (array-length firsts)))))
+          (take-rows t firsts (array-length firsts)))))
 
 ;; The rows of the tables, one table after the other, as dplyr's bind_rows.
 ;; Columns are matched by name: the columns are those of the first table, then
@@ -2442,7 +2935,7 @@
 ;; it. An Err for a name with columns of two types. Each column is made as a
 ;; part on (std parallel)'s compute threads, when the result has 65 536 cells
 ;; or more. Below that, the columns are made on this thread: the start of the
-;; parts takes longer than the copies, as for Query.Take.
+;; parts takes longer than the copies, as for take-rows.
 (: (-> (Vec Table) (Result TableError Table)))
 (defun (table-append tables)
   (def (Ok fields) (appended-fields tables) :propagate)
@@ -2564,7 +3057,7 @@
     {arraying (let ((a (clr-column t c)))
                 (if (clr-interleavable? (any-type a))
                     (clr-interleaved (make-array k #:fill a) n)
-                    (clr-column (clr-take (clr-select t #[c]) kept-rows m) 0)))
+                    (clr-column (take-rows (clr-select t #[c]) kept-rows m) 0)))
               (:for c kept)})
   (def values
     (if (clr-interleavable? type)
@@ -2574,7 +3067,7 @@
                           (clr-column t (array-ref idx 0))
                           (clr-concat {arraying (clr-column t c) (:for c idx)} type)))
                (one (clr-from-fields #[(clr-new-field values-to type)] #[whole] (any-length whole))))
-          (clr-column (clr-take one rows m) 0))))
+          (clr-column (take-rows one rows m) 0))))
   (clr-from-fields
    {arraying (cond
                ((< i nk) (field-at t (array-ref kept i)))
@@ -2610,7 +3103,7 @@
                   "; the names of columns have to be strings.")))
     (:def ids {arraying i (:for i (range 0 (table-column-count t))) (:when (not (or (= i nc) (= i vc))))})
     (else
-     (match (find (fun (i) (not (clr-key-type? (type-at t i)))) ids)
+     (match (find (fun (i) (not (key-type? (type-at t i)))) ids)
        ((Some i)
         (refuse (str "'" (field-name (field-at t i)) "' is a column of " (clr-arrow-name (type-at t i))
                      ", which cannot be a key.")))
@@ -2627,7 +3120,7 @@
   (match (find (fun (s) (any? (fun (x) (= x s)) id-names)) new-names)
     ((Some name) (refuse (str "the table has a column '" name "' already.")))
     (None
-     (def id-table (clr-take (clr-select t ids) firsts rows))
+     (def id-table (take-rows (clr-select t ids) firsts rows))
      (def value-table (clr-select t #[vc]))
      (def type (type-at t vc))
      (def nids (array-length ids))
@@ -2783,7 +3276,7 @@
   (def (Tuple group-of firsts order) (clr-groups-in-order cols n))
   (def counts (group-counts group-of (array-length firsts) n))
   (def rows (array-length order))
-  (with-count (clr-take (clr-select t idx) (gathered firsts order) rows) name
+  (with-count (take-rows (clr-select t idx) (gathered firsts order) rows) name
               (column->any (clr-longs-at counts order)) rows))
 
 ;; The number of rows in each of the groups.
@@ -2873,7 +3366,7 @@
         (compacted-in-parts slot-counts slot-firsts parts)
         (compacted slot-counts slot-firsts)))
   (def rows (array-length firsts))
-  (with-count (clr-take (clr-select t idx) firsts rows) name (long-column counts) rows))
+  (with-count (take-rows (clr-select t idx) firsts rows) name (long-column counts) rows))
 
 (: (-> (Array int) (Array (Array int)) (Array int) int int Unit))
 (defun (combine-slots! ids col-ids cards from to)
@@ -3023,7 +3516,7 @@
       (count-codes-into! cells levels counts firsts 0 n))
   (def (Tuple out-firsts out-counts) (compacted counts firsts))
   (def rows (array-length out-firsts))
-  (with-count (clr-take (clr-select t #[col]) out-firsts rows) name (long-column out-counts) rows))
+  (with-count (take-rows (clr-select t #[col]) out-firsts rows) name (long-column out-counts) rows))
 
 ;; The counts and the first rows of the codes from `from` to `to`, a null
 ;; counted as the code `levels`.
@@ -3106,7 +3599,7 @@
   (def rows (match active ((Some (Tuple ra _)) (kept row-order (fun (rg) (array-ref ra rg)))) (None row-order)))
   (def columns (match active ((Some (Tuple _ ca)) (kept col-order (fun (cg) (array-ref ca cg)))) (None col-order)))
   (def m (array-length rows))
-  (def row-table (clr-take (clr-select t #[row-idx]) (gathered row-firsts rows) m))
+  (def row-table (take-rows (clr-select t #[row-idx]) (gathered row-firsts rows) m))
   (def names {vecing (any->string col-col (array-ref col-firsts cg) -1) (:for cg columns)})
   (match (repeated-name [row-key] names)
     ((Some name)
@@ -3248,7 +3741,9 @@
 ;;     (table-categorize t "size" #:levels ["small" "medium" "large"])
 (: (-> Table string (#:levels (Vec string)) (Result TableError Table)))
 (defun (table-categorize t name #:levels [])
-  (problem-or (clr-categorize t name (vec->array levels))))
+  (match (clr-categorize t name (vec->array levels))
+    ((Ok c) (Ok (with-column t name c)))
+    ((Err e) (refuse (.-Message e)))))
 
 (: (-> Table string (Result TableError AnyColumn)))
 (defun (find-category t name)

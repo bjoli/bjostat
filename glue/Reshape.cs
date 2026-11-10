@@ -594,21 +594,6 @@ public static class Reshape
         return ids;
     }
 
-    // The columns of the names, or a TableProblem for a name the table does
-    // not have, a name given twice, or a column that cannot be a key.
-    internal static int[] KeyColumns(RecordBatch t, string[] names)
-    {
-        if (names.Distinct().Count() != names.Length) throw new TableProblem("a key is named twice.");
-        return names.Select(name =>
-        {
-            int i = Column(t, name);
-            var type = t.Schema.GetFieldByIndex(i).DataType;
-            if (!Joins.KeyType(type))
-                throw new TableProblem($"'{name}' is a column of {TypeText(type)}, which cannot be a key.");
-            return i;
-        }).ToArray();
-    }
-
     internal static int Column(RecordBatch t, string name)
     {
         int i = Tables.IndexOf(t, name);

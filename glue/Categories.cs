@@ -33,12 +33,13 @@ public static class Categories
         t is DictionaryType { IndexType: Int32Type, ValueType: StringType };
 
     /// <summary>
-    /// The table with the column <paramref name="name"/> a category. With no
+    /// The column <paramref name="name"/> of the table, as a category, which
+    /// (bjostat table) puts in the table in its place. With no
     /// levels, the levels are the distinct strings in the order of their code
     /// points; with levels, a string that is not one of them is a
     /// TableProblem. A null stays a null.
     /// </summary>
-    public static RecordBatch Categorize(RecordBatch t, string name, string[] levels)
+    public static IArrowArray Categorize(RecordBatch t, string name, string[] levels)
     {
         int i = Tables.IndexOf(t, name);
         if (i < 0)
@@ -54,7 +55,7 @@ public static class Categories
             _ => throw new TableProblem($"'{name}' is a column of {Reshape.TypeText(a.Data.DataType)}; "
                                         + "a category is made of strings."),
         };
-        return Query.WithColumn(t, name, made);
+        return made;
     }
 
     // The category of the strings: each distinct string is found once, and

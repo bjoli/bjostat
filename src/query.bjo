@@ -26,7 +26,7 @@
   where-rows count-rows create-column
 
   ;; Collectors, for a loop over cells
-  Selecting selecting
+  Selecting selecting Selection
   ColumnBuilding ColumnBuildingOption
   DatesBuilding DateTimesBuilding InstantsBuilding
   Grouping grouping Pairing pairing
@@ -52,25 +52,9 @@
 (import (std mutable vec))
 
 (import/class
-  ((Builder %a) (: Bjostat.Builder))
-  (Selection (: Bjostat.Selection)))
+  ((Builder %a) (: Bjostat.Builder)))
 
 (import/extern
-  (install-workers (: Bjostat.Workers.Install (-> (-> int (-> int Unit) Unit) int void))))
-
-;; The glue of this module (Query) runs its parts on (std parallel)'s compute
-;; threads. See glue/Workers.cs.
-(: (-> int (-> int Unit) Unit))
-(defun (run-on-compute-threads n work)
-  (ignore (computing-each n work))
-  unit)
-
-(def _workers
-  (begin (install-workers run-on-compute-threads (compute-thread-count)) #t))
-
-(import/extern
-  (clr-take (: Bjostat.Query.Take (-> Table (Array int) int Table)))
-  (clr-with-column (: Bjostat.Query.WithColumn (-> Table string AnyColumn Table)))
   (any-length (: Apache.Arrow.IArrowArray.Length (-> AnyColumn int) #:get))
 
   ;; A builder is changed in place, and answered so that it is a
@@ -84,15 +68,7 @@
   (builder-build-micros (: Bjostat.BuilderOps.BuildMicros (-> (Builder long) bool AnyColumn)))
   (builder-extend (: Bjostat.BuilderOps.Extend (-> (Builder %a) int (Builder %a))))
   (builder-span (: Bjostat.BuilderOps.Span (-> (Builder %a) int int (Span %a))))
-  (builder-set-null! (: Bjostat.BuilderOps.SetNull (-> (Builder %a) int void)))
-
-  (selection-make (: Bjostat.Selection.Make (-> Selection)))
-  (selection-add (: Bjostat.Selection.Add (-> Selection int Selection)))
-  (selection-take (: Bjostat.Selection.Take (-> Selection Table Table)))
-  (selection-count (: Bjostat.Selection.Count (-> Selection int)))
-  (selection-grow (: Bjostat.Selection.Grow (-> Selection int Selection)))
-  (selection-span (: Bjostat.Selection.Span (-> Selection int int (Span int))))
-  (selection-no-none! (: Bjostat.Selection.NoNone (-> Selection int void))))
+  (builder-set-null! (: Bjostat.BuilderOps.SetNull (-> (Builder %a) int void))))
 
 ;; ===========================================================================
 ;; Row specs
@@ -156,7 +132,7 @@
          (array-set! picked k i)
          (loop (+ i 1) (+ k 1)))
         (else (loop (+ i 1) k)))))
-  (Ok (clr-take t picked count)))
+  (Ok (take-rows t picked count)))
 
 ;; How many rows `where-rows` would keep.
 (: (-> Table (Row %r) (-> %r bool) (Result TableError int)))
@@ -200,6 +176,62 @@
 ;;
 ;; `selecting` makes the table of the rows it was given, and the two
 ;; `column-building`s make a column, which `table-with` adds to a table.
+
+;; The numbers of the rows a loop kept, in the order it kept them: the first
+;; `count` of `rows`, which grows as it fills.
+(type (: Selection #:opaque (Record (: rows (Array int) #:mutable) (: count int #:mutable))))
+
+(: (-> Selection))
+(defun (selection-make) (Selection (rows (make-array 1024)) (count 0)))
+
+(: (-> Selection int Selection))
+(defun (selection-add s row)
+  (def n (record-ref s count))
+  (def rows (record-ref s rows))
+  (if (< n (array-length rows))
+      (begin
+        (array-set! rows n row)
+        (record-set! s (count (+ n 1)))
+        s)
+      (selection-add-grown s row)))
+
+;; As `selection-add`, on a full array: twice as long first.
+(: (-> Selection int Selection))
+(defun (selection-add-grown s row)
+  (def n (record-ref s count))
+  (def rows (array-resize (record-ref s rows) (* 2 n)))
+  (record-set! s (rows rows))
+  (array-set! rows n row)
+  (record-set! s (count (+ n 1)))
+  s)
+
+(: (-> Selection int))
+(defun (selection-count s) (record-ref s count))
+
+;; `n` more rows at the end, written next through `selection-span`.
+(: (-> Selection int Selection))
+(defun (selection-grow s n)
+  (when (< n 0) (panic! "(bjostat query): a selection cannot grow by less than 0 rows"))
+  (def count (record-ref s count))
+  (def rows (record-ref s rows))
+  (when (< (- (array-length rows) count) n)
+    (record-set! s (rows (array-resize rows (max (* 2 (array-length rows)) (+ count n))))))
+  (record-set! s (count (+ count n)))
+  s)
+
+(: (-> Selection int int (Span int)))
+(defun (selection-span s start n)
+  (when (or (< start 0) (< n 0) (> start (- (record-ref s count) n)))
+    (panic! "(bjostat query): a span outside the selection"))
+  (array->span (record-ref s rows) #:from start #:to (+ start n)))
+
+;; A row number is never None, so a vector loop never calls this.
+(: (-> Selection int void))
+(defun (selection-no-none! s i) (panic! "(bjostat query): a selected row cannot be None"))
+
+;; The table of the selected rows of `t`.
+(: (-> Selection Table Table))
+(defun (selection-take s t) (take-rows t (record-ref s rows) (record-ref s count)))
 
 ;; The rows of a table whose numbers it is given, in that order.
 (type (: Selecting #:opaque (Struct (: table Table))))
@@ -634,7 +666,7 @@
 (: (-> Table string AnyColumn (Result TableError Table)))
 (defun (table-with t name c)
   (if (= (any-length c) (table-row-count t))
-      (Ok (clr-with-column t name c))
+      (Ok (with-column t name c))
       (Err (TableError (message (str "the column '" name "' has " (int->string (any-length c))
                                      " rows, and the table has " (int->string (table-row-count t)) "."))))))
 

@@ -18,7 +18,7 @@
 // 64-bit keys whose unsigned order is the order of the values, with the rows
 // beside them; a radix sort is stable and needs no comparisons. A string key
 // is first made the rank of each string among the distinct strings. The rows
-// are found as a permutation, and Query.Take copies them.
+// are found as a permutation, which (bjostat table) copies.
 
 using System.Numerics;
 using System.Runtime.CompilerServices;
@@ -30,7 +30,7 @@ namespace Bjostat;
 public static class Sorting
 {
     /// <summary>
-    /// The name of the type of a column that <see cref="SortBy"/> cannot
+    /// The name of the type of a column that <see cref="SortOrder"/> cannot
     /// sort by, or the empty string when it can.
     /// </summary>
     public static string Unsortable(IArrowArray a) =>
@@ -42,12 +42,12 @@ public static class Sorting
             : a.Data.DataType.Name;
 
     /// <summary>
-    /// The table with its rows in the order of the columns at
-    /// <paramref name="columns"/>, each in the direction that
-    /// <paramref name="descending"/> says.
+    /// The rows of the table, 0 to its length - 1, in the order of the
+    /// columns at <paramref name="columns"/>, each in the direction that
+    /// <paramref name="descending"/> says. (bjostat table) copies them.
     /// </summary>
-    public static RecordBatch SortBy(RecordBatch t, int[] columns, bool[] descending) =>
-        Query.Take(t, Order(columns.Select(t.Column).ToArray(), descending, t.Length), t.Length);
+    public static int[] SortOrder(RecordBatch t, int[] columns, bool[] descending) =>
+        Order(columns.Select(t.Column).ToArray(), descending, t.Length);
 
     /// <summary>
     /// The rows, 0 to n - 1, in the order of the columns, each in the
