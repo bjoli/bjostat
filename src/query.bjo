@@ -29,7 +29,7 @@
   Selecting selecting Selection
   ColumnBuilding ColumnBuildingOption
   DatesBuilding DateTimesBuilding InstantsBuilding
-  Grouping grouping Pairing pairing
+  Grouping grouping-into Pairing pairing
   map->table table-with
 
   ;; Groups by number
@@ -100,7 +100,7 @@
 ;; The values of two specs, as a tuple.
 (: (-> (Row %a) (Row %b) (Row (Tuple %a %b))))
 (defun (both ra rb)
-  (Row (names (vec-merge (record-ref ra names) (record-ref rb names)))
+  (Row (names (vec-append (record-ref ra names) (record-ref rb names)))
        (bind (fun (t)
                (def (Ok a) ((record-ref ra bind) t) :propagate)
                (def (Ok b) ((record-ref rb bind) t) :propagate)
@@ -338,14 +338,14 @@
 
 ;; For each key, what the inner collector makes of the values with that key:
 ;;
-;;     (:acc by-region (grouping summing (Tuple region price)))
+;;     (:acc by-region (grouping-into summing (Tuple region price)))
 ;;
 ;; is a map from each region to the sum of its prices. Each key has an
 ;; accumulator of the inner collector, made at its first value.
 (type (: (Grouping %c %k) #:opaque (Struct (: inner %c))))
 
 (: (-> %c (Grouping %c %k)))
-(defun (grouping inner) (Grouping (inner inner)))
+(defun (grouping-into inner) (Grouping (inner inner)))
 
 (impl (Collector (Grouping %c %k))
   (where (Collector %c) (Eq %k))
@@ -366,9 +366,9 @@
     {mapping (Tuple k (collector-finish inner a)) (:for (Tuple k a) m)}))
 
 ;; Two collectors at once, of the two sides of each element: with
-;; `grouping`, two aggregates of each group.
+;; `grouping-into`, two aggregates of each group.
 ;;
-;;     (grouping (pairing summing counting) (Tuple region (Tuple price price)))
+;;     (grouping-into (pairing summing counting) (Tuple region (Tuple price price)))
 (type (: (Pairing %c %d) #:opaque (Struct (: left %c) (: right %d))))
 
 (: (-> %c %d (Pairing %c %d)))
@@ -654,7 +654,7 @@
   (make-table (vec-add-first (vec-map (fun (p) (named-any (fst p) (snd p))) cols)
                              (named-any key-name (column-of (group-keys groups))))))
 
-;; The table of a map, as `grouping` makes: a column of the keys and a
+;; The table of a map, as `grouping-into` makes: a column of the keys and a
 ;; column of the values, in the map's order.
 (: (-> (Map %k %v) string string (Result TableError Table)))
 (defun (map->table m key-name value-name)

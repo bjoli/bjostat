@@ -126,7 +126,7 @@ type for each column and part: about a microsecond, against 65 536 rows.
 |------------------------------------|------------------------------------------------------|--------------------------------|
 | `int`, `long`, `double`, `float`, `decimal` | `+`                                         | `summing`, `counting`          |
 | `(Vec %a)`, `(List %a)`, `(Array %a)` | the parts one after the other                     | `vecing`, `listing`, `arraying` |
-| `(Map %k %v)`, `(Partial %v)`      | the union; a key in two parts, its values combined   | `grouping` of a partial collector |
+| `(Map %k %v)`, `(Partial %v)`      | the union; a key in two parts, its values combined   | `grouping-into` of a partial collector |
 | `(Tuple %a %b)` … 6                | each side                                            | several `:acc`s, `pairing`     |
 | `Unit`                             | nothing                                              | a loop of `:do`s only          |
 | `Table`                            | the rows one after the other (`table-append`)        | `selecting`                    |
@@ -157,7 +157,7 @@ on the combined value.
 | `maximizing`, `minimizing`        | `(Max %a)`, `(Min %a)` | `max-value`, `min-value`: an `Option`     |
 | `selecting`                       | `Table`      | itself                                              |
 | `column-building`, `column-building/option` | a column | itself                                          |
-| `grouping c`, `c` partial         | `(Map %k %p)` | itself, or the finish of `c` on each value         |
+| `grouping-into c`, `c` partial         | `(Map %k %p)` | itself, or the finish of `c` on each value         |
 | `summing-by/partial` and the other `-by` | `(PerGroup %a)` | `per-group->column groups`               |
 | `linear-fit`                      | `LinearFit`  | `linear-fit->model`, as `linear-model` makes        |
 
@@ -183,7 +183,7 @@ an error. So:
   reads the index. The `-by` collectors' `/partial` forms answer a
   `(PerGroup %a)`, the array by group number, which parts combine element by
   element; `per-group->column groups` makes the column `groups->table` takes.
-- *Groups a loop makes* run in parts as `grouping`: a map in each part's
+- *Groups a loop makes* run in parts as `grouping-into`: a map in each part's
   accumulator, merged by key in order. The groups of the merged map are in
   the order of their first rows, the parts being in order.
 - `group-of!` raises when it is called on a thread other than the one that

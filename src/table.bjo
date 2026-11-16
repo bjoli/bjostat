@@ -73,7 +73,7 @@
 (import (only (std simd) Simd128 Simd256))
 (import (only (std maths) quotient))
 (import (only (std atomic) atomic-array-increment!))
-(import (only (std array) array-fill! array-copy!))
+(import (only (std array) array-fill!))
 (import (only (std interop) clr-default))
 (import (only (std mutable vec) MutableVec mutablevec mutablevec-with-capacity mutablevec-add!
               mutablevec-length mutablevec->array))
@@ -2240,7 +2240,7 @@
                      (array-ref taken-right i)))
             (:for i (range 0 (table-column-count right)))
             (:when (not (key? (field-name (schema-field right-schema i)))))})
-  (def all (vec-merge key-columns left-columns right-columns))
+  (def all (vec-append key-columns left-columns right-columns))
   (clr-from-fields {arraying (match c ((Tuple f _) f)) (:for c all)}
                    {arraying (match c ((Tuple _ col) col)) (:for c all)}
                    n))

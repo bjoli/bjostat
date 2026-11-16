@@ -113,7 +113,7 @@
   (map-length
     (loop (:for r* r) (:for p* p)
           (:when-let (Some region) r*) (:when-let (Some price) p*)
-          (:acc (grouping summing (Tuple (: region string) (: price double)))))))
+          (:acc (grouping-into summing (Tuple (: region string) (: price double)))))))
 
 ;; The same, by quantity: forty keys, longs.
 (def/bench "grouping, long keys"
@@ -122,7 +122,7 @@
   (map-length
     (loop (:for q* q) (:for p* p)
           (:when-let (Some qty) q*) (:when-let (Some price) p*)
-          (:acc (grouping summing (Tuple (: qty long) (: price double)))))))
+          (:acc (grouping-into summing (Tuple (: qty long) (: price double)))))))
 
 ;; Two aggregates with grouping, for summing-by and counting-by below.
 (def/bench "grouping and pairing, long keys"
@@ -131,7 +131,7 @@
   (map-length
     (loop (:for q* q) (:for p* p)
           (:when-let (Some qty) q*) (:when-let (Some price) p*)
-          (:acc (grouping (pairing summing counting) (Tuple (: qty long) (Tuple (: price double) price)))))))
+          (:acc (grouping-into (pairing summing counting) (Tuple (: qty long) (Tuple (: price double) price)))))))
 
 ;; The same sums with a group index and summing-by.
 (def/bench "summing-by, string keys"

@@ -64,7 +64,7 @@
                             [(Tuple "sd" (close? (column-standard-deviation column) sd))
                              (Tuple "cor" (close? (column-correlation column other) cor))
                              (Tuple "cov" (close? (column-covariance column other) cov))]))
-        (:acc found (folding [] (vec-merge found (vec-map (fun (case) (str (fst case) " n=" (int->string n) " pattern=" (int->string pattern))) wrong))))))
+        (:acc found (folding [] (vec-append found (vec-map (fun (case) (str (fst case) " n=" (int->string n) " pattern=" (int->string pattern))) wrong))))))
 
 ;; Close enough: within 1e-12 of the value R prints.
 (: (-> (Option double) double bool))

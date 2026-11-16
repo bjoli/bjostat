@@ -337,7 +337,7 @@ The columns are found first, where a misspelt name is an ~Err~:
 | ~groups->table~ and the key it makes | A key is a value a column can hold, which is what the trait ~ColumnValue~ says: the numbers, a string, a bool, a ~Date~, a ~DateTime~ or an ~Instant~. Group by a date and the table's column of keys is a column of dates. A ~Cells~ is not one, so a column passed where the row's value was meant is refused when the program is compiled, not when it runs. |
 | ~(category-groups t name)~ | The groups of a category's levels, so that a row's code is its group, with no hash |
 | ~(string-groups t name)~ | The groups of a column of strings, in the order first seen, and the group of each row: each string numbered once, in parts on the compute threads, not hashed for each row as ~group-of!~ does |
-| ~(grouping c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |
+| ~(grouping-into c (Tuple key x))~, ~(pairing c d)~ | Any collector by key, ~map->table~ the table |
 | ~(table-with t name c)~ | The table with a column more, or one replaced |
 | ~(worker-count)~ | How many compute threads there are, as ~compute-thread-count~ of ~(std parallel)~ |
 

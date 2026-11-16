@@ -92,7 +92,7 @@
   ;; order had no code.
   (def by-code
     (loop (:for c* code) (:for r (skip-nulls revenue))
-          (:acc (grouping (pairing mean standard-deviation) (Tuple (code-name c*) (Tuple r r))))))
+          (:acc (grouping-into (pairing mean standard-deviation) (Tuple (code-name c*) (Tuple r r))))))
   (println "\nOrder value by discount code (mean, standard deviation):")
   (loop (:for (Tuple disc agg) by-code)
         (:let (Tuple m sd) agg)
@@ -101,7 +101,7 @@
   ;; 8. Is a lower price met with a larger quantity, within each product?
   (def by-product
     (loop (:for (Tuple o q p) (complete-rows (Tuple product quantity price)))
-          (:acc (grouping correlation (Tuple o (Tuple p (cast double q)))))))
+          (:acc (grouping-into correlation (Tuple o (Tuple p (cast double q)))))))
   (println "\nCorrelation of unit price and quantity, by product:")
   (loop (:for (Tuple prod r) by-product)
         (:do (println (str "  " prod ": " (shown r)))))
@@ -110,7 +110,7 @@
   ;; country. Three steps that can fail, one chain, one unwrap.
   (def by-customer
     (loop (:for (Tuple c r) (complete-rows (Tuple customer revenue)))
-          (:acc (grouping summing (Tuple c r)))))
+          (:acc (grouping-into summing (Tuple c r)))))
   (def best
     (or-panic (try-> by-customer
                      (map->table & "customer" "revenue")

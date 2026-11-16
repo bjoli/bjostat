@@ -48,7 +48,6 @@
 (import (bjostat table))
 (import (bjostat query))
 (import (only (std parallel) computing-each))
-(import (only (std array) array-copy!))
 (import (only (std maths) quotient remainder))
 
 (import/class (CsvColumn (: Bjostat.CsvColumn)))
@@ -234,7 +233,7 @@
 
 (: (-> (Array byte) (Array int) char (Vec (Tuple string ColumnType)) int (Vec string) (Option Table)))
 (defun (read-cut bytes cuts separator types guess-rows nulls)
-  (def sep (cast byte (char->integer separator)))
+  (def sep (cast byte (char->int separator)))
   (def null-bytes {arraying (string->bytes n) (:for n nulls)})
   (def plain (vec-map (fun (p) (match p ((Tuple name Category) (Tuple name String)) (_ p))) types))
   (def (Some names) (header-names bytes (array-ref cuts 0) sep) :leave-with None)

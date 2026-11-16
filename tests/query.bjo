@@ -164,8 +164,8 @@
   (def by-region
     (loop (:for r* region) (:for p* price)
           (:when-let (Some r) r*) (:when-let (Some p) p*)
-          (:acc (grouping summing (Tuple r p)))))
-  (expect "grouping: a sum for each key"
+          (:acc (grouping-into summing (Tuple r p)))))
+  (expect "grouping-into: a sum for each key"
           by-region
           (list->map (list (Tuple "north" 17.75) (Tuple "south" 20.0) (Tuple "east" 12.0))))
   (def by-region-table (ok (map->table by-region "region" "total")))
@@ -174,11 +174,11 @@
   (def two-aggregates
     (loop (:for r* region) (:for p* price)
           (:when-let (Some r) r*) (:when-let (Some p) p*)
-          (:acc (grouping (pairing summing counting) (Tuple r (Tuple p p))))))
+          (:acc (grouping-into (pairing summing counting) (Tuple r (Tuple p p))))))
   (expect "pairing: a sum and a count for each key"
           (map-ref two-aggregates "north")
           (Tuple 17.75 2))
-  (expect "grouping, then a mean"
+  (expect "grouping-into, then a mean"
           (loop (:for (Tuple r agg) two-aggregates)
                 (:let (Tuple total n) agg)
                 (:acc (mapping (Tuple r (/ total (cast double (: n int)))))))

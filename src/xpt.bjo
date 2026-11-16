@@ -41,7 +41,6 @@
 
 (import (std prelude))
 (import (only (std maths) quotient))
-(import (only (std array) array-copy!))
 (import (only (std interop) clr-default))
 (import (bjostat table))
 
