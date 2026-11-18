@@ -90,7 +90,7 @@
 (import/extern
   (install-workers (: Bjostat.Workers.Install (-> (-> int (-> int Unit) Unit) int void))))
 
-;; The glue of this module (Categories, Reshape, Sort) runs its parts on (std parallel)'s compute
+;; The glue of this module (Categories, Reshape) runs its parts on (std parallel)'s compute
 ;; threads. See glue/Workers.cs.
 (: (-> int (-> int Unit) Unit))
 (defun (run-on-compute-threads n work)
@@ -233,8 +233,9 @@
   (clr-batch-slice (: Apache.Arrow.RecordBatch.Slice (-> Table int int Table)))
   (schema-builder-add! (: Apache.Arrow.Schema+Builder.Field (-> SchemaBuilder Field SchemaBuilder)))
   (schema-builder-build (: Apache.Arrow.Schema+Builder.Build (-> SchemaBuilder Schema)))
-  (clr-unsortable (: Bjostat.Sorting.Unsortable (-> AnyColumn string)))
-  (clr-sort-order (: Bjostat.Sorting.SortOrder (-> Table (Array int) (Array bool) (Array int))))
+  (arrow-type-name (: Apache.Arrow.Types.IArrowType.Name (-> ArrowType string) #:get))
+  (clr-sorted-string-ids (: Bjostat.ReshapeOps.SortedStringIds (-> StringColumn (Array int))))
+  (clr-in-byte-order (: Bjostat.ReshapeOps.InByteOrder (-> StringColumn (Array int) (Array int))))
 
   ;; Reshaping: the kernels of glue/Reshape.cs.
   (clr-firsts (: Bjostat.ReshapeOps.Firsts (-> (Array AnyColumn) int (Array int))))
@@ -256,11 +257,11 @@
   (data-type (: Apache.Arrow.ArrayData.DataType (-> ArrayData ArrowType) #:get))
 
   ;; A TableProblem is a table the arguments cannot make.
-  ;; For the counts: the groups of the keys with their order, and the ids of
-  ;; a column's values in the order of table-sort.
-  (clr-groups-in-order (: Bjostat.ReshapeOps.GroupsInOrder
-                          (-> (Array AnyColumn) int (out (Array int)) (out (Array int))
-                              (Tuple (Array int) (Array int) (Array int)))))
+  ;; For the counts: the groups of the keys with the ids of their strings,
+  ;; and the ids of a column's values in the order of table-sort.
+  (clr-groups-with-ids (: Bjostat.ReshapeOps.GroupsWithStringIds
+                          (-> (Array AnyColumn) int (out (Array int)) (out (Array (Array int))) (out (Array (Array int)))
+                              (Tuple (Array int) (Array int) (Array (Array int)) (Array (Array int))))))
   (clr-sorted-ids (: Bjostat.ReshapeOps.SortedIds (-> AnyColumn (Option (Tuple (Array int) int)))))
   (clr-dense-limit (: Bjostat.ReshapeOps.DenseLimit long #:get))
   (clr-level-count (: Bjostat.ReshapeOps.LevelCount (-> AnyColumn int)))
@@ -1580,6 +1581,488 @@
     (row-parts (record-ref r length) k
                (fun (from to) (complete-rows (row-columns-slice cols from to))))))
 
+;; ===========================================================================
+;; Sorting: the order of the rows
+;; ===========================================================================
+;;
+;; - The order is that of R's `order`: by the first key, then by the next
+;;   among the rows that the first key does not tell apart, and so on. The
+;;   sort is stable.
+;; - A null comes after every value, in both directions. A NaN comes after
+;;   every number and before the nulls. Strings are in the order of their
+;;   UTF-8 bytes, which is the order of their code points.
+;; - There is one pass for each key, from the last key to the first. A pass
+;;   is stable, so it keeps the order of the later keys among the rows that
+;;   its key does not tell apart.
+;; - A pass is a radix sort of 64-bit keys whose unsigned order is the order
+;;   of the values, with the rows beside them. A string is first made its
+;;   rank among the distinct strings. A category is sorted by its codes,
+;;   which are in the order of its levels.
+
+;; A 64-bit key whose unsigned order is the order of the number, and whether
+;; the number is a NaN. -0.0 has the key of 0.0, as the two are equal.
+(def/trait (SortBits %a)
+  (: sort-bits (-> %a ulong))
+  (: sort-nan? (-> %a bool)))
+
+(: ulong) (def sign-bit 0x8000000000000000UL)
+
+(impl (SortBits double)
+  (defun (sort-bits x)
+    (def u (double-bits (if (= x 0.0) 0.0 x)))
+    (if (= (bitwise-and u sign-bit) 0UL) (bitwise-ior u sign-bit) (bitwise-not u)))
+  (defun (sort-nan? x) (double-nan? x)))
+(impl (SortBits float)
+  (defun (sort-bits x)
+    (def u (float-bits (if (= x (cast float 0.0)) (cast float 0.0) x)))
+    (cast ulong (if (= (bitwise-and u 0x80000000U) 0U) (bitwise-ior u 0x80000000U) (bitwise-not u))))
+  (defun (sort-nan? x) (float-nan? x)))
+(impl (SortBits long)
+  (defun (sort-bits x) (bitwise-xor (cast ulong x) sign-bit))
+  (defun (sort-nan? _) #f))
+(impl (SortBits int)
+  (defun (sort-bits x) (cast ulong (+ (cast long x) 2147483648L)))
+  (defun (sort-nan? _) #f))
+(impl (SortBits short)
+  (defun (sort-bits x) (cast ulong (+ (cast int x) 32768)))
+  (defun (sort-nan? _) #f))
+(impl (SortBits byte)
+  (defun (sort-bits x) (cast ulong x))
+  (defun (sort-nan? _) #f))
+(impl (SortBits ushort)
+  (defun (sort-bits x) (cast ulong x))
+  (defun (sort-nan? _) #f))
+(impl (SortBits uint)
+  (defun (sort-bits x) (cast ulong x))
+  (defun (sort-nan? _) #f))
+(impl (SortBits ulong)
+  (defun (sort-bits x) x)
+  (defun (sort-nan? _) #f))
+
+;; The name of the type of a column that `table-sort` cannot sort by, or ""
+;; when it can.
+(: (-> AnyColumn string))
+(defun (unsortable a)
+  (def name (clr-type-name a))
+  (if (some? (find (fun (s) (= s name))
+                   ["Double" "Float" "Int64" "Int32" "Int16" "UInt8" "UInt16" "UInt32" "UInt64"
+                    "String" "Boolean" "Date32" "Timestamp" "TimestampTz" "Category"]))
+      ""
+      (arrow-type-name (data-type (clr-data a)))))
+
+;; The indices 0 to n - 1 in the order of the columns at the rows of
+;; `row-map`, or at 0 to n - 1 when `row-map` is empty.
+;; - `descending` gives the direction of each column.
+;; - `ids` and `firsts` give, for a string column, the ids of its strings and
+;;   the first row of each id, as ReshapeOps.StringIds returns them. An empty
+;;   array means that they are not known, and the pass finds them.
+(: (-> (Array AnyColumn) (Array bool) (Array int) (Array (Array int)) (Array (Array int)) int (Array int)))
+(defun (rows-in-order columns descending row-map ids firsts n)
+  (def order (: (uninitialized-array n) (Array int)))
+  (loop (:for i (range 0 n)) (:do (array-set! order i i)))
+  (when (> n 1)
+    (let pass ((k (- (array-length columns) 1)))
+      (when (>= k 0)
+        (sort-pass! order row-map (array-ref columns k) (array-ref descending k)
+                    (array-ref ids k) (array-ref firsts k))
+        (pass (- k 1)))))
+  order)
+
+;; The group of each row, the first row of each group, and the groups in the
+;; order that `table-sort` gives their keys, ascending, a null last.
+(: (-> (Array AnyColumn) int (Tuple (Array int) (Array int) (Array int))))
+(defun (groups-in-order keys n)
+  (def (Tuple group-of firsts ids id-firsts) (clr-groups-with-ids keys n))
+  (def ups (: (make-array (array-length keys)) (Array bool)))
+  (Tuple group-of firsts (rows-in-order keys ups firsts ids id-firsts (array-length firsts))))
+
+(: (-> AnyColumn %a))
+(defun (cannot-sort a)
+  (panic! (str "(bjostat table): a column of " (arrow-type-name (data-type (clr-data a))) " cannot be sorted by")))
+
+;; One stable pass: `order` in the order of the column, and among equal
+;; values in the order it had.
+(: (-> (Array int) (Array int) AnyColumn bool (Array int) (Array int) void))
+(defun (sort-pass! order row-map a descending ids firsts)
+  (match a
+    ((:is Apache.Arrow.DoubleArray c) (pass-numbers! order row-map (cast (Column double) c) descending #t))
+    ((:is Apache.Arrow.FloatArray c) (pass-numbers! order row-map (cast (Column float) c) descending #t))
+    ((:is Apache.Arrow.Int64Array c) (pass-numbers! order row-map (cast (Column long) c) descending #f))
+    ((:is Apache.Arrow.Int32Array c) (pass-numbers! order row-map (cast (Column int) c) descending #f))
+    ((:is Apache.Arrow.Int16Array c) (pass-numbers! order row-map (cast (Column short) c) descending #f))
+    ((:is Apache.Arrow.UInt8Array c) (pass-numbers! order row-map (cast (Column byte) c) descending #f))
+    ((:is Apache.Arrow.UInt16Array c) (pass-numbers! order row-map (cast (Column ushort) c) descending #f))
+    ((:is Apache.Arrow.UInt32Array c) (pass-numbers! order row-map (cast (Column uint) c) descending #f))
+    ((:is Apache.Arrow.UInt64Array c) (pass-numbers! order row-map (cast (Column ulong) c) descending #f))
+    ((:is Apache.Arrow.Date32Array c) (pass-numbers! order row-map (cast (Column int) c) descending #f))
+    ((:is Apache.Arrow.TimestampArray c) (pass-numbers! order row-map (cast (Column long) c) descending #f))
+    ((:is Apache.Arrow.StringArray c) (pass-strings! order row-map c descending ids firsts))
+    ((:is Apache.Arrow.BooleanArray c) (pass-bools! order row-map c descending))
+    ((:is Apache.Arrow.DictionaryArray _)
+     (if (category? a)
+         (pass-numbers! order row-map (category-codes-of a) descending #f)
+         (cannot-sort a)))
+    (_ (cannot-sort a))))
+
+(: (-> bool ulong))
+(defun (direction-mask descending) (if descending 0xFFFFFFFFFFFFFFFFUL 0UL))
+
+;; Whether bit `i` of a bitmap is set.
+(: (-> (RoSpan byte) int bool))
+(defun (bit-set? bits i)
+  (not (= 0 (bitwise-and (cast int (ro-span-ref bits (shift-right i 3))) (shift-left 1 (bitwise-and i 7))))))
+
+;; The keys of all of `order`, in parts on the compute threads when there
+;; are many. `part!` writes the keys of the indices [from, to) and returns
+;; the OR of each key XOR the first key. Returns the OR of all parts: the
+;; bits in which some key differs from the first.
+(: (-> int (-> int int ulong) ulong))
+(defun (keys-in-parts n part!)
+  (def parts (sort-parts n))
+  (if (< parts 2)
+      (part! 0 n)
+      (begin
+        (def size (quotient (+ n (- parts 1)) parts))
+        (def diffs (computing-each parts (fun (p) (part! (* p size) (min n (* (+ p 1) size))))))
+        (loop (:for d diffs) (:acc all (folding 0UL (bitwise-ior all d)))))))
+
+;; The key of values[order[i]] XOR `mask` into bits[i], for i in [from, to).
+(: (-> (RoSpan %a) (Array int) (Array ulong) ulong ulong int int ulong) (where (SortBits %a)))
+(defun (value-keys! values order bits mask first from to)
+  (let go ((i from) (diff 0UL))
+    (if (< i to)
+        (begin
+          (def k (bitwise-xor (sort-bits (ro-span-ref values (array-ref order i))) mask))
+          (array-set! bits i k)
+          (go (+ i 1) (bitwise-ior diff (bitwise-xor k first))))
+        diff)))
+
+;; The rank of each row's string, ranks[order[i]] XOR `mask`, into bits[i],
+;; for i in [from, to).
+(: (-> (Array int) (Array int) (Array ulong) ulong ulong int int ulong))
+(defun (rank-keys! ranks order bits mask first from to)
+  (let go ((i from) (diff 0UL))
+    (if (< i to)
+        (begin
+          (def k (bitwise-xor (cast ulong (cast uint (array-ref ranks (array-ref order i)))) mask))
+          (array-set! bits i k)
+          (go (+ i 1) (bitwise-ior diff (bitwise-xor k first))))
+        diff)))
+
+;; A pass by a column of numbers.
+;; - Without nulls, NaNs or a row map: the keys of all rows, in parts.
+;; - Else on this thread, by `numbers-with-others!`.
+(: (-> (Array int) (Array int) (Column %a) bool bool void) (where (SortBits %a)))
+(defun (pass-numbers! order row-map c descending floating)
+  (def n (array-length order))
+  (def mask (direction-mask descending))
+  (def nulls (> (column-null-count c) 0))
+  (if (and (not nulls) (not floating) (= (array-length row-map) 0))
+      (begin
+        (def bits (: (uninitialized-array n) (Array ulong)))
+        (def first (bitwise-xor (sort-bits (ro-span-ref (column-values c) (array-ref order 0))) mask))
+        (def diff (keys-in-parts n (fun (from to) (value-keys! (column-values c) order bits mask first from to))))
+        (radix-sort! bits n order diff))
+      (begin
+        (def data (column-array-data (column->any c)))
+        (def rows (: (uninitialized-array n) (Array int)))
+        (def bits (: (uninitialized-array n) (Array ulong)))
+        (def (Tuple count nans null-rows diff)
+          (numbers-with-others! order row-map rows bits (column-values c) (buffer-span (buffer-of data 0))
+                                (array-data-offset data) nulls floating mask))
+        (others-last! order rows bits count nans null-rows diff))))
+
+;; The keys of a pass with nulls, NaNs or a row map, for `others-last!`.
+;; - The rows of the numbers and their keys are put at the start of `rows`
+;;   and `bits`.
+;; - The rows of the nulls are put at the end of `rows`, and the rows of the
+;;   NaNs at the end of `bits`, from the back. Neither reaches the numbers.
+;; - Returns the number of numbers, of NaNs and of nulls, and the bits in
+;;   which the numbers' keys differ.
+(: (-> (Array int) (Array int) (Array int) (Array ulong) (RoSpan %a) (RoSpan byte) int bool bool ulong
+       (Tuple int int int ulong))
+   (where (SortBits %a)))
+(defun (numbers-with-others! order row-map rows bits values valid offset nulls floating mask)
+  (def n (array-length order))
+  (def mapped (> (array-length row-map) 0))
+  (let go ((i 0) (count 0) (nans 0) (null-rows 0) (first 0UL) (diff 0UL))
+    (if (>= i n)
+        (Tuple count nans null-rows diff)
+        (begin
+          (def r (array-ref order i))
+          (def row (if mapped (array-ref row-map r) r))
+          (cond
+            ((and nulls (not (bit-set? valid (+ offset row))))
+             (array-set! rows (- (- n 1) null-rows) r)
+             (go (+ i 1) count nans (+ null-rows 1) first diff))
+            ((and floating (sort-nan? (ro-span-ref values row)))
+             (array-set! bits (- (- n 1) nans) (cast ulong r))
+             (go (+ i 1) count (+ nans 1) null-rows first diff))
+            (else
+             (def k (bitwise-xor (sort-bits (ro-span-ref values row)) mask))
+             (array-set! rows count r)
+             (array-set! bits count k)
+             (if (= count 0)
+                 (go (+ i 1) 1 nans null-rows k 0UL)
+                 (go (+ i 1) (+ count 1) nans null-rows first (bitwise-ior diff (bitwise-xor k first))))))))))
+
+;; The rows with numbers are sorted, and the NaNs and then the nulls come
+;; after them, each in the order they had: `order` from the `count` sorted
+;; rows of `rows`, then the NaNs at the end of `bits`, then the nulls at the
+;; end of `rows`, where `numbers-with-others!` put them.
+(: (-> (Array int) (Array int) (Array ulong) int int int ulong void))
+(defun (others-last! order rows bits count nans nulls diff)
+  (def n (array-length order))
+  (if (= count n)
+      ;; All rows have keys, so `rows` is `order`.
+      (radix-sort! bits n order diff)
+      (begin
+        (radix-sort! bits count rows diff)
+        (array-copy! rows 0 order 0 count)
+        (loop (:for i (range 0 nans))
+              (:do (array-set! order (+ count i) (cast int (array-ref bits (- (- n 1) i))))))
+        (loop (:for i (range 0 nulls))
+              (:do (array-set! order (+ (+ count nans) i) (array-ref rows (- (- n 1) i))))))))
+
+;; A pass by a column of strings. A string's key is its rank among the
+;; distinct strings.
+;; - Without nulls, a row map or known ids: ReshapeOps.SortedStringIds gives
+;;   the ranks, and the keys are made in parts.
+;; - Else on this thread, from the ids and the order of the distinct strings.
+(: (-> (Array int) (Array int) StringColumn bool (Array int) (Array int) void))
+(defun (pass-strings! order row-map c descending known-ids known-firsts)
+  (def n (array-length order))
+  (def mask (direction-mask descending))
+  (def nulls (> (string-column-null-count c) 0))
+  (def mapped (> (array-length row-map) 0))
+  (def known (> (array-length known-ids) 0))
+  (if (and (not nulls) (not mapped) (not known))
+      (begin
+        (def ranks (clr-sorted-string-ids c))
+        (def bits (: (uninitialized-array n) (Array ulong)))
+        (def first (bitwise-xor (cast ulong (cast uint (array-ref ranks (array-ref order 0)))) mask))
+        (def diff (keys-in-parts n (fun (from to) (rank-keys! ranks order bits mask first from to))))
+        (radix-sort! bits n order diff))
+      (begin
+        (def (Tuple ids firsts) (if known (Tuple known-ids known-firsts) (clr-string-ids c)))
+        (def by-bytes (clr-in-byte-order c firsts))
+        (def rank (: (uninitialized-array (array-length by-bytes)) (Array int)))
+        (loop (:for i (range 0 (array-length by-bytes))) (:do (array-set! rank (array-ref by-bytes i) i)))
+        (def data (column-array-data (strings->any c)))
+        (def rows (: (uninitialized-array n) (Array int)))
+        (def bits (: (uninitialized-array n) (Array ulong)))
+        (def (Tuple count null-rows diff)
+          (strings-with-nulls! order row-map rows bits ids rank (buffer-span (buffer-of data 0))
+                               (array-data-offset data) nulls mask))
+        (others-last! order rows bits count 0 null-rows diff))))
+
+;; The keys of a pass by the ranks of the strings, rank[ids[row]], with
+;; nulls or a row map, as `numbers-with-others!` puts them. Returns the
+;; number of strings and of nulls, and the bits in which the keys differ.
+(: (-> (Array int) (Array int) (Array int) (Array ulong) (Array int) (Array int) (RoSpan byte) int bool ulong
+       (Tuple int int ulong)))
+(defun (strings-with-nulls! order row-map rows bits ids rank valid offset nulls mask)
+  (def n (array-length order))
+  (def mapped (> (array-length row-map) 0))
+  (let go ((i 0) (count 0) (null-rows 0) (first 0UL) (diff 0UL))
+    (if (>= i n)
+        (Tuple count null-rows diff)
+        (begin
+          (def r (array-ref order i))
+          (def row (if mapped (array-ref row-map r) r))
+          (if (and nulls (not (bit-set? valid (+ offset row))))
+              (begin
+                (array-set! rows (- (- n 1) null-rows) r)
+                (go (+ i 1) count (+ null-rows 1) first diff))
+              (begin
+                (def k (bitwise-xor (cast ulong (cast uint (array-ref rank (array-ref ids row)))) mask))
+                (array-set! rows count r)
+                (array-set! bits count k)
+                (if (= count 0)
+                    (go (+ i 1) 1 null-rows k 0UL)
+                    (go (+ i 1) (+ count 1) null-rows first (bitwise-ior diff (bitwise-xor k first))))))))))
+
+;; A pass by a column of bools: #f first when ascending, #t first when
+;; descending, then the nulls. The first group is written into `order` as
+;; it is read, behind the reads. The second group is put at the start of
+;; `rest` and the nulls at its end.
+(: (-> (Array int) (Array int) Apache.Arrow.BooleanArray bool void))
+(defun (pass-bools! order row-map c descending)
+  (def n (array-length order))
+  (def mapped (> (array-length row-map) 0))
+  (def a (cast AnyColumn c))
+  (def data (column-array-data a))
+  (def nulls (> (any-null-count a) 0))
+  (def valid (buffer-span (buffer-of data 0)))
+  (def values (buffer-span (buffer-of data 1)))
+  (def offset (array-data-offset data))
+  (def rest (: (uninitialized-array n) (Array int)))
+  (let go ((i 0) (firsts 0) (seconds 0) (null-rows 0))
+    (if (< i n)
+        (begin
+          (def r (array-ref order i))
+          (def bit (+ offset (if mapped (array-ref row-map r) r)))
+          (cond
+            ((and nulls (not (bit-set? valid bit)))
+             (array-set! rest (- (- n 1) null-rows) r)
+             (go (+ i 1) firsts seconds (+ null-rows 1)))
+            ((= (bit-set? values bit) descending)
+             (array-set! order firsts r)
+             (go (+ i 1) (+ firsts 1) seconds null-rows))
+            (else
+             (array-set! rest seconds r)
+             (go (+ i 1) firsts (+ seconds 1) null-rows))))
+        (begin
+          (array-copy! rest 0 order firsts seconds)
+          (loop (:for j (range 0 null-rows))
+                (:do (array-set! order (+ (+ firsts seconds) j) (array-ref rest (- (- n 1) j)))))))))
+
+;; ---------------------------------------------------------------------------
+;; The radix sort
+;;
+;; - Least significant digit first, 11 bits a digit: 6 passes for 64 bits,
+;;   where 8 bits a digit need 8.
+;; - Stable. A digit that is the same in every key needs no pass.
+;; - From `sort-part-keys` keys a part, in parts on the compute threads.
+
+(: int) (def sort-digit-bits 11)
+(: int) (def sort-buckets 2048)
+(: int) (def sort-digits 6)
+;; The fewest keys of a part of a sort.
+(: int) (def sort-part-keys 65536)
+
+(: (-> ulong int int))
+(defun (sort-digit k d)
+  (cast int (bitwise-and (shift-right k (* sort-digit-bits d)) 2047UL)))
+
+;; The number of parts to sort n keys in; below 2, one.
+(: (-> int int))
+(defun (sort-parts n) (min (quotient n sort-part-keys) (compute-thread-count)))
+
+;; The highest digit that is not the same in every key: the last pass.
+(: (-> ulong int))
+(defun (last-digit diff)
+  (let down ((d (- sort-digits 1)))
+    (if (and (> d 0) (= (sort-digit diff d) 0)) (down (- d 1)) d)))
+
+;; The number of passes, one for each digit that is not the same in every
+;; key.
+(: (-> ulong int))
+(defun (digit-passes diff)
+  (loop (:for d (range 0 sort-digits))
+        (:when (> (sort-digit diff d) 0))
+        (:acc c (folding 0 (+ c 1)))))
+
+;; `rows` in the order of `keys`, the first n of each. `diff` has the bits
+;; in which some key differs from the first. The keys are changed.
+(: (-> (Array ulong) int (Array int) ulong void))
+(defun (radix-sort! keys n rows diff)
+  (when (and (>= n 2) (not (= diff 0UL)))
+    (def parts (sort-parts n))
+    (if (>= parts 2)
+        (radix-sort-parts! keys n rows parts diff)
+        (radix-sort-one! keys n rows diff))))
+
+;; Each pass but the last moves the keys and the rows into the other arrays.
+;; The last moves only the rows. The keys need a second array only when
+;; there is more than one pass.
+(: (-> ulong int (Array ulong)))
+(defun (second-keys diff n)
+  (if (> (digit-passes diff) 1) (uninitialized-array n) (make-array 0)))
+
+(: (-> (Array ulong) int (Array int) ulong void))
+(defun (radix-sort-one! keys n rows diff)
+  (def last (last-digit diff))
+  (def count (: (make-array sort-buckets) (Array int)))
+  (def keys2 (second-keys diff n))
+  (def rows2 (: (uninitialized-array n) (Array int)))
+  (let pass ((d 0) (fk keys) (tk keys2) (fr rows) (tr rows2) (moved #f))
+    (cond
+      ((> d last) (when moved (array-copy! fr 0 rows 0 n)))
+      ((= (sort-digit diff d) 0) (pass (+ d 1) fk tk fr tr moved))
+      (else
+       (array-fill! count 0)
+       (loop (:for i (range 0 n))
+             (:do (def b (sort-digit (array-ref fk i) d))
+                  (array-set! count b (+ (array-ref count b) 1))))
+       (let sum ((b 0) (total 0))
+         (when (< b sort-buckets)
+           (def c (array-ref count b))
+           (array-set! count b total)
+           (sum (+ b 1) (+ total c))))
+       (if (= d last)
+           (loop (:for i (range 0 n))
+                 (:do (def b (sort-digit (array-ref fk i) d))
+                      (def at (array-ref count b))
+                      (array-set! count b (+ at 1))
+                      (array-set! tr at (array-ref fr i))))
+           (loop (:for i (range 0 n))
+                 (:do (def k (array-ref fk i))
+                      (def b (sort-digit k d))
+                      (def at (array-ref count b))
+                      (array-set! count b (+ at 1))
+                      (array-set! tk at k)
+                      (array-set! tr at (array-ref fr i)))))
+       (pass (+ d 1) tk fk tr fr (not moved))))))
+
+;; The sort in parts. Each pass has three steps:
+;; - Each part counts the digits of its keys.
+;; - The counts give each part where each of its digits goes: after the keys
+;;   of the smaller digits, and after the same digit's keys of the parts
+;;   before it, so that the sort stays stable.
+;; - Each part moves its keys there.
+;; The counts are taken again at each pass, as a pass moves the keys between
+;; the parts.
+(: (-> (Array ulong) int (Array int) int ulong void))
+(defun (radix-sort-parts! keys n rows parts diff)
+  (def last (last-digit diff))
+  (def size (quotient (+ n (- parts 1)) parts))
+  (def counts (: {arraying (make-array sort-buckets) (:for _ (range 0 parts))} (Array (Array int))))
+  (def keys2 (second-keys diff n))
+  (def rows2 (: (uninitialized-array n) (Array int)))
+  (let pass ((d 0) (fk keys) (tk keys2) (fr rows) (tr rows2) (moved #f))
+    (cond
+      ((> d last) (when moved (array-copy! fr 0 rows 0 n)))
+      ((= (sort-digit diff d) 0) (pass (+ d 1) fk tk fr tr moved))
+      (else
+       (ignore (computing-each parts
+                               (fun (p)
+                                 (def c (array-ref counts p))
+                                 (array-fill! c 0)
+                                 (loop (:for i (range (* p size) (min n (* (+ p 1) size))))
+                                       (:do (def b (sort-digit (array-ref fk i) d))
+                                            (array-set! c b (+ (array-ref c b) 1))))
+                                 unit)))
+       (let sum ((b 0) (p 0) (total 0))
+         (cond
+           ((= b sort-buckets) unit)
+           ((= p parts) (sum (+ b 1) 0 total))
+           (else
+            (def c (array-ref counts p))
+            (def k (array-ref c b))
+            (array-set! c b total)
+            (sum b (+ p 1) (+ total k)))))
+       (def final (= d last))
+       (ignore (computing-each parts
+                               (fun (p)
+                                 (def at (array-ref counts p))
+                                 (def to (min n (* (+ p 1) size)))
+                                 (if final
+                                     (loop (:for i (range (* p size) to))
+                                           (:do (def b (sort-digit (array-ref fk i) d))
+                                                (def j (array-ref at b))
+                                                (array-set! at b (+ j 1))
+                                                (array-set! tr j (array-ref fr i))))
+                                     (loop (:for i (range (* p size) to))
+                                           (:do (def k (array-ref fk i))
+                                                (def b (sort-digit k d))
+                                                (def j (array-ref at b))
+                                                (array-set! at b (+ j 1))
+                                                (array-set! tk j k)
+                                                (array-set! tr j (array-ref fr i)))))
+                                 unit)))
+       (pass (+ d 1) tk fk tr fr (not moved))))))
+
 ;; A column to sort by, and the direction.
 (type (: SortKey (Union (: ascending string) (: descending string))))
 
@@ -1604,7 +2087,7 @@
   (match found
     ((Err e) (Some e))
     ((Ok c)
-     (def kind (clr-unsortable c))
+     (def kind (unsortable c))
      (if (= kind "")
          None
          (Some (TableError (message (str "'" (sort-key-name k) "' is a column of " kind
@@ -1618,11 +2101,14 @@
           (:acc (vecing e))))
   (if (> (vec-length problems) 0)
       (Err (vec-ref problems 0))
-      (Ok (take-rows t
-                     (clr-sort-order t
-                                     {arraying (clr-index-of t (sort-key-name k)) (:for k keys)}
-                                     {arraying (match k ((descending _) #t) (_ #f)) (:for k keys)})
-                     (table-row-count t)))))
+      (let ()
+        (def n (table-row-count t))
+        (def none {arraying (: (make-array 0) (Array int)) (:for _ keys)})
+        (Ok (take-rows t
+                       (rows-in-order {arraying (clr-column t (clr-index-of t (sort-key-name k))) (:for k keys)}
+                                      {arraying (match k ((descending _) #t) (_ #f)) (:for k keys)}
+                                      (make-array 0) none none n)
+                       n)))))
 
 ;; ===========================================================================
 ;; Joins: the rows that match
@@ -3205,7 +3691,7 @@
 ;; numbers of a row are its slot, and the slots that have a count are the
 ;; result in its order: no groups to find and no sort. A category's codes
 ;; are such numbers already. Otherwise the groups of the keys are found and
-;; put in order (ReshapeOps.GroupsInOrder).
+;; put in order (groups-in-order).
 
 (import/extern
   (uninitialized-ints (: System.GC.AllocateUninitializedArray (-> int bool (Array int)))))
@@ -3273,7 +3759,7 @@
 ;; The counts of the groups of the keys, in the order of the groups' keys.
 (: (-> Table (Array int) (Array AnyColumn) string int Table))
 (defun (count-groups t idx cols name n)
-  (def (Tuple group-of firsts order) (clr-groups-in-order cols n))
+  (def (Tuple group-of firsts order) (groups-in-order cols n))
   (def counts (group-counts group-of (array-length firsts) n))
   (def rows (array-length order))
   (with-count (take-rows (clr-select t idx) (gathered firsts order) rows) name
@@ -3580,8 +4066,8 @@
 (: (-> Table int AnyColumn AnyColumn string string (Result TableError Table)))
 (defun (crosstab-of t row-idx row-col col-col row-key col-key)
   (def n (table-row-count t))
-  (def (Tuple row-of row-firsts row-order) (clr-groups-in-order #[row-col] n))
-  (def (Tuple col-of col-firsts col-order) (clr-groups-in-order #[col-col] n))
+  (def (Tuple row-of row-firsts row-order) (groups-in-order #[row-col] n))
+  (def (Tuple col-of col-firsts col-order) (groups-in-order #[col-col] n))
   (def r-count (array-length row-firsts))
   (def c-count (array-length col-firsts))
   (def nulls? (or (> (any-null-count row-col) 0) (> (any-null-count col-col) 0)))

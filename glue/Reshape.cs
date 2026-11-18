@@ -882,16 +882,38 @@ public static class ReshapeOps
     }
 
     /// <summary>
-    /// The group of each row, the first row of each group, and the groups in
-    /// the order that table-sort gives their keys, ascending, a null last.
+    /// The group of each row and the first row of each group. For each key
+    /// that is a string, also the ids of its strings, as <see cref="StringIds"/>
+    /// returns them, and the first row of each id. Both are empty arrays for
+    /// a key of another type. (bjostat table) puts the groups in order with
+    /// them.
     /// </summary>
-    public static int[] GroupsInOrder(IArrowArray[] keys, int n, out int[] firsts, out int[] order)
+    public static int[] GroupsWithStringIds(IArrowArray[] keys, int n, out int[] firsts, out int[][] ids, out int[][] idFirsts)
     {
         var groups = Reshape.Groups(keys, n, out var f, out var stringIds);
-        order = Sorting.OrderRows(keys, new bool[keys.Length], CollectionsMarshal.AsSpan(f), stringIds, f.Count);
         firsts = f.ToArray();
+        ids = new int[keys.Length][];
+        idFirsts = new int[keys.Length][];
+        for (int k = 0; k < keys.Length; k++)
+        {
+            var known = stringIds[k];
+            ids[k] = known?.Ids ?? System.Array.Empty<int>();
+            idFirsts[k] = known?.Firsts.ToArray() ?? System.Array.Empty<int>();
+        }
         return groups;
     }
+
+    /// <summary>
+    /// The rank of each row's string among the distinct strings, in the
+    /// order of their UTF-8 bytes. For a column without nulls.
+    /// </summary>
+    public static int[] SortedStringIds(StringArray s) => Categories.SortedStringIds(s, out _);
+
+    /// <summary>
+    /// The ids of the distinct strings whose first rows are <paramref name="firsts"/>,
+    /// in the order of the strings' bytes.
+    /// </summary>
+    public static int[] InByteOrder(StringArray s, int[] firsts) => Categories.InByteOrder(s, firsts.ToList());
 
     /// <summary>
     /// An id for each row's value in the column, from 0 in the order of

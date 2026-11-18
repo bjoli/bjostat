@@ -1831,6 +1831,69 @@ The glue is 4173 lines of C# (475 out).
   rows after its add was made one test and one store on the path that does
   not grow. The sort's medians are noisy in both (9-17 %).
 
+** Done: the sort in Bjolang
+
+glue/Sort.cs is Bjolang now, in src/table.bjo ("Sorting: the order of the
+rows"), with the passes of the C#: one stable pass for each key, from the
+last key to the first, each a radix sort of 64-bit keys of 11-bit digits,
+with a digit that is the same in every key left out. The trait ~SortBits~
+gives the key of each type of number and says whether it is a NaN; a
+constrained function is copied at each type, so the key is inline in the
+loops. The keys are made in parts with ~computing-each~, and from 131 072
+keys the radix sort runs in parts of at least 65 536. A pass with nulls,
+NaNs or a row map puts the rows of the nulls at the end of its array of
+rows and those of the NaNs at the end of its array of keys, so it needs no
+third array. ~table-sort~ and ~groups-in-order~ (the counts and the
+crosstabs) call ~rows-in-order~. ReshapeOps.GroupsInOrder became
+GroupsWithStringIds: the groups and the ids of the string keys, which the
+Bjolang puts in order. ReshapeOps.SortedStringIds and InByteOrder are
+public for the Bjolang. The glue is 3680 lines of C# (493 out).
+
+- The same results: scratch/sort/dump.bjo sorts all.arrow (300 003 rows
+  with nulls) by each column type that can be sorted, in both directions,
+  whole, as a slice of 40 rows and as a slice of 139 000 at an offset. It
+  also sorts by two and three keys, with no keys, one row and no rows.
+  Tables made in the dump, of 1M and of 1000 rows without nulls, take the
+  paths in parts: longs, a few ints, negative ints, floats and doubles with
+  NaN and -0, one value, and strings. It counts and makes crosstabs by
+  strings, floats, bools, categories and dates, and prints the messages of
+  the types that cannot be sorted. Each result keeps the row number, and
+  its sha256 is printed: 1088 lines, the same before and after, with all
+  threads and with one. All 15 test files pass with all threads and with
+  one.
+- Measured, the C# version (worktree of 9101b81) and this alternated, three
+  rounds each (scratch/sort/bench.bjo), ms:
+
+  | row                                | C#          | Bjolang     |
+  |------------------------------------+-------------+-------------|
+  | 1M longs                           | 13.4-14.4   | 11.5-12.4   |
+  | 1M longs, descending               | 13.4-14.2   | 11.5-12.3   |
+  | 1M ints of 1000 values             | 7.52-7.92   | 6.37-6.48   |
+  | 1M doubles                         | 19.9-21.3   | 18.9-19.6   |
+  | 1M prices (doubles)                | 16.2-17.1   | 15.8-16.6   |
+  | 1M strings of 20 000 values        | 14.2-14.7   | 13.7-14.0   |
+  | 1M short strings                   | 5.73-5.74   | 5.17-5.21   |
+  | 1M strings, 2/3 null               | 60.7-62.0   | 47.7-48.3   |
+  | 1M bools                           | 3.02-3.62   | 3.28-3.34   |
+  | 1000 doubles                       | 0.024-0.025 | 0.020-0.021 |
+  | 1M by price, all 6 columns         | 26.2-27.1   | 24.3-24.8   |
+  | 1M by region, qty desc, all 6      | 16.6-16.7   | 15.7-15.9   |
+  | count 1M by region                 | 1.27-1.28   | 1.27-1.28   |
+  | count 1M by price                  | 84.4-87.6   | 81.5-85.4   |
+  | count 1M by region, ok             | 2.73-3.03   | 2.75-2.98   |
+  | crosstab 1M region, ok             | 3.33-3.54   | 3.33-3.38   |
+
+  The same memory, or less with nulls (52.9 MB against 54.3). The strings
+  with nulls are faster because the rows of the nulls do not go through a
+  third array. The bools are in the spread of the C#: run alone, 3.36-3.52
+  against 3.54-3.58. In the first version, the bools were 15 % slower in
+  the full run (3.38-3.47). Its loop stopped at ~(= i n)~; it now continues
+  while ~(< i n)~, as the C# loop does, which may let the JIT leave out the
+  bounds check of ~order[i]~.
+- A rule of Bjolang that the code follows: a function that takes a span
+  cannot call one that suspends, as ~computing-each~ does. The loops over
+  the spans return their counts, and their caller sorts.
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema
