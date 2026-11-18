@@ -1,0 +1,54 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/models.bjo — fitting, where the collector step is called
+;; once per row: the response and a Vec of the predictors.
+;;
+;;     bjo bench bench/models.bjo --all
+;;
+;; The predictors arrive as a Vec, so the C# reads them out of a relaxed
+;; radix tree. Copying them out with one CopyTo instead of indexing them
+;; measured no different at 3 predictors (5.26 vs 5.39 ms) or at 64 (42.7 vs
+;; 42.9 ms, 20 000 rows): the step's work is the p Givens rotations, which are
+;; p², and reading p values cannot show inside it. The benches stay for the
+;; rotations and for what a fit allocates.
+
+(import (std prelude))
+(import (std bench))
+(import (bjostat table))
+(import (bjostat models))
+
+(: int)
+(def rows 100000)
+
+;; y against three predictors, the first near-linear in the row number so
+;; that the fit is a real one and the QR does real work.
+(: (Vec (Tuple double (Vec double))))
+(def data
+  {vecing (Tuple (+ 1.0 (* 0.002 (cast double i))) [(* 0.001 (cast double i))
+                                                   (cast double (% i 97))
+                                                   (sqrt (cast double i))])
+          (:for i (range 0 rows))})
+
+;; The same, with a response a logistic model can have.
+(: (Vec (Tuple double (Vec double))))
+(def counts
+  {vecing (Tuple (if (> (% i 3) 0) 1.0 0.0) [(cast double (% i 7))])
+          (:for i (range 0 rows))})
+
+(: (Vec string))
+(def three ["a" "b" "c"])
+(: (Vec string))
+(def one ["x"])
+
+(def/bench "linear, 3 predictors"
+  (or-panic (loop (:for row data) (:acc (linear-model three row)))))
+
+(def/bench "linear, no intercept"
+  (or-panic (loop (:for row data) (:acc (linear-model/origin three row)))))
+
+(def/bench "logistic, 1 predictor"
+  (or-panic (loop (:for row counts) (:acc (logistic-model one row)))))
+
+(run-benches)

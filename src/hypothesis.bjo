@@ -232,7 +232,7 @@
      (refuse (str "the table has " (int->string rows) " rows and " (int->string cols)
                   " columns of counts: a test needs at least 2 of each.")))
     ((some? bad)
-     (refuse (str "'" (vec-ref names (option-value bad 0)) "' is not a column of counts, which are longs.")))
+     (refuse (str "'" (vec-ref names (option-ref-or bad 0)) "' is not a column of counts, which are longs.")))
     (else
      (def counts
        {vecing {vecing (match (cells-get (column-of (vec-ref columns c)) r)
@@ -455,7 +455,7 @@
     ((some? (find (fun (c) (err? c)) columns)) (refuse "the columns are not of counts, which are longs."))
     (else
      (: (-> int int long))
-     (defun (count c r) (option-value (cells-get (column-of (vec-ref columns c)) r) -1L))
+     (defun (count c r) (option-ref-or (cells-get (column-of (vec-ref columns c)) r) -1L))
      (def a (count 0 0)) (def b (count 1 0)) (def c (count 0 1)) (def d (count 1 1))
      (if (or (< a 0L) (< b 0L) (< c 0L) (< d 0L))
          (refuse "a count is null or below 0.")

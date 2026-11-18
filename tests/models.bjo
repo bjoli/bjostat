@@ -255,7 +255,7 @@
           (close? (glm-residual logit 1.0 [2.62]) (- 1.0 (glm-predict logit [2.62])) 1e-15) #t)
 
   (: (-> Table string (Vec double)))
-  (defun (doubles-of t name) {vecing (option-value x 0.0) (:for x (: (match (column-as t name) ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells double)))})
+  (defun (doubles-of t name) {vecing (option-ref-or x 0.0) (:for x (: (match (column-as t name) ((Ok c) c) ((Err e) (panic! (displayed e)))) (Cells double)))})
   ;; R's anova(lm(dist ~ speed, cars))
   (def anova (match (model-anova cars [(Tuple "speed" 1)]) ((Ok t) t) ((Err e) (panic! (displayed e)))))
   (expect "cars: anova, the sums of squares"

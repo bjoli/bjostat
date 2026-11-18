@@ -195,7 +195,7 @@
               (:acc lows (min-by groups (Tuple g p)))
               (:acc highs (max-by groups (Tuple g p)))
               (:acc means (mean-by groups (Tuple g p)))
-              (:acc quantities (summing-by groups (Tuple g (: (option-value q* 0L) long))) #:when (some? q*))
+              (:acc quantities (summing-by groups (Tuple g (: (option-ref-or q* 0L) long))) #:when (some? q*))
               => (groups->table groups "region"
                                 [(Tuple "total" totals) (Tuple "n" counts) (Tuple "low" lows)
                                  (Tuple "high" highs) (Tuple "mean" means) (Tuple "qty" quantities)]))))

@@ -1,0 +1,34 @@
+;; This Source Code Form is subject to the terms of the Mozilla Public
+;; License, v. 2.0. If a copy of the MPL was not distributed with this
+;; file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+;; bjostat/bench/hypothesis.bjo — Fisher's exact test, whose cost is the
+;; support of the hypergeometric: the odds ratio bisects, and each step walks
+;; the support again.
+;;
+;;     bjo bench bench/hypothesis.bjo --all
+;;
+;; A 2 × 2 of 150 each way is a support of 301 values.
+
+(import (std prelude))
+(import (std bench))
+(import (bjostat table))
+(import (bjostat hypothesis))
+
+(: (-> long (Result TableError Table)))
+(defun (two-by-two count)
+  (make-table
+    [(named "k" (array->column {arraying (cast long i) (:for i (range 0 2))}))
+     (named "x" (array->column {arraying count (:for i (range 0 2))}))
+     (named "y" (array->column {arraying count (:for i (range 0 2))}))]))
+
+;; The support's width is count: 150 gives 301 values to sum.
+(: Table)
+(def small (or-panic (two-by-two 10L)))
+(: Table)
+(def wide (or-panic (two-by-two 150L)))
+
+(def/bench "fisher, 21 values" (or-panic (fisher-test small)))
+(def/bench "fisher, 301 values" (or-panic (fisher-test wide)))
+
+(run-benches)
