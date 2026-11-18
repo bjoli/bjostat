@@ -873,14 +873,6 @@ public static class ReshapeOps
     /// <summary>The cells of the columns, one column after the other.</summary>
     public static IArrowArray Concat(IArrowArray[] pieces, IArrowType type) => Reshape.Concat(pieces.ToList(), type);
 
-    /// <summary>The number of each distinct string, in the order they first come, and the first row of each.</summary>
-    public static int[] StringIds(StringArray s, out int[] firsts)
-    {
-        var ids = Categories.StringIds(s, out var f);
-        firsts = f.ToArray();
-        return ids;
-    }
-
     /// <summary>
     /// The group of each row and the first row of each group. For each key
     /// that is a string, also the ids of its strings, as <see cref="StringIds"/>
@@ -902,18 +894,6 @@ public static class ReshapeOps
         }
         return groups;
     }
-
-    /// <summary>
-    /// The rank of each row's string among the distinct strings, in the
-    /// order of their UTF-8 bytes. For a column without nulls.
-    /// </summary>
-    public static int[] SortedStringIds(StringArray s) => Categories.SortedStringIds(s, out _);
-
-    /// <summary>
-    /// The ids of the distinct strings whose first rows are <paramref name="firsts"/>,
-    /// in the order of the strings' bytes.
-    /// </summary>
-    public static int[] InByteOrder(StringArray s, int[] firsts) => Categories.InByteOrder(s, firsts.ToList());
 
     /// <summary>
     /// An id for each row's value in the column, from 0 in the order of

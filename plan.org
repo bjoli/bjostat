@@ -1894,6 +1894,77 @@ public for the Bjolang. The glue is 3680 lines of C# (493 out).
   cannot call one that suspends, as ~computing-each~ does. The loops over
   the spans return their counts, and their caller sorts.
 
+** Done: Categories in Bjolang
+
+The numbering of strings and the making of categories of glue/Categories.cs
+are Bjolang now, in src/table.bjo ("Numbering strings" and "Making
+categories"). The numbering is that of the C#:
+
+- An ~IdTable~ numbers the distinct strings by open addressing. The key of
+  a string is two words of its bytes and its length. A string of more than
+  16 bytes is also compared by the bytes between the words.
+- A column of fewer than 32 768 rows is numbered on this thread.
+- A longer column is numbered in parts on the compute threads:
+  - With few distinct strings, each part has a table, and ~merged~
+    numbers the strings of the parts.
+  - With many, the rows go into 256 buckets by hash, and each bucket has
+    one table.
+- ~in-byte-order~ sorts keys of at most 16 bytes with three passes of the
+  radix sort of the sort (the length, then bytes 9 to 16, then bytes 1 to
+  8). Longer keys are sorted by comparisons.
+- The hot functions (~key-word0~, ~key-word1~, ~key-hash~, ~row-id!~,
+  ~id-of!~) are ~#:inline~, as the C# has AggressiveInlining on them.
+  ~insert-id!~ and ~same-middle?~ are not inlined.
+
+~table-categorize~, ~category-levels~, ~category-codes~, ~string-numbers~
+and the join by categories use the Bjolang. Categories.cs keeps the
+category type, ~Make~, ~Concat~ and ~SameLevels~. glue/Reshape.cs calls the
+numbering through Categories.StringIds, SortedStringIds and InByteOrder,
+which the module installs as delegates when it is initialized. The glue is
+2815 lines of C# (865 out).
+
+- The same results: scratch/categories/dump.bjo numbers, categorizes,
+  sorts, counts and makes distinct tables of columns made for each path:
+  - one part, few strings in parts, and many strings in parts
+  - with and without nulls, whole and as a slice at an odd offset
+  - strings of 0 to 40 bytes, some alike in their first and last 8 bytes,
+    some not ASCII
+  It also gives levels, appends and joins categories, and prints the
+  messages of the errors. The output is 1474 lines of sha256s and tables,
+  the same before and after, with all threads and with one. The sort dump
+  is the same. All 15 test files pass with all threads and with one.
+- Measured, the C# version (worktree of 7f82b20) and this alternated, three
+  rounds each (scratch/categories/bench.bjo), ms:
+
+  | row                                    | C#          | Bjolang     |
+  |----------------------------------------+-------------+-------------|
+  | numbers of 1M strings, 8 values        | 1.56-1.71   | 1.80-1.82   |
+  | numbers of 1M strings, 20 000 values   | 7.92-8.35   | 7.71-7.79   |
+  | numbers of 1M strings, 600 000 values  | 101-105     | 70.0-72.3   |
+  | numbers of 20 000 strings, 500 values  | 0.194-0.200 | 0.207-0.209 |
+  | numbers of 1M long strings, 20 000     | 14.0-14.5   | 13.4-13.6   |
+  | numbers of 1M regions                  | 1.45-1.75   | 1.65-1.84   |
+  | numbers of 1M notes, 2/3 null          | 82.0-83.1   | 54.6-55.1   |
+  | categorize 1M strings, 8 values        | 1.64-1.73   | 1.78-1.81   |
+  | categorize 1M strings, 20 000 values   | 8.45-8.66   | 8.21-8.47   |
+  | categorize 1M strings, 600 000 values  | 85.0-86.7   | 66.0-67.1   |
+  | categorize 1M strings, levels given    | 1.62-1.67   | 1.75-1.83   |
+  | categorize 20 000 strings              | 0.204-0.210 | 0.220-0.226 |
+  | sort 1M strings, 20 000 values         | 18.9-19.7   | 18.7-19.0   |
+  | sort 1M notes, 2/3 null                | 52.1-52.4   | 52.8-53.5   |
+  | count 1M by strings, 20 000 values     | 10.9-11.2   | 10.8-10.9   |
+  | count 1M by region, ok                 | 4.17-4.49   | 4.32-4.40   |
+  | distinct 1M by strings, 600 000 values | 29.4-29.6   | 30.3-32.2   |
+
+  - Few distinct strings are 2 to 10 % slower. The C# reads the bytes with
+    Unsafe.ReadUnaligned, without bounds checks. Bjolang has no unchecked
+    read. Before ~#:inline~ on the hot functions, these rows were 13 to
+    32 % slower.
+  - Many distinct strings are 23 to 34 % faster, with less memory, except
+    for categorize with 600 000 values: 61.9 MB against 45.0. Most of the
+    difference is the keys of the radix passes of ~in-byte-order~. With a
+    sort by comparisons, that row was 16 % slower than the C#.
+
 ** Later
 
 - *Typed views.* A macro over a record type that checks a table's schema

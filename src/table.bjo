@@ -234,13 +234,10 @@
   (schema-builder-add! (: Apache.Arrow.Schema+Builder.Field (-> SchemaBuilder Field SchemaBuilder)))
   (schema-builder-build (: Apache.Arrow.Schema+Builder.Build (-> SchemaBuilder Schema)))
   (arrow-type-name (: Apache.Arrow.Types.IArrowType.Name (-> ArrowType string) #:get))
-  (clr-sorted-string-ids (: Bjostat.ReshapeOps.SortedStringIds (-> StringColumn (Array int))))
-  (clr-in-byte-order (: Bjostat.ReshapeOps.InByteOrder (-> StringColumn (Array int) (Array int))))
 
   ;; Reshaping: the kernels of glue/Reshape.cs.
   (clr-firsts (: Bjostat.ReshapeOps.Firsts (-> (Array AnyColumn) int (Array int))))
   (clr-groups (: Bjostat.ReshapeOps.Groups (-> (Array AnyColumn) int (out (Array int)) (Tuple (Array int) (Array int)))))
-  (clr-string-ids (: Bjostat.ReshapeOps.StringIds (-> StringColumn (out (Array int)) (Tuple (Array int) (Array int)))))
   (clr-concat (: Bjostat.ReshapeOps.Concat (-> (Array AnyColumn) ArrowType AnyColumn)))
   (clr-interleavable? (: Bjostat.Reshape.Interleavable (-> ArrowType bool)))
   (clr-interleaved (: Bjostat.Reshape.Interleaved (-> (Array AnyColumn) int AnyColumn)))
@@ -265,11 +262,6 @@
   (clr-sorted-ids (: Bjostat.ReshapeOps.SortedIds (-> AnyColumn (Option (Tuple (Array int) int)))))
   (clr-dense-limit (: Bjostat.ReshapeOps.DenseLimit long #:get))
   (clr-level-count (: Bjostat.ReshapeOps.LevelCount (-> AnyColumn int)))
-  (clr-categorize (: Bjostat.Categories.Categorize (-> Table string (Array string) AnyColumn)
-                     #:exceptions (Bjostat.TableProblem)))
-  (clr-levels (: Bjostat.Categories.Levels (-> AnyColumn (Array string))))
-  (clr-codes (: Bjostat.Categories.Codes (-> AnyColumn AnyColumn)))
-  (clr-first-seen (: Bjostat.Categories.FirstSeen (-> AnyColumn AnyColumn)))
 
   ;; Files
   (file-open-read (: System.IO.File.OpenRead (-> string FileStream)))
@@ -329,9 +321,17 @@
   (binary-search (: System.Array.BinarySearch (-> (Array %a) %a int)))
   (slice-column (: Apache.Arrow.ArrowArrayFactory.Slice (-> AnyColumn int int AnyColumn)))
   (build-column (: Apache.Arrow.ArrowArrayFactory.BuildArray (-> ArrayDataOf AnyColumn)))
-  (level-bytes (: Bjostat.Categories.LevelBytes (-> Apache.Arrow.DictionaryArray int (RoSpan byte))))
   (category-type? (: Bjostat.Categories.IsType (-> ArrowType bool)))
-  (category-nulls (: Bjostat.Categories.Nulls (-> int AnyColumn)))
+  ;; For the numbering of strings
+  (read-u64 (: System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian (-> (RoSpan byte) ulong)))
+  (read-u32 (: System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian (-> (RoSpan byte) uint)))
+  (read-u64-big (: System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian (-> (RoSpan byte) ulong)))
+  (bytes-compare (: System.MemoryExtensions.SequenceCompareTo (-> (RoSpan %a) (RoSpan %a) int)))
+  (sort-ulongs! (: System.Array.Sort (-> (Array ulong) void)))
+  (category-dictionary-type (: Bjostat.Categories.Type #:get))
+  (install-numbering (: Bjostat.Categories.InstallNumbering
+                        (-> (-> StringColumn (Array (Array int))) (-> StringColumn (Array (Array int)))
+                            (-> StringColumn (Array int) (Array int)) void)))
   (column-array-data (: Apache.Arrow.IArrowArray.Data (-> AnyColumn ArrayDataOf) #:get))
   (array-data-type (: Apache.Arrow.ArrayData.DataType (-> ArrayDataOf ArrowType) #:get))
   (array-data-length (: Apache.Arrow.ArrayData.Length (-> ArrayDataOf int) #:get))
@@ -1582,6 +1582,736 @@
                (fun (from to) (complete-rows (row-columns-slice cols from to))))))
 
 ;; ===========================================================================
+;; Numbering strings
+;; ===========================================================================
+;;
+;; - The distinct strings of a column get numbers from 0, in the order of
+;;   their first rows. The id of a row is the number of its string.
+;; - The numbers are kept in an `IdTable`: open addressing over the hashes
+;;   of the strings.
+;; - A column of fewer than 2 * `id-part-rows` rows is numbered on this
+;;   thread. A longer one is numbered in parts on the compute threads, in
+;;   one of two ways, which `many-distinct?` chooses:
+;;   - Few distinct strings (`number-in-parts!`): each part numbers its rows
+;;     in a table of its own, and `merged` then numbers the parts' strings
+;;     for the column.
+;;   - Many (`number-by-hash!`): the rows are put in 256 buckets by hash, and
+;;     one table numbers each bucket, so each string is numbered once.
+;; - glue/Reshape.cs calls the numbering through Categories.StringIds,
+;;   SortedStringIds and InByteOrder, which this module installs when it is
+;;   initialized.
+
+;; The hash table of the distinct strings of a column.
+;; - `slots` holds an id or -1. Its length is `mask` + 1, a power of 2, at
+;;   least twice the number of ids.
+;; - `entries` holds four words for each id: the two words of the string's
+;;   key, its length and hash as (len << 32) | hash, and its first row.
+;; - A string of at most 16 bytes is all in its two words. A longer one is
+;;   also compared by the bytes between them.
+(type (: IdTable #:opaque
+         (Record (: slots (Array int) #:mutable)
+                 (: mask int #:mutable)
+                 (: count int #:mutable)
+                 (: entries (Array ulong) #:mutable))))
+
+(: (-> IdTable))
+(defun (id-table)
+  ;; 256 slots at first: two of a few strings then share a slot less often
+  ;; (4 strings: about 2 % of hashes against 9 % in 64 slots).
+  (def slots (: (make-array 256) (Array int)))
+  (array-fill! slots -1)
+  (IdTable (slots slots) (mask 255) (count 0) (entries (uninitialized-array 64))))
+
+;; The first word of the key of the string of `len` bytes at `start`: its
+;; first 8 bytes; with 4 to 7 bytes, its first 4 and last 4; with 1 to 3,
+;; its first, middle and last bytes.
+(: (-> (RoSpan byte) int int ulong))
+(defun (key-word0 bytes start len) #:inline
+  (cond
+    ((>= len 8) (read-u64 (ro-span-slice bytes #:from start)))
+    ((>= len 4)
+     (bitwise-ior (cast ulong (read-u32 (ro-span-slice bytes #:from start)))
+                  (shift-left (cast ulong (read-u32 (ro-span-slice bytes #:from (+ start (- len 4))))) 32)))
+    ((> len 0)
+     (bitwise-ior (cast ulong (ro-span-ref bytes start))
+                  (bitwise-ior (shift-left (cast ulong (ro-span-ref bytes (+ start (shift-right len 1)))) 8)
+                               (shift-left (cast ulong (ro-span-ref bytes (+ start (- len 1)))) 16))))
+    (else 0UL)))
+
+;; The second word of the key: the last 8 bytes, for a string of 8 bytes or
+;; more.
+(: (-> (RoSpan byte) int int ulong))
+(defun (key-word1 bytes start len) #:inline
+  (if (>= len 8) (read-u64 (ro-span-slice bytes #:from (+ start (- len 8)))) 0UL))
+
+;; The hash of a key: a multiply-xor of both words.
+;; - A product carries a change of a bit only to higher bits, and strings
+;;   such as "region-12345" differ in the high bytes of w1. So w1's product
+;;   is rotated before the words meet, and the sum is multiplied once more
+;;   after its high half is folded in.
+;; - The low bits pick the slot, and the top bits the bucket of
+;;   `number-by-hash!` and of `merged`: both depend on every byte.
+(: (-> ulong ulong int int))
+(defun (key-hash w0 w1 len) #:inline
+  (def m (* w1 0xBF58476D1CE4E5B9UL))
+  (def h (bitwise-xor (* (bitwise-xor w0 (cast ulong len)) 0x9E3779B97F4A7C15UL)
+                      (bitwise-ior (shift-left m 32) (shift-right m 32))))
+  (def h2 (* (bitwise-xor h (shift-right h 32)) 0x9E3779B97F4A7C15UL))
+  (cast int (bitwise-xor h2 (shift-right h2 32))))
+
+;; The length and the hash of a string, as `entries` keeps them.
+(: (-> int int ulong))
+(defun (len-hash len h) #:inline
+  (bitwise-ior (shift-left (cast ulong len) 32) (cast ulong (cast uint h))))
+
+;; Whether the bytes between the first 8 and the last 8 of two strings of
+;; `len` bytes, at `a` and `b`, are the same.
+(: (-> (RoSpan byte) int int int bool))
+(defun (same-middle? bytes a b len)
+  (bytes-equal? (ro-span-slice bytes #:from (+ a 8) #:to (+ a (- len 8)))
+                (ro-span-slice bytes #:from (+ b 8) #:to (+ b (- len 8)))))
+
+;; The id of the string of row `r`, of `len` bytes at `start`, whose key is
+;; `w0`, `w1` and `lh`. A new id, with `r` its first row, when the string is
+;; new.
+(: (-> IdTable (RoSpan int) (RoSpan byte) int int int ulong ulong ulong int))
+(defun (id-of! t offsets bytes r start len w0 w1 lh) #:inline
+  (def slots (record-ref t slots))
+  (def mask (record-ref t mask))
+  (def e (record-ref t entries))
+  (let probe ((i (bitwise-and (cast int lh) mask)))
+    (def id (array-ref slots i))
+    (def at (* 4 id))
+    (cond
+      ((< id 0) (insert-id! t i r w0 w1 lh))
+      ((and (= (array-ref e (+ at 2)) lh) (= (array-ref e at) w0) (= (array-ref e (+ at 1)) w1)
+            (or (<= len 16)
+                (same-middle? bytes (ro-span-ref offsets (cast int (array-ref e (+ at 3)))) start len)))
+       id)
+      (else (probe (bitwise-and (+ i 1) mask))))))
+
+;; A new id in slot `slot`. The slots are doubled when the ids fill half of
+;; them.
+(: (-> IdTable int int ulong ulong ulong int))
+(defun (insert-id! t slot r w0 w1 lh)
+  (def id (record-ref t count))
+  (def at (* 4 id))
+  (def old (record-ref t entries))
+  (def e (if (<= (+ at 4) (array-length old))
+             old
+             (let ()
+               (def grown (array-resize old (* 2 (array-length old))))
+               (record-set! t (entries grown))
+               grown)))
+  (array-set! e at w0)
+  (array-set! e (+ at 1) w1)
+  (array-set! e (+ at 2) lh)
+  (array-set! e (+ at 3) (cast ulong r))
+  (array-set! (record-ref t slots) slot id)
+  (record-set! t (count (+ id 1)))
+  (when (> (* 2 (+ id 1)) (record-ref t mask))
+    (grow-slots! t))
+  id)
+
+;; Twice the slots, and each id where its hash puts it.
+(: (-> IdTable void))
+(defun (grow-slots! t)
+  (def mask (+ (* 2 (record-ref t mask)) 1))
+  (def slots (: (make-array (+ mask 1)) (Array int)))
+  (array-fill! slots -1)
+  (def e (record-ref t entries))
+  (loop (:for k (range 0 (record-ref t count)))
+        (:do (let probe ((j (bitwise-and (cast int (array-ref e (+ (* 4 k) 2))) mask)))
+               (if (>= (array-ref slots j) 0)
+                   (probe (bitwise-and (+ j 1) mask))
+                   (array-set! slots j k)))))
+  (record-set! t (mask mask))
+  (record-set! t (slots slots)))
+
+;; The first row of each id of the table.
+(: (-> IdTable (Array int)))
+(defun (table-firsts t)
+  (def k (record-ref t count))
+  (def e (record-ref t entries))
+  (def firsts (: (uninitialized-array k) (Array int)))
+  (loop (:for i (range 0 k)) (:do (array-set! firsts i (cast int (array-ref e (+ (* 4 i) 3))))))
+  firsts)
+
+;; The id of row `r`, which is not null.
+(: (-> IdTable (RoSpan int) (RoSpan byte) int int))
+(defun (row-id! t offsets bytes r) #:inline
+  (def start (ro-span-ref offsets r))
+  (def len (- (ro-span-ref offsets (+ r 1)) start))
+  (def w0 (key-word0 bytes start len))
+  (def w1 (key-word1 bytes start len))
+  (id-of! t offsets bytes r start len w0 w1 (len-hash len (key-hash w0 w1 len))))
+
+;; Where the ids of a column are written: `ints`, or else `bytes` as ints.
+(: (-> (Array int) (Array byte) (Span int)))
+(defun (ids-span ints bytes)
+  (if (> (array-length ints) 0) (array->span ints) (span-> (array->span bytes))))
+
+;; Numbers the rows [from, to) of the column into the ids. A null row is
+;; left as it is.
+(: (-> IdTable StringColumn int int (Array int) (Array byte) void))
+(defun (number-part! t c from to ints bytes)
+  (def data (column-array-data (strings->any c)))
+  (def offsets (string-offsets data))
+  (def values (buffer-span (buffer-of data 2)))
+  (def valid (buffer-span (buffer-of data 0)))
+  (def offset (array-data-offset data))
+  (def nulls (> (string-column-null-count c) 0))
+  (def ids (ids-span ints bytes))
+  (loop (:for r (range from to))
+        (:when (or (not nulls) (bit-set? valid (+ offset r))))
+        (:do (span-set! ids r (row-id! t offsets values r)))))
+
+;; ids[r] = map[ids[r]] for the rows [from, to), and `null-id` at a null.
+(: (-> StringColumn (Array int) (Array byte) (Array int) int int int void))
+(defun (map-ids! c ints bytes map null-id from to)
+  (def data (column-array-data (strings->any c)))
+  (def valid (buffer-span (buffer-of data 0)))
+  (def offset (array-data-offset data))
+  (def nulls (> (string-column-null-count c) 0))
+  (def ids (ids-span ints bytes))
+  (loop (:for r (range from to))
+        (:do (span-set! ids r (if (and nulls (not (bit-set? valid (+ offset r))))
+                                  null-id
+                                  (array-ref map (span-ref ids r)))))))
+
+;; The fewest rows of a part when the strings of a column are numbered.
+(: int) (def id-part-rows 16384)
+
+;; The ids of the strings of the column into `ints`, or into `bytes` as ints
+;; when `ints` is empty. Returns the first row of each number.
+;; - `remap`, when there is one, is called with the first rows and returns a
+;;   new id for each number: the ids written are the new ones, and a null
+;;   gets `null-id`, or the number of strings when `null-id` is -1.
+;; - Without `remap`, a null is left as it is.
+(: (-> StringColumn (Array int) (Array byte) (Option (-> (Array int) (Array int))) int (Array int)))
+(defun (number-strings! c ints bytes remap null-id)
+  (def n (string-column-length c))
+  (def parts (if (< n (* 2 id-part-rows)) 1 (min (quotient n id-part-rows) (compute-thread-count))))
+  (cond
+    ((= n 0) (begin (match remap ((Some f) (ignore (f (make-array 0)))) (None unit)) (make-array 0)))
+    ((< parts 2) (number-one! c ints bytes remap null-id))
+    ((many-distinct? c) (number-by-hash! c ints bytes remap null-id parts))
+    (else (number-in-parts! c ints bytes remap null-id parts))))
+
+(: (-> int (Array int) int))
+(defun (null-id-of null-id firsts) (if (< null-id 0) (array-length firsts) null-id))
+
+(: (-> StringColumn (Array int) (Array byte) (Option (-> (Array int) (Array int))) int (Array int)))
+(defun (number-one! c ints bytes remap null-id)
+  (def t (id-table))
+  (def n (string-column-length c))
+  (number-part! t c 0 n ints bytes)
+  (def firsts (table-firsts t))
+  (match remap
+    ((Some f) (map-ids! c ints bytes (f firsts) (null-id-of null-id firsts) 0 n))
+    (None unit))
+  firsts)
+
+;; The rows that `many-distinct?` numbers, and the distinct strings among
+;; them above which a column is numbered by `number-by-hash!`. Measured on
+;; 1M rows and 23 parts:
+;; - 5 000 strings, 4 026 of them in the first 8 192 rows: in parts 4.5 ms,
+;;   by hash 4.9 to 5.1.
+;; - 20 000 strings, 5 192 in the first rows: in parts 10.7 to 11.6, by hash
+;;   6.8 to 7.2.
+;; Near the line the two cost about the same.
+(: int) (def sample-rows 8192)
+(: int) (def sample-distinct 4608)
+
+;; Whether the column has more than `sample-distinct` strings in its first
+;; `sample-rows` rows. Numbered 1024 rows at a time on this thread, so a
+;; column of many strings is decided early.
+(: (-> StringColumn bool))
+(defun (many-distinct? c)
+  (def t (id-table))
+  (def rows (min sample-rows (string-column-length c)))
+  (def ids (: (uninitialized-array rows) (Array int)))
+  (let go ((from 0))
+    (cond
+      ((>= from rows) #f)
+      (else
+       (number-part! t c from (min rows (+ from 1024)) ids (make-array 0))
+       (if (> (record-ref t count) sample-distinct) #t (go (+ from 1024)))))))
+
+;; Few distinct strings:
+;; - Each part numbers its rows on a compute thread.
+;; - `merged` numbers the parts' strings for the column, the parts in
+;;   order, so that the numbers are in the order of the first rows.
+;; - Each part's rows get those numbers, on the compute threads again.
+;; Each part's table has each string of the part, so with many distinct
+;; strings each is numbered once for each part and again in the merge.
+(: (-> StringColumn (Array int) (Array byte) (Option (-> (Array int) (Array int))) int int (Array int)))
+(defun (number-in-parts! c ints bytes remap null-id parts)
+  (def n (string-column-length c))
+  (def size (quotient (+ n (- parts 1)) parts))
+  (def tables
+    (vec->array (computing-each parts
+                                (fun (p)
+                                  (def t (id-table))
+                                  (number-part! t c (* p size) (min n (* (+ p 1) size)) ints bytes)
+                                  t))))
+  (def (Tuple maps firsts) (merged c tables))
+  (match remap
+    ((Some f)
+     (def level-of (f firsts))
+     (loop (:for map maps)
+           (:do (loop (:for k (range 0 (array-length map)))
+                      (:do (array-set! map k (array-ref level-of (array-ref map k))))))))
+    (None unit))
+  (def null-code (null-id-of null-id firsts))
+  (ignore (computing-each parts
+                          (fun (p)
+                            (map-ids! c ints bytes (array-ref maps p) null-code (* p size) (min n (* (+ p 1) size)))
+                            unit)))
+  firsts)
+
+;; The buckets of a merge of the parts' numbers, by the top 6 bits of a
+;; string's hash.
+(: int) (def merge-buckets 64)
+
+(: (-> ulong int))
+(defun (merge-bucket lh) (cast int (shift-right (cast uint lh) 26)))
+
+;; The numbers of a table's strings by `merge-bucket`: bucket after bucket,
+;; each in the table's order, and where each bucket starts.
+(: (-> IdTable (Tuple (Array int) (Array int))))
+(defun (by-merge-bucket t)
+  (def k (record-ref t count))
+  (def e (record-ref t entries))
+  (def starts (: (make-array (+ merge-buckets 1)) (Array int)))
+  (loop (:for i (range 0 k))
+        (:do (def b (+ (merge-bucket (array-ref e (+ (* 4 i) 2))) 1))
+             (array-set! starts b (+ (array-ref starts b) 1))))
+  (loop (:for b (range 0 merge-buckets))
+        (:do (array-set! starts (+ b 1) (+ (array-ref starts (+ b 1)) (array-ref starts b)))))
+  (def next (: (make-array (+ merge-buckets 1)) (Array int)))
+  (array-copy! starts 0 next 0 (+ merge-buckets 1))
+  (def order (: (uninitialized-array k) (Array int)))
+  (loop (:for i (range 0 k))
+        (:do (def b (merge-bucket (array-ref e (+ (* 4 i) 2))))
+             (def at (array-ref next b))
+             (array-set! next b (+ at 1))
+             (array-set! order at i)))
+  (Tuple order starts))
+
+;; The strings of part table `t` in [from, to) of `order` into the merged
+;; table `m`: map[k] is the number in `m` of the part's string k.
+(: (-> IdTable StringColumn IdTable (Array int) int int (Array int) void))
+(defun (merge-part-strings! m c t order from to map)
+  (def data (column-array-data (strings->any c)))
+  (def offsets (string-offsets data))
+  (def values (buffer-span (buffer-of data 2)))
+  (def e (record-ref t entries))
+  (loop (:for i (range from to))
+        (:do (def k (array-ref order i))
+             (def at (* 4 k))
+             (def lh (array-ref e (+ at 2)))
+             (def first (cast int (array-ref e (+ at 3))))
+             (array-set! map k (id-of! m offsets values first (ro-span-ref offsets first)
+                                       (cast int (shift-right lh 32)) (array-ref e at) (array-ref e (+ at 1)) lh)))))
+
+;; The number for the column of each part's string: maps[p][k] is that of
+;; string k of part p. Returns the maps and the first row of each number.
+;; Numbered so, the strings are in the order of their first rows.
+(: (-> StringColumn (Array IdTable) (Tuple (Array (Array int)) (Array int))))
+(defun (merged c tables)
+  (def parts (array-length tables))
+  (def maps (: {arraying (: (make-array (record-ref t count)) (Array int)) (:for t tables)} (Array (Array int))))
+  (def bucketed (vec->array (computing-each parts (fun (p) (by-merge-bucket (array-ref tables p))))))
+  ;; Each bucket's strings, in one table for the column, the parts in
+  ;; order, so a table's numbers are in the order of its first rows.
+  (def merged-tables
+    (vec->array (computing-each merge-buckets
+                                (fun (b)
+                                  (def m (id-table))
+                                  (loop (:for p (range 0 parts))
+                                        (:do (def (Tuple order starts) (array-ref bucketed p))
+                                             (merge-part-strings! m c (array-ref tables p) order
+                                                          (array-ref starts b) (array-ref starts (+ b 1))
+                                                          (array-ref maps p))))
+                                  m))))
+  ;; The strings of all buckets in the order of their first rows: that
+  ;; order gives their numbers. Each is (first row << 32) | (bucket << 24) | id.
+  (def count (loop (:for m merged-tables) (:acc s (folding 0 (+ s (record-ref m count))))))
+  (def packed (: (uninitialized-array count) (Array ulong)))
+  (let fill ((b 0) (i 0))
+    (when (< b merge-buckets)
+      (def m (array-ref merged-tables b))
+      (def e (record-ref m entries))
+      (def k (record-ref m count))
+      (loop (:for j (range 0 k))
+            (:do (array-set! packed (+ i j)
+                             (bitwise-ior (shift-left (array-ref e (+ (* 4 j) 3)) 32)
+                                          (cast ulong (bitwise-ior (shift-left b 24) j))))))
+      (fill (+ b 1) (+ i k))))
+  (sort-ulongs! packed)
+  (def number (: {arraying (: (make-array (record-ref m count)) (Array int)) (:for m merged-tables)} (Array (Array int))))
+  (def firsts (: (uninitialized-array count) (Array int)))
+  (loop (:for i (range 0 count))
+        (:do (def v (array-ref packed i))
+             (def place (cast int (bitwise-and v 0xFFFFFFFFUL)))
+             (array-set! (array-ref number (shift-right place 24)) (bitwise-and place 0xFFFFFF) i)
+             (array-set! firsts i (cast int (shift-right v 32)))))
+  (ignore (computing-each parts
+                          (fun (p)
+                            (def e (record-ref (array-ref tables p) entries))
+                            (def map (array-ref maps p))
+                            (loop (:for k (range 0 (array-length map)))
+                                  (:do (array-set! map k (array-ref (array-ref number (merge-bucket (array-ref e (+ (* 4 k) 2))))
+                                                                    (array-ref map k)))))
+                            unit)))
+  (Tuple maps firsts))
+
+;; The buckets of `number-by-hash!`, by the top 8 bits of a string's hash.
+(: int) (def hash-buckets 256)
+
+(: (-> int int))
+(defun (hash-bucket h) (cast int (shift-right (cast uint h) 24)))
+
+;; The hash of each valid row of [from, to) into `hashes`, and the number of
+;; those rows in each bucket into counts[at + bucket].
+(: (-> StringColumn int int (Array int) (Array int) int void))
+(defun (hash-rows! c from to hashes counts at)
+  (def data (column-array-data (strings->any c)))
+  (def offsets (string-offsets data))
+  (def values (buffer-span (buffer-of data 2)))
+  (def valid (buffer-span (buffer-of data 0)))
+  (def offset (array-data-offset data))
+  (def nulls (> (string-column-null-count c) 0))
+  (loop (:for r (range from to))
+        (:when (or (not nulls) (bit-set? valid (+ offset r))))
+        (:do (def start (ro-span-ref offsets r))
+             (def len (- (ro-span-ref offsets (+ r 1)) start))
+             (def h (key-hash (key-word0 values start len) (key-word1 values start len) len))
+             (def b (+ at (hash-bucket h)))
+             (array-set! hashes r h)
+             (array-set! counts b (+ (array-ref counts b) 1)))))
+
+;; The valid rows of [from, to), each at the next place of its bucket.
+(: (-> StringColumn int int (Array int) (Array int) (Array int) void))
+(defun (place-rows! c from to hashes next rows)
+  (def data (column-array-data (strings->any c)))
+  (def valid (buffer-span (buffer-of data 0)))
+  (def offset (array-data-offset data))
+  (def nulls (> (string-column-null-count c) 0))
+  (loop (:for r (range from to))
+        (:when (or (not nulls) (bit-set? valid (+ offset r))))
+        (:do (def b (hash-bucket (array-ref hashes r)))
+             (def at (array-ref next b))
+             (array-set! next b (+ at 1))
+             (array-set! rows at r))))
+
+;; The ids of rows[i] into local[i], for i in [from, to). The rows are valid.
+(: (-> IdTable StringColumn (Array int) (Array int) int int void))
+(defun (number-listed! t c rows local from to)
+  (def data (column-array-data (strings->any c)))
+  (def offsets (string-offsets data))
+  (def values (buffer-span (buffer-of data 2)))
+  (loop (:for i (range from to))
+        (:do (array-set! local i (row-id! t offsets values (array-ref rows i))))))
+
+;; Each part goes through its valid rows in order, with the next place of
+;; each bucket, which gives each row its id in its bucket's table:
+;; local[next[b]]. `part-firsts` counts the rows that are the first of their
+;; string.
+(: (-> StringColumn int int (Array int) (Array int) (Array int) (Array (Array ulong)) int))
+(defun (part-firsts c from to hashes next local entries)
+  (def data (column-array-data (strings->any c)))
+  (def valid (buffer-span (buffer-of data 0)))
+  (def offset (array-data-offset data))
+  (def nulls (> (string-column-null-count c) 0))
+  (loop (:for r (range from to))
+        (:when (or (not nulls) (bit-set? valid (+ offset r))))
+        (:acc count
+              (folding 0
+                       (let ()
+                         (def b (hash-bucket (array-ref hashes r)))
+                         (def at (array-ref next b))
+                         (array-set! next b (+ at 1))
+                         (def k (array-ref local at))
+                         (if (= (cast int (array-ref (array-ref entries b) (+ (* 4 k) 3))) r) (+ count 1) count))))))
+
+;; The number for the column of each string first seen in the part, from
+;; `first-number` on: number[b][k] for string k of bucket b, and its first
+;; row in `firsts`.
+(: (-> StringColumn int int (Array int) (Array int) (Array int) (Array (Array ulong)) (Array (Array int)) (Array int) int void))
+(defun (number-part-firsts! c from to hashes next local entries number firsts first-number)
+  (def data (column-array-data (strings->any c)))
+  (def valid (buffer-span (buffer-of data 0)))
+  (def offset (array-data-offset data))
+  (def nulls (> (string-column-null-count c) 0))
+  (let go ((r from) (i first-number))
+    (when (< r to)
+      (if (and nulls (not (bit-set? valid (+ offset r))))
+          (go (+ r 1) i)
+          (let ()
+            (def b (hash-bucket (array-ref hashes r)))
+            (def at (array-ref next b))
+            (array-set! next b (+ at 1))
+            (def k (array-ref local at))
+            (if (= (cast int (array-ref (array-ref entries b) (+ (* 4 k) 3))) r)
+                (begin
+                  (array-set! (array-ref number b) k i)
+                  (array-set! firsts i r)
+                  (go (+ r 1) (+ i 1)))
+                (go (+ r 1) i)))))))
+
+;; The id of each row of the part: the number of its string, and `null-id`
+;; at a null.
+(: (-> StringColumn int int (Array int) (Array int) (Array int) (Array (Array int)) int (Array int) (Array byte) void))
+(defun (write-part-ids! c from to hashes next local number null-id ints bytes)
+  (def data (column-array-data (strings->any c)))
+  (def valid (buffer-span (buffer-of data 0)))
+  (def offset (array-data-offset data))
+  (def nulls (> (string-column-null-count c) 0))
+  (def ids (ids-span ints bytes))
+  (loop (:for r (range from to))
+        (:do (if (and nulls (not (bit-set? valid (+ offset r))))
+                 (span-set! ids r null-id)
+                 (let ()
+                   (def b (hash-bucket (array-ref hashes r)))
+                   (def at (array-ref next b))
+                   (array-set! next b (+ at 1))
+                   (span-set! ids r (array-ref (array-ref number b) (array-ref local at))))))))
+
+;; Many distinct strings. Each string is numbered by one table, once, and no
+;; two threads write to the same rows of one array:
+;; - Each part hashes its rows and counts its rows in each bucket.
+;; - The rows are put bucket by bucket into one array, a bucket's rows part
+;;   by part, so in row order.
+;; - Each bucket's rows are numbered by a table of its own, into the
+;;   bucket's place in a second array: a table's numbers are in the order of
+;;   its strings' first rows.
+;; - Each part goes through its rows three times, with a place in each
+;;   bucket: to count its first rows, to give the strings their numbers for
+;;   the column (the parts before first), and to give each row the number of
+;;   its string.
+;; A row's id is not written by the bucket's thread: the rows of a bucket
+;; are spread over the column, so the threads would write to the same cache
+;; lines.
+(: (-> StringColumn (Array int) (Array byte) (Option (-> (Array int) (Array int))) int int (Array int)))
+(defun (number-by-hash! c ints bytes remap null-id parts)
+  (def n (string-column-length c))
+  (def size (quotient (+ n (- parts 1)) parts))
+  (: (-> int int))
+  (defun (part-end p) (min n (* (+ p 1) size)))
+  (def hashes (: (uninitialized-array n) (Array int)))
+  (def counts (: (make-array (* parts hash-buckets)) (Array int)))
+  (ignore (computing-each parts
+                          (fun (p) (hash-rows! c (* p size) (part-end p) hashes counts (* p hash-buckets)) unit)))
+  ;; Where each part's rows of each bucket start: bucket by bucket, and in
+  ;; a bucket part by part.
+  (def bucket-start (: (make-array (+ hash-buckets 1)) (Array int)))
+  (def place (: (make-array (* parts hash-buckets)) (Array int)))
+  (def total
+    (loop (:for b (range 0 hash-buckets))
+          (:acc at
+                (folding 0
+                         (let ()
+                           (array-set! bucket-start b at)
+                           (loop (:for p (range 0 parts))
+                                 (:acc a2
+                                       (folding at
+                                                (let ()
+                                                  (def i (+ (* p hash-buckets) b))
+                                                  (array-set! place i a2)
+                                                  (+ a2 (array-ref counts i)))))))))))
+  (array-set! bucket-start hash-buckets total)
+  (: (-> int (Array int)))
+  (defun (places-of p)
+    (def next (: (make-array hash-buckets) (Array int)))
+    (array-copy! place (* p hash-buckets) next 0 hash-buckets)
+    next)
+  (def rows (: (uninitialized-array total) (Array int)))
+  (ignore (computing-each parts
+                          (fun (p) (place-rows! c (* p size) (part-end p) hashes (places-of p) rows) unit)))
+  (def local (: (uninitialized-array total) (Array int)))
+  (def tables
+    (vec->array (computing-each hash-buckets
+                                (fun (b)
+                                  (def t (id-table))
+                                  (number-listed! t c rows local (array-ref bucket-start b) (array-ref bucket-start (+ b 1)))
+                                  t))))
+  (def entries (: {arraying (record-ref t entries) (:for t tables)} (Array (Array ulong))))
+  ;; The first rows of each part, and the number of the first of them.
+  (def in-part (vec->array (computing-each parts
+                                           (fun (p) (part-firsts c (* p size) (part-end p) hashes (places-of p) local entries)))))
+  (def before (: (make-array (+ parts 1)) (Array int)))
+  (loop (:for p (range 0 parts))
+        (:do (array-set! before (+ p 1) (+ (array-ref before p) (array-ref in-part p)))))
+  (def count (array-ref before parts))
+  ;; Each string's number for the column, and its first row.
+  (def number (: {arraying (: (make-array (record-ref t count)) (Array int)) (:for t tables)} (Array (Array int))))
+  (def firsts (: (uninitialized-array count) (Array int)))
+  (ignore (computing-each parts
+                          (fun (p)
+                            (number-part-firsts! c (* p size) (part-end p) hashes (places-of p) local entries
+                                                 number firsts (array-ref before p))
+                            unit)))
+  (match remap
+    ((Some f)
+     (def level-of (f firsts))
+     (ignore (computing-each hash-buckets
+                             (fun (b)
+                               (def map (array-ref number b))
+                               (loop (:for k (range 0 (array-length map)))
+                                     (:do (array-set! map k (array-ref level-of (array-ref map k)))))
+                               unit))))
+    (None unit))
+  (def null-code (null-id-of null-id firsts))
+  (ignore (computing-each parts
+                          (fun (p)
+                            (write-part-ids! c (* p size) (part-end p) hashes (places-of p) local number null-code ints bytes)
+                            unit)))
+  firsts)
+
+;; The id of each row's string, from 0 in the order of the strings' first
+;; rows, and the first row of each id. A null's id is 0.
+(: (-> StringColumn (Tuple (Array int) (Array int))))
+(defun (string-ids c)
+  (def n (string-column-length c))
+  (def ids (: (if (= (string-column-null-count c) 0) (uninitialized-array n) (make-array n)) (Array int)))
+  (def firsts (number-strings! c ids (make-array 0) None 0))
+  (Tuple ids firsts))
+
+;; The id of each row's string in the order of the strings' UTF-8 bytes,
+;; from 0, a null's after them all, and the first row of each string.
+(: (-> StringColumn (Tuple (Array int) (Array int))))
+(defun (sorted-string-ids c)
+  (def n (string-column-length c))
+  (def ids (: (uninitialized-array n) (Array int)))
+  (def firsts (number-strings! c ids (make-array 0)
+                               (Some (fun (firsts)
+                                       (def by-bytes (in-byte-order c firsts))
+                                       (def rank (: (uninitialized-array (array-length by-bytes)) (Array int)))
+                                       (loop (:for l (range 0 (array-length by-bytes)))
+                                             (:do (array-set! rank (array-ref by-bytes l) l)))
+                                       rank))
+                               -1))
+  (Tuple ids firsts))
+
+;; A string's first 16 bytes as two big-endian words, for the order of the
+;; bytes; its length; and its id.
+(type/derive (Eq Ord)
+  (: ByteKey (Struct (: p0 ulong) (: p1 ulong) (: len int) (: id int))))
+
+;; The bytes [at, at + 8) of the string of `len` bytes at `start`, as a
+;; big-endian word, with 0 for the bytes after its end.
+(: (-> (RoSpan byte) int int int ulong))
+(defun (prefix-word bytes start len at)
+  (def have (- len at))
+  (def from (+ start at))
+  (cond
+    ((<= have 0) 0UL)
+    ((>= have 8) (read-u64-big (ro-span-slice bytes #:from from)))
+    ((<= (+ from 8) (ro-span-length bytes))
+     (bitwise-and (read-u64-big (ro-span-slice bytes #:from from))
+                  (shift-left 0xFFFFFFFFFFFFFFFFUL (* 8 (- 8 have)))))
+    (else
+     (loop (:for i (range 0 have))
+           (:acc w (folding 0UL (bitwise-ior w (shift-left (cast ulong (ro-span-ref bytes (+ from i))) (- 56 (* 8 i))))))))))
+
+;; The key of each string at `firsts` into `keys`. Returns the most bytes of
+;; a string.
+(: (-> StringColumn (Array int) (Array ByteKey) int))
+(defun (byte-keys! c firsts keys)
+  (def data (column-array-data (strings->any c)))
+  (def offsets (string-offsets data))
+  (def values (buffer-span (buffer-of data 2)))
+  (loop (:for id (range 0 (array-length firsts)))
+        (:acc most
+              (folding 0
+                       (let ()
+                         (def r (array-ref firsts id))
+                         (def start (ro-span-ref offsets r))
+                         (def len (- (ro-span-ref offsets (+ r 1)) start))
+                         (array-set! keys id (ByteKey (p0 (prefix-word values start len 0))
+                                                      (p1 (prefix-word values start len 8))
+                                                      (len len) (id id)))
+                         (max most len))))))
+
+;; The order of two keys whose strings may be longer than 16 bytes: by the
+;; words, and then by all the bytes.
+(: (-> StringColumn (Array int) ByteKey ByteKey int))
+(defun (long-key-compare c firsts a b)
+  (def la (record-ref a len))
+  (def lb (record-ref b len))
+  (cond
+    ((not (= (record-ref a p0) (record-ref b p0))) (compare (record-ref a p0) (record-ref b p0)))
+    ((not (= (record-ref a p1) (record-ref b p1))) (compare (record-ref a p1) (record-ref b p1)))
+    ((and (<= la 16) (<= lb 16)) (compare la lb))
+    (else
+     (def data (column-array-data (strings->any c)))
+     (def offsets (string-offsets data))
+     (def values (buffer-span (buffer-of data 2)))
+     (def sa (ro-span-ref offsets (array-ref firsts (record-ref a id))))
+     (def sb (ro-span-ref offsets (array-ref firsts (record-ref b id))))
+     (bytes-compare (ro-span-slice values #:from sa #:to (+ sa la))
+                    (ro-span-slice values #:from sb #:to (+ sb lb))))))
+
+;; The ids of the strings whose first rows are `firsts`, in the order of the
+;; strings' UTF-8 bytes.
+;; - Each string's key is its first 16 bytes and its length.
+;; - With no string longer than 16 bytes, the keys alone give the order:
+;;   the ids are sorted by the length, then by bytes 9 to 16, then by bytes
+;;   1 to 8, each a pass of the radix sort, which is stable.
+;; - Else the keys are sorted by comparisons, and two keys that are the same
+;;   in the first 16 bytes are compared by all of their bytes.
+(: (-> StringColumn (Array int) (Array int)))
+(defun (in-byte-order c firsts)
+  (def k (array-length firsts))
+  (def keys (: (make-array k) (Array ByteKey)))
+  (def most (byte-keys! c firsts keys))
+  (def order (: (uninitialized-array k) (Array int)))
+  (cond
+    ((<= most 16)
+     (loop (:for i (range 0 k)) (:do (array-set! order i i)))
+     (def bits (: (uninitialized-array k) (Array ulong)))
+     (key-pass! keys order bits (fun (key) (cast ulong (record-ref key len))))
+     (key-pass! keys order bits (fun (key) (record-ref key p1)))
+     (key-pass! keys order bits (fun (key) (record-ref key p0))))
+    (else
+     (array-sort-by! (fun (a b) (long-key-compare c firsts a b)) keys)
+     (loop (:for i (range 0 k)) (:do (array-set! order i (record-ref (array-ref keys i) id))))))
+  order)
+
+;; One stable pass of `in-byte-order`: `order` in the order of a word of
+;; the keys, on this thread.
+(: (-> (Array ByteKey) (Array int) (Array ulong) (-> ByteKey ulong) void))
+(defun (key-pass! keys order bits word)
+  (def k (array-length order))
+  (when (>= k 2)
+    (def first (word (array-ref keys (array-ref order 0))))
+    (def diff
+      (loop (:for i (range 0 k))
+            (:acc d (folding 0UL
+                             (let ()
+                               (def w (word (array-ref keys (array-ref order i))))
+                               (array-set! bits i w)
+                               (bitwise-ior d (bitwise-xor w first)))))))
+    (when (not (= diff 0UL))
+      (radix-sort-one! bits k order diff))))
+
+;; For glue/Reshape.cs: the ids and the first rows, as two arrays.
+(: (-> StringColumn (Array (Array int))))
+(defun (glue-string-ids c)
+  (def (Tuple ids firsts) (string-ids c))
+  #[ids firsts])
+
+(: (-> StringColumn (Array (Array int))))
+(defun (glue-sorted-string-ids c)
+  (def (Tuple ids firsts) (sorted-string-ids c))
+  #[ids firsts])
+
+(def _numbering
+  (begin (install-numbering glue-string-ids glue-sorted-string-ids in-byte-order) #t))
+
+;; ===========================================================================
 ;; Sorting: the order of the rows
 ;; ===========================================================================
 ;;
@@ -1709,7 +2439,7 @@
 
 ;; Whether bit `i` of a bitmap is set.
 (: (-> (RoSpan byte) int bool))
-(defun (bit-set? bits i)
+(defun (bit-set? bits i) #:inline
   (not (= 0 (bitwise-and (cast int (ro-span-ref bits (shift-right i 3))) (shift-left 1 (bitwise-and i 7))))))
 
 ;; The keys of all of `order`, in parts on the compute threads when there
@@ -1838,14 +2568,14 @@
   (def known (> (array-length known-ids) 0))
   (if (and (not nulls) (not mapped) (not known))
       (begin
-        (def ranks (clr-sorted-string-ids c))
+        (def (Tuple ranks _) (sorted-string-ids c))
         (def bits (: (uninitialized-array n) (Array ulong)))
         (def first (bitwise-xor (cast ulong (cast uint (array-ref ranks (array-ref order 0)))) mask))
         (def diff (keys-in-parts n (fun (from to) (rank-keys! ranks order bits mask first from to))))
         (radix-sort! bits n order diff))
       (begin
-        (def (Tuple ids firsts) (if known (Tuple known-ids known-firsts) (clr-string-ids c)))
-        (def by-bytes (clr-in-byte-order c firsts))
+        (def (Tuple ids firsts) (if known (Tuple known-ids known-firsts) (string-ids c)))
+        (def by-bytes (in-byte-order c firsts))
         (def rank (: (uninitialized-array (array-length by-bytes)) (Array int)))
         (loop (:for i (range 0 (array-length by-bytes))) (:do (array-set! rank (array-ref by-bytes i) i)))
         (def data (column-array-data (strings->any c)))
@@ -2629,7 +3359,13 @@
      (def y (as-dictionary b))
      (if (same-object? (cast System.Object (dictionary-levels x)) (cast System.Object (dictionary-levels y)))
          (column-cells-equal (category-codes-of a) (category-codes-of b))
-         (fun (i j) (bytes-equal? (level-bytes x i) (level-bytes y j)))))
+         (let ()
+           (def xl (levels-of a))
+           (def yl (levels-of b))
+           (def xc (category-codes-of a))
+           (def yc (category-codes-of b))
+           (fun (i j) (bytes-equal? (string-column-bytes xl (ro-span-ref (column-values xc) i))
+                                    (string-column-bytes yl (ro-span-ref (column-values yc) j)))))))
     (_ (not-a-key a))))
 
 (: (-> AnyColumn (Column short)))
@@ -3632,10 +4368,10 @@
      (refuse (str "'" names-from "' has a null in row " (int->string r) ", and a column needs a name.")))
     (strings?
      (def s (as-strings name-col))
-     (def (Tuple col-of firsts) (clr-string-ids s))
+     (def (Tuple col-of firsts) (string-ids s))
      (Ok (Tuple col-of {arraying (match (string-column-ref s r) ((Some x) x) (None ""))
                                  (:for r firsts)})))
-    (else (Ok (category-columns (column-values (as-ints (clr-codes name-col))) (clr-levels name-col) n)))))
+    (else (Ok (category-columns (column-values (as-ints (category-code-column name-col))) (category-level-strings name-col) n)))))
 
 ;; Of a category: a new column for each code, in the order the codes first
 ;; come.
@@ -3988,7 +4724,7 @@
 (defun (count-category t col cat name n)
   (def levels (clr-level-count cat))
   (def slots (if (= (any-null-count cat) 0) levels (+ levels 1)))
-  (def cells (clr-cells-of-column (as-ints (clr-codes cat))))
+  (def cells (clr-cells-of-column (as-ints (category-code-column cat))))
   (def counts (: (make-array slots) (Array int)))
   (def firsts (: (make-array slots #:fill int-max) (Array int)))
   (if (and (>= n (* 2 count-part-rows)) (<= slots count-parts-limit))
@@ -4218,6 +4954,175 @@
 ;;
 ;; A sort of a category is in the order of its levels, as in R.
 
+;; ---------------------------------------------------------------------------
+;; Making categories
+;;
+;; A category is always a dictionary of int codes and string levels, of the
+;; type Categories.Type. The order of the levels is the order of a sort: the
+;; levels given, or the strings in the order of their code points.
+
+;; A category of `n` rows: the codes' buffer, the validity bitmap from row 0
+;; and the levels.
+(: (-> ArrowBuffer ArrowBuffer int int StringColumn AnyColumn))
+(defun (make-category codes validity nulls n levels)
+  (build-column (ArrayDataOf. (cast ArrowType category-dictionary-type) n nulls 0 #[validity codes]
+                              (: (clr-default) (Array ArrayDataOf)) (column-array-data (strings->any levels)))))
+
+;; A category of n nulls, with no levels.
+(: (-> int AnyColumn))
+(defun (category-nulls n)
+  (make-category (ArrowBuffer. (Rom. (: (make-array (* n 4)) (Array byte))))
+                 (ArrowBuffer. (Rom. (: (make-array (quotient (+ n 7) 8)) (Array byte))))
+                 n n (array->string-column (: (make-array 0) (Array string)))))
+
+;; The validity bitmap of the column from row 0: empty with no nulls, the
+;; column's own at offset 0, and else a copy.
+(: (-> AnyColumn ArrowBuffer))
+(defun (validity-from-0 a)
+  (def data (column-array-data a))
+  (def offset (array-data-offset data))
+  (cond
+    ((= (any-null-count a) 0) empty-buffer)
+    ((and (= offset 0) (not (buffer-empty? (buffer-of data 0)))) (buffer-of data 0))
+    (else
+     (def n (any-length a))
+     (def bits (: (make-array (quotient (+ n 7) 8)) (Array byte)))
+     (copy-valid-bits! bits (buffer-span (buffer-of data 0)) offset n)
+     (ArrowBuffer. (Rom. bits)))))
+
+(: (-> (Array byte) (RoSpan byte) int int void))
+(defun (copy-valid-bits! bits valid offset n)
+  (loop (:for r (range 0 n))
+        (:when (bit-set? valid (+ offset r)))
+        (:do (set-bit! bits r))))
+
+;; The strings at the rows, which are not null, as a column without nulls.
+(: (-> StringColumn (Array int) StringColumn))
+(defun (strings-at s rows)
+  (as-strings (build-column (taken-strings (column-array-data (strings->any s)) rows 0 (array-length rows)
+                                           0 empty-buffer))))
+
+;; The levels of a category, in order: level `i` has code `i`.
+(: (-> AnyColumn (Array string)))
+(defun (category-level-strings c)
+  (def levels (levels-of c))
+  (def n (string-column-length levels))
+  (def out (: (make-array n) (Array string)))
+  (loop (:for i (range 0 n)) (:do (array-set! out i (utf-8->string (string-column-bytes levels i)))))
+  out)
+
+;; The codes of a category: a column of ints, with its nulls.
+(: (-> AnyColumn AnyColumn))
+(defun (category-code-column c) (dictionary-codes (as-dictionary c)))
+
+;; The strings of a category, as a column of strings.
+(: (-> AnyColumn StringColumn))
+(defun (category-strings a)
+  (def levels (category-level-strings a))
+  (def codes (category-codes-of a))
+  (def n (column-length codes))
+  (def strs (: (make-array n) (Array string)))
+  (def valid (: (make-array n) (Array bool)))
+  (loop (:for r (range 0 n))
+        (:do (when (column-valid? codes r)
+               (array-set! valid r #t)
+               (array-set! strs r (array-ref levels (ro-span-ref (column-values codes) r))))))
+  (array->string-column strs #:valid valid))
+
+;; The strings of a column as a category whose levels are the distinct
+;; strings in the order of their first rows, not sorted. The code of a row is
+;; the id of its string, from `number-strings!`. A null stays a null.
+(: (-> AnyColumn AnyColumn))
+(defun (first-seen a)
+  (def s (as-strings a))
+  (def n (string-column-length s))
+  (def nulls (string-column-null-count s))
+  (def codes (: (if (= nulls 0) (uninitialized-array (* n 4)) (make-array (* n 4))) (Array byte)))
+  (def firsts (number-strings! s (make-array 0) codes None 0))
+  (make-category (ArrowBuffer. (Rom. codes)) (validity-from-0 a) nulls n (strings-at s firsts)))
+
+;; The level of each id, for levels given. A string that is not a level sets
+;; problem[0] to the message.
+(: (-> StringColumn (Array int) (MutableMap string int) string (Array (Option string)) (Array int)))
+(defun (given-levels s firsts index name problem)
+  (def level-of (: (make-array (array-length firsts)) (Array int)))
+  (let go ((id 0))
+    (when (< id (array-length firsts))
+      (def row (array-ref firsts id))
+      (def text (utf-8->string (string-column-bytes s row)))
+      (def l (mutablemap-ref-or index text -1))
+      (if (< l 0)
+          (array-set! problem 0 (Some (str "'" text "' in row " (int->string row) " of '" name
+                                           "' is not one of the levels.")))
+          (begin
+            (array-set! level-of id l)
+            (go (+ id 1))))))
+  level-of)
+
+;; The category of the strings. Each distinct string is found once, and its
+;; code is then that of each row with it.
+;; - No levels given: the levels are the strings in the order of their bytes.
+;; - Levels given: `index` has the level of each, and a string that is not
+;;   one of them is an Err.
+(: (-> StringColumn (Vec string) (MutableMap string int) string (Result TableError AnyColumn)))
+(defun (from-strings s given index name)
+  (def n (string-column-length s))
+  (def nulls (string-column-null-count s))
+  (def codes (: (if (= nulls 0) (uninitialized-array (* n 4)) (make-array (* n 4))) (Array byte)))
+  (def problem (: (make-array 1 #:fill None) (Array (Option string))))
+  ;; With no levels given: the first row of each level.
+  (def level-rows (: (make-array 1 #:fill (make-array 0)) (Array (Array int))))
+  (: (-> (Array int) (Array int)))
+  (defun (level-of firsts)
+    (if (> (vec-length given) 0)
+        (given-levels s firsts index name problem)
+        (let ()
+          (def by-bytes (in-byte-order s firsts))
+          (def k (array-length by-bytes))
+          (def levels (: (uninitialized-array k) (Array int)))
+          (def rows (: (uninitialized-array k) (Array int)))
+          (loop (:for l (range 0 k))
+                (:do (def id (array-ref by-bytes l))
+                     (array-set! levels id l)
+                     (array-set! rows l (array-ref firsts id))))
+          (array-set! level-rows 0 rows)
+          levels)))
+  (ignore (number-strings! s (make-array 0) codes (Some level-of) 0))
+  (match (array-ref problem 0)
+    ((Some m) (refuse m))
+    (None
+     (Ok (make-category (ArrowBuffer. (Rom. codes)) (validity-from-0 (strings->any s)) nulls n
+                        (if (> (vec-length given) 0)
+                            (array->string-column (vec->array given))
+                            (strings-at s (array-ref level-rows 0))))))))
+
+;; The column `name` of the table as a category, which `table-categorize`
+;; puts in the table in its place. A category is given new levels from its
+;; strings.
+(: (-> Table string (Vec string) (Result TableError AnyColumn)))
+(defun (categorized t name levels)
+  (def (Ok a) (find-column t name) :propagate)
+  (def index (: (mutablemap-with-capacity (vec-length levels)) (MutableMap string int)))
+  (def twice
+    (loop (:for l (range 0 (vec-length levels)))
+          (:acc dup (folding #f
+                             (let ()
+                               (def s (vec-ref levels l))
+                               (if (>= (mutablemap-ref-or index s -1) 0)
+                                   #t
+                                   (begin (mutablemap-set! index s l) dup)))))))
+  (cond
+    (twice (refuse "a level is given twice."))
+    (else
+     (match a
+       ((:is Apache.Arrow.StringArray s) (from-strings s levels index name))
+       (_ (cond
+            ((not (category? a))
+             (refuse (str "'" name "' is a column of " (clr-arrow-name (data-type (clr-data a)))
+                          "; a category is made of strings.")))
+            ((= (vec-length levels) 0) (Ok a))
+            (else (from-strings (category-strings a) levels index name))))))))
+
 ;; The table with the column `name` a category. With no `#:levels`, the
 ;; levels are its distinct strings in the order of their code points, as R's
 ;; factor gives them; with `#:levels`, they are those, in that order, and a
@@ -4227,9 +5132,8 @@
 ;;     (table-categorize t "size" #:levels ["small" "medium" "large"])
 (: (-> Table string (#:levels (Vec string)) (Result TableError Table)))
 (defun (table-categorize t name #:levels [])
-  (match (clr-categorize t name (vec->array levels))
-    ((Ok c) (Ok (with-column t name c)))
-    ((Err e) (refuse (.-Message e)))))
+  (def (Ok c) (categorized t name levels) :propagate)
+  (Ok (with-column t name c)))
 
 (: (-> Table string (Result TableError AnyColumn)))
 (defun (find-category t name)
@@ -4242,7 +5146,7 @@
 (: (-> Table string (Result TableError (Vec string))))
 (defun (category-levels t name)
   (def (Ok c) (find-category t name) :propagate)
-  (Ok (array->vec (clr-levels c))))
+  (Ok (array->vec (category-level-strings c))))
 
 ;; The codes of the category `name`, as cells of ints, None at a null. A loop
 ;; over them reads ints from one span, which Bjolang can vectorize.
@@ -4253,7 +5157,7 @@
 
 (: (-> AnyColumn string (Result TableError (Cells int))))
 (defun (codes-of c name)
-  (match (clr-cells-of (clr-codes c))
+  (match (clr-cells-of (category-code-column c))
     ((Some cells) (Ok (Cells (clr cells))))
     (None (refuse (str "the codes of '" name "' are not ints.")))))
 
@@ -4266,9 +5170,9 @@
   (def (Ok c) (find-column t name) :propagate)
   (match (type-of-column c)
     (String
-     (def numbered (clr-first-seen c))
+     (def numbered (first-seen c))
      (def (Ok codes) (codes-of numbered name) :propagate)
-     (Ok (Tuple (array->vec (clr-levels numbered)) codes)))
+     (Ok (Tuple (array->vec (category-level-strings numbered)) codes)))
     (Category (refuse (str "'" name "' is a category: its groups are category-groups, and the group of a row category-codes.")))
     (other (refuse (str "'" name "' is a column of " (type-text other) ", not of strings.")))))
 
