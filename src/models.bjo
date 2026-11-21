@@ -100,8 +100,8 @@
 
 ;; Puts v at place j of the row, and adds its square to the column's sum of
 ;; squares, as the row is filled.
-(: (-> Regression int double void))
-(defun (regression-set! m j v) #:inline
+(: (-> Regression int double void) #:inline)
+(defun (regression-set! m j v)
   (array-set! (record-ref m row) j v)
   (def squares (record-ref m column-squares))
   (array-set! squares j (+ (array-ref squares j) (* v v))))
@@ -350,29 +350,29 @@
 
 ;; The mean of the linear predictor: the logistic of the binomial, exp of the
 ;; Poisson.
-(: (-> Glm double double))
-(defun (glm-mean m eta) #:inline
+(: (-> Glm double double) #:inline)
+(defun (glm-mean m eta)
   (if (= (record-ref m family) 0) (/ 1.0 (+ 1.0 (exp (- eta)))) (exp eta)))
 
 ;; dμ/dη: μ(1 - μ) of the logit, μ of the log. Kept from 0, as R's
 ;; binomial()$mu.eta keeps it above the machine epsilon.
-(: (-> Glm double double))
-(defun (glm-slope m mu) #:inline
+(: (-> Glm double double) #:inline)
+(defun (glm-slope m mu)
   (dmax (if (= (record-ref m family) 0) (* mu (- 1.0 mu)) mu) machine-epsilon))
 
 ;; a ln(a / b), and 0 for an a of 0.
-(: (-> double double double))
-(defun (y-log a b) #:inline (if (= a 0.0) 0.0 (* a (loge (/ a b)))))
+(: (-> double double double) #:inline)
+(defun (y-log a b) (if (= a 0.0) 0.0 (* a (loge (/ a b)))))
 
 ;; The deviance of one row, 2 (ln L(saturated) - ln L(μ)).
-(: (-> Glm double double double))
-(defun (unit-deviance m y mu) #:inline
+(: (-> Glm double double double) #:inline)
+(defun (unit-deviance m y mu)
   (if (= (record-ref m family) 0)
       (* 2.0 (+ (y-log y mu) (y-log (- 1.0 y) (- 1.0 mu))))
       (* 2.0 (- (y-log y mu) (- y mu)))))
 
-(: (-> Glm double double double))
-(defun (row-log-likelihood m y mu) #:inline
+(: (-> Glm double double double) #:inline)
+(defun (row-log-likelihood m y mu)
   (if (= (record-ref m family) 0)
       (+ (if (= y 0.0) 0.0 (* y (loge mu))) (if (= y 1.0) 0.0 (* (- 1.0 y) (loge (- 1.0 mu)))))
       (- (- (if (= y 0.0) 0.0 (* y (loge mu))) mu) (log-gamma (+ y 1.0)))))

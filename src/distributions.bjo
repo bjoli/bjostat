@@ -156,8 +156,8 @@
         (- (- (+ (* a (- (log1p d) d)) (* 0.5 (loge a))) log-root-2-pi) (stirling-rest a)))))
 
 ;; v, or `tiny` when it is nearer to 0: Lentz's method divides by it.
-(: (-> double double))
-(defun (not-tiny v) #:inline (if (< (dabs v) tiny) tiny v))
+(: (-> double double) #:inline)
+(defun (not-tiny v) (if (< (dabs v) tiny) tiny v))
 
 ;; The series of P(a, x).
 (: (-> double double double))

@@ -488,8 +488,8 @@
 
 ;; Whether two doubles are equal as C#'s == says: NaN is equal to nothing.
 ;; Bjolang's = of doubles is Equals, where NaN is equal to NaN.
-(: (-> double double bool))
-(defun (same? a b) #:inline (and (<= a b) (>= a b)))
+(: (-> double double bool) #:inline)
+(defun (same? a b) (and (<= a b) (>= a b)))
 
 ;; The ranks of the values, ties given the mean of their ranks, and the sum
 ;; of t³ - t over the groups of t tied values.

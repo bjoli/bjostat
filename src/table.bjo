@@ -1625,8 +1625,8 @@
 ;; The first word of the key of the string of `len` bytes at `start`: its
 ;; first 8 bytes; with 4 to 7 bytes, its first 4 and last 4; with 1 to 3,
 ;; its first, middle and last bytes.
-(: (-> (RoSpan byte) int int ulong))
-(defun (key-word0 bytes start len) #:inline
+(: (-> (RoSpan byte) int int ulong) #:inline)
+(defun (key-word0 bytes start len)
   (cond
     ((>= len 8) (read-u64 (ro-span-slice bytes #:from start)))
     ((>= len 4)
@@ -1640,8 +1640,8 @@
 
 ;; The second word of the key: the last 8 bytes, for a string of 8 bytes or
 ;; more.
-(: (-> (RoSpan byte) int int ulong))
-(defun (key-word1 bytes start len) #:inline
+(: (-> (RoSpan byte) int int ulong) #:inline)
+(defun (key-word1 bytes start len)
   (if (>= len 8) (read-u64 (ro-span-slice bytes #:from (+ start (- len 8)))) 0UL))
 
 ;; The hash of a key: a multiply-xor of both words.
@@ -1651,8 +1651,8 @@
 ;;   after its high half is folded in.
 ;; - The low bits pick the slot, and the top bits the bucket of
 ;;   `number-by-hash!` and of `merged`: both depend on every byte.
-(: (-> ulong ulong int int))
-(defun (key-hash w0 w1 len) #:inline
+(: (-> ulong ulong int int) #:inline)
+(defun (key-hash w0 w1 len)
   (def m (* w1 0xBF58476D1CE4E5B9UL))
   (def h (bitwise-xor (* (bitwise-xor w0 (cast ulong len)) 0x9E3779B97F4A7C15UL)
                       (bitwise-ior (shift-left m 32) (shift-right m 32))))
@@ -1660,8 +1660,8 @@
   (cast int (bitwise-xor h2 (shift-right h2 32))))
 
 ;; The length and the hash of a string, as `entries` keeps them.
-(: (-> int int ulong))
-(defun (len-hash len h) #:inline
+(: (-> int int ulong) #:inline)
+(defun (len-hash len h)
   (bitwise-ior (shift-left (cast ulong len) 32) (cast ulong (cast uint h))))
 
 ;; Whether the bytes between the first 8 and the last 8 of two strings of
@@ -1674,8 +1674,8 @@
 ;; The id of the string of row `r`, of `len` bytes at `start`, whose key is
 ;; `w0`, `w1` and `lh`. A new id, with `r` its first row, when the string is
 ;; new.
-(: (-> IdTable (RoSpan int) (RoSpan byte) int int int ulong ulong ulong int))
-(defun (id-of! t offsets bytes r start len w0 w1 lh) #:inline
+(: (-> IdTable (RoSpan int) (RoSpan byte) int int int ulong ulong ulong int) #:inline)
+(defun (id-of! t offsets bytes r start len w0 w1 lh)
   (def slots (record-ref t slots))
   (def mask (record-ref t mask))
   (def e (record-ref t entries))
@@ -1738,8 +1738,8 @@
   firsts)
 
 ;; The id of row `r`, which is not null.
-(: (-> IdTable (RoSpan int) (RoSpan byte) int int))
-(defun (row-id! t offsets bytes r) #:inline
+(: (-> IdTable (RoSpan int) (RoSpan byte) int int) #:inline)
+(defun (row-id! t offsets bytes r)
   (def start (ro-span-ref offsets r))
   (def len (- (ro-span-ref offsets (+ r 1)) start))
   (def w0 (key-word0 bytes start len))
@@ -2438,8 +2438,8 @@
 (defun (direction-mask descending) (if descending 0xFFFFFFFFFFFFFFFFUL 0UL))
 
 ;; Whether bit `i` of a bitmap is set.
-(: (-> (RoSpan byte) int bool))
-(defun (bit-set? bits i) #:inline
+(: (-> (RoSpan byte) int bool) #:inline)
+(defun (bit-set? bits i)
   (not (= 0 (bitwise-and (cast int (ro-span-ref bits (shift-right i 3))) (shift-left 1 (bitwise-and i 7))))))
 
 ;; The keys of all of `order`, in parts on the compute threads when there
