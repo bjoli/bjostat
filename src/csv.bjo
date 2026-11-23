@@ -390,8 +390,8 @@
         (cond
           ((or (= step step-bad) (= step step-end)) None)
           (else
-           (transientvec-add! names (bytes->string (if (record-ref f copied?) (record-ref unq bytes) b)
-                                                   #:start (record-ref f from) #:end (record-ref f to)))
+           (transientvec-add! names (bytes->string/lossy (if (record-ref f copied?) (record-ref unq bytes) b)
+                                                         #:start (record-ref f from) #:end (record-ref f to)))
            (if (= step step-row-end)
                (Some (vec->array (transientvec->vec names)))
                (go (record-ref f next))))))))

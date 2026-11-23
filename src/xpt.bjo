@@ -270,10 +270,10 @@
         e)))
 
 ;; The Latin-1 text of `n` bytes from `from`, blanks and zeros after it
-;; dropped.
+;; dropped. Every byte is a Latin-1 character, so it never fails.
 (: (-> (Array byte) int int string))
 (defun (latin-1 b from n)
-  (bytes->string b #:encoding clr-latin-1 #:start from #:end (text-end b from (+ from n))))
+  (bytes->string/lossy b #:encoding clr-latin-1 #:start from #:end (text-end b from (+ from n))))
 
 ;; A big-endian short, and an int.
 (: (-> (Array byte) int int))
