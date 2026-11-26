@@ -112,10 +112,10 @@
   (def pairs-by-hand
     (loop (:for x* c) (:for y* d) (:when-let (Some x) x*) (:when-let (Some y) y*) (:acc (listing (Tuple x y)))))
   (def triples-by-hand
-    (loop (:for x* c) (:for y* d) (:for z* e) (:when-let (Some x) x*) (:when-let (Some y) y*) (:when-let (Some _z) z*)
+    (loop (:for x* c) (:for y* d) (:for z* e) (:when-let (Some x) x*) (:when-let (Some y) y*) (:when-let (Some _) z*)
           (:acc (listing x))))
   (def short-by-hand
-    (loop (:for x* c) (:for y* short) (:when-let (Some x) x*) (:when-let (Some _y) y*) (:acc (listing x))))
+    (loop (:for x* c) (:for y* short) (:when-let (Some x) x*) (:when-let (Some _) y*) (:acc (listing x))))
   (and (= (loop (:for x (skip-nulls c)) (:acc (listing x))) (values-by-hand c))
        (= (count (skip-nulls c)) (list-length (values-by-hand c)))
        (= (loop (:for p (complete-rows (Tuple c d))) (:acc (listing p))) pairs-by-hand)
@@ -332,11 +332,11 @@
             (def d (: (ok (column-as t3 "d")) (Cells int)))
             (Tuple (loop (:for (Tuple x y) (complete-rows (Tuple a b))) (:acc (listing (str (displayed x) y))))
                    (loop (:for (Tuple x y z) (complete-rows (Tuple a b c))) (:acc (listing (str (displayed x) y (displayed z)))))
-                   (loop (:for (Tuple _x _y _z w) (complete-rows (Tuple a b c d))) (:acc (listing w)))
-                   (loop (:for (Tuple _z w) (complete-rows (Tuple c d))) (:acc (listing w)))))
+                   (loop (:for (Tuple _ _ _ w) (complete-rows (Tuple a b c d))) (:acc (listing w)))
+                   (loop (:for (Tuple _ w) (complete-rows (Tuple c d))) (:acc (listing w)))))
           (Tuple (list "1v" "4y" "5z") (list "1v0.5" "5z4.5") (list 10 50) (list 10 20 30 50)))
   (expect "complete-rows: no complete row"
-          (loop (:for (Tuple p _r) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2 3 4]) #:valid (vec->array [#f #f #f #f])))])) "n")) (Cells int)))))
+          (loop (:for (Tuple p _) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2 3 4]) #:valid (vec->array [#f #f #f #f])))])) "n")) (Cells int)))))
                 (:acc (counting p)))
           0)
   (expect "skip-nulls and complete-rows give the rows of the loop with :when-let, for each kind of nulls, length and start of a slice"
@@ -394,7 +394,7 @@
                (vec-map (fun (name) (column-nulls t name)) ["l" "s" "b"])))
           #t)
   (expect "complete-rows: columns of two lengths give the rows of the shorter"
-          (loop (:for (Tuple _p r) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2])))])) "n")) (Cells int)))))
+          (loop (:for (Tuple _ r) (complete-rows (Tuple price-cells (: (ok (column-as (ok (make-table [(named "n" (array->column (vec->array [1 2])))])) "n")) (Cells int)))))
                 (:acc (listing r)))
           (list 1 2))
 

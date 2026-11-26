@@ -523,7 +523,7 @@
   (def top (* k (- n k)))
   ;; ways j s: the subsets of size j of the elements so far whose sum, less
   ;; 0 + 1 + ... + (j - 1), is s.
-  (def ways {arraying (make-array (+ top 1) #:fill 0.0) (:for _j (range 0 (+ k 1)))})
+  (def ways {arraying (make-array (+ top 1) #:fill 0.0) (:for _ (range 0 (+ k 1)))})
   (array-set! (array-ref ways 0) 0 1.0)
   (loop (:for e (range 0 n))
         (:do (loop (:for j (down-from (min k (+ e 1)) #:to 1))

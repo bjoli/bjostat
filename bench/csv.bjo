@@ -38,7 +38,7 @@
                        (int->string (+ 1 (% i 40))) ","
                        (if (= (% i 3) 0) (str "item " (int->string i)) "")
                        "\n"))))
-  (file-write-text path (stringbuilder->string sb))
+  (raise-err (file-write-text path (stringbuilder->string sb)))
   path)
 
 (: string)

@@ -102,13 +102,13 @@
           (string-starts-with? (error-of (read-xpt "tests/data/none.xpt")) "tests/data/none.xpt: ")
           #t)
   (def csv-path (path-combine (temp-dir) "bjostat-test-not.xpt"))
-  (file-write-text csv-path "a,b\n1,2\n")
+  (raise-err (file-write-text csv-path "a,b\n1,2\n"))
   (expect "a file of another format"
           (string-ends-with? (error-of (read-xpt csv-path))
                              "is not a SAS transport file of version 5: it does not start with the library header. A file of SAS's CPORT, or a .sas7bdat, is another format.")
           #t)
   (def v8-path (path-combine (temp-dir) "bjostat-test-v8.xpt"))
-  (file-write-text v8-path "HEADER RECORD*******LIBV8   HEADER RECORD!!!!!!!000000000000000000000000000000  ")
+  (raise-err (file-write-text v8-path "HEADER RECORD*******LIBV8   HEADER RECORD!!!!!!!000000000000000000000000000000  "))
   (expect "version 8"
           (string-ends-with? (error-of (read-xpt v8-path))
                              "is a SAS transport file of version 8, and read-xpt reads version 5, the format of NHANES. Version 8 has long names; save the dataset with the XPORT engine, or as CSV.")

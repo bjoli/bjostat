@@ -97,7 +97,7 @@
   (ignore (computing-each n work))
   unit)
 
-(def _workers
+(def workers-installed
   (begin (install-workers run-on-compute-threads (compute-thread-count)) #t))
 
 (import/class
@@ -2308,7 +2308,7 @@
   (def (Tuple ids firsts) (sorted-string-ids c))
   #[ids firsts])
 
-(def _numbering
+(def numbering-installed
   (begin (install-numbering glue-string-ids glue-sorted-string-ids in-byte-order) #t))
 
 ;; ===========================================================================
@@ -3152,7 +3152,7 @@
   (def rn (any-length (array-ref rk 0)))
   (def next (: (make-array rn) (Array int)))
   (def rh (hashes-in-parts rk rn))
-  (def by-part {vecing (: (mutablevec) (MutableVec int)) (:for _q (range 0 hash-parts))})
+  (def by-part {vecing (: (mutablevec) (MutableVec int)) (:for _ (range 0 hash-parts))})
   (loop (:for r (range 0 rn))
         (:do (mutablevec-add! (vec-ref by-part (hash-part (array-ref rh r))) r)))
   (def tables
@@ -3928,10 +3928,8 @@
   (ignore (computing-each (* ncols parts)
                           (fun (u) (take-first! (array-ref plans (quotient u parts)) rows (% u parts)))))
   (def strings? (loop (:for plan plans) (:acc (summing (if (take-between! plan) 1 0)))))
-  (def _copied
-    (if (> strings? 0)
-        (computing-each (* ncols parts) (fun (u) (take-second! (array-ref plans (quotient u parts)) rows (% u parts))))
-        []))
+  (when (> strings? 0)
+    (ignore (computing-each (* ncols parts) (fun (u) (take-second! (array-ref plans (quotient u parts)) rows (% u parts))))))
   (def out (: (make-array ncols) (Array AnyColumn)))
   (loop (:for c (range 0 ncols)) (:do (array-set! out c (take-result (array-ref plans c)))))
   out)
@@ -4397,7 +4395,7 @@
 ;; for two rows of one cell.
 (: (-> string (Array int) (Array int) (Array string) int int (Result TableError (Array (Array int)))))
 (defun (cell-rows names-from group-of col-of new-names rows n)
-  (def cells {arraying (make-array rows #:fill -1) (:for _c (range 0 (array-length new-names)))})
+  (def cells {arraying (make-array rows #:fill -1) (:for _ (range 0 (array-length new-names)))})
   (let go ((r 0))
     (if (= r n)
         (Ok cells)
@@ -4872,7 +4870,7 @@
 
 (: (-> int int (Array (Array long))))
 (defun (zero-counts r-count c-count)
-  {arraying (: (make-array r-count) (Array long)) (:for _c (range 0 c-count))})
+  {arraying (: (make-array r-count) (Array long)) (:for _ (range 0 c-count))})
 
 (: (-> (Array int) (Array int) int int int (Array (Array long))))
 (defun (pair-counts row-of col-of r-count c-count n)

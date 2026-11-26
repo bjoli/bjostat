@@ -119,7 +119,7 @@
 
   ;; Files
   (def path (path-combine (temp-dir) "bjostat-test.csv"))
-  (file-write-text path sales)
+  (raise-err (file-write-text path sales))
   (def from-file (ok (read-csv path)))
   (expect "from a file" (column-sum (ok (doubles from-file "price"))) 49.75)
   (expect "a file that is not there"
@@ -136,7 +136,7 @@
          (if (= (% i 7) 0) "" (double->string (/ (cast double i) 4.0))) "\n"))
   (def big-text (str "n,s,x\n" (string-join {vecing (big-row i) (:for i (range 0 200000))} "")))
   (def big-path (path-combine (temp-dir) "bjostat-test-big.csv"))
-  (file-write-text big-path big-text)
+  (raise-err (file-write-text big-path big-text))
   (def in-chunks (ok (read-csv big-path #:types [(Tuple "s" Category)])))
   (def on-one (ok (csv->table big-text #:types [(Tuple "s" Category)])))
   (expect "chunks: the size of the file" (> (string-length big-text) 4000000) #t)
@@ -161,8 +161,8 @@
   ;; read with the guessed types, and the file is read on one thread, which
   ;; makes the column one of doubles.
   (def late-path (path-combine (temp-dir) "bjostat-test-late.csv"))
-  (file-write-text late-path (str "n,note\n" (string-join {vecing (str (if (= i 190000) "2.5" (int->string i)) ",some text here\n")
-                                                                  (:for i (range 0 200000))} "")))
+  (raise-err (file-write-text late-path (str "n,note\n" (string-join {vecing (str (if (= i 190000) "2.5" (int->string i)) ",some text here\n")
+                                                                  (:for i (range 0 200000))} ""))))
   (def late (ok (read-csv late-path)))
   (expect "chunks: a decimal after the guess makes the column double" (types-of late) ["n:double" "note:string"])
   (expect "chunks: its value" (cells-ref (: (ok (column-as late "n")) (Cells double)) 190000) 2.5)
@@ -188,7 +188,7 @@
   (def mixed-text (str "n;s;x;d;t;b;late;small;tail\r\n"
                        (string-join {vecing (mixed-row i "\r\n") (:for i (range 0 200000))} "")))
   (def mixed-path (path-combine (temp-dir) "bjostat-test-mixed.csv"))
-  (file-write-text mixed-path mixed-text)
+  (raise-err (file-write-text mixed-path mixed-text))
   (def mixed-types [(Tuple "small" Int)])
   (def mixed-chunks (ok (read-csv mixed-path #:separator #\; #:nulls ["NA"] #:types mixed-types)))
   (def mixed-one (ok (csv->table mixed-text #:separator #\; #:nulls ["NA"] #:types mixed-types)))
@@ -202,13 +202,13 @@
   (def blank-text (str "n,s\n" (string-join {vecing (str (int->string i) ",some text\n" (if (= i 120000) "\n" ""))
                                                     (:for i (range 0 300000))} "")))
   (def blank-path (path-combine (temp-dir) "bjostat-test-blank.csv"))
-  (file-write-text blank-path blank-text)
+  (raise-err (file-write-text blank-path blank-text))
   (expect "chunks: a blank line, read on one thread, gives the table of one thread"
           (same-as-one-thread? (ok (read-csv blank-path)) (ok (csv->table blank-text)))
           #t)
   (def twice-path (path-combine (temp-dir) "bjostat-test-twice.csv"))
-  (file-write-text twice-path (str "a,a,b\n" (string-join {vecing (str (int->string i) ",2,some text\n")
-                                                                  (:for i (range 0 300000))} "")))
+  (raise-err (file-write-text twice-path (str "a,a,b\n" (string-join {vecing (str (int->string i) ",2,some text\n")
+                                                                  (:for i (range 0 300000))} ""))))
   (expect "chunks: two columns of one name, as in a small file"
           (error-of (read-csv twice-path))
           "two columns are named 'a'.")

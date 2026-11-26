@@ -355,7 +355,7 @@
 ;; its rows.
 (: (-> Records string string (Result TableError Member)))
 (defun (find-member rs path wanted)
-  (def (Ok _started) (start! rs path) :propagate)
+  (def (Ok _) (start! rs path) :propagate)
   (let go ((seen (: [] (Vec string))))
     (cond
       ((not (next! rs))
@@ -373,7 +373,7 @@
 ;; The names of the members.
 (: (-> Records string (Result TableError (Vec string))))
 (defun (member-names rs path)
-  (def (Ok _started) (start! rs path) :propagate)
+  (def (Ok _) (start! rs path) :propagate)
   (let go ((names (: [] (Vec string))))
     (cond
       ((not (next! rs)) (Ok names))
@@ -648,7 +648,7 @@
 (: (-> Rows int void))
 (defun (add-pending! st k)
   (set! st .pending 0)
-  (loop (:for _i (range 0 k)) (:do (add-row! st (get st .blank)))))
+  (loop (:for _ (range 0 k)) (:do (add-row! st (get st .blank)))))
 
 ;; The rows of blanks at the end that lie in the padding, under 80 bytes, are
 ;; not rows; those before them are.

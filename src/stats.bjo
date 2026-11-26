@@ -534,7 +534,7 @@
 
 ;; A value is never None in a vector loop over values that are not null.
 (: (-> (MutableVec double) int void))
-(defun (stats-no-none! _xs _i)
+(defun (stats-no-none! _ _)
   (raise (cast Exception (InvalidOperationException. "(bjostat stats): a quantile value cannot be None"))))
 
 ;; The quantiles at `ps` of the values, as R's `quantile` gives them by
